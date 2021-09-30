@@ -6739,6 +6739,44 @@ if the guest_memfd memory was pinned in IOMMU page tables.
 
 See also: :ref: `KVM_SET_MEMORY_ATTRIBUTES`.
 
+4.146 KVM_ARM_RMI_POPULATE
+--------------------------
+
+:Capability: KVM_CAP_ARM_RMI
+:Architectures: arm64
+:Type: vm ioctl
+:Parameters: struct kvm_arm_rmi_populate (in/out)
+:Returns: 0 on success, < 0 on error
+
+::
+
+  struct kvm_arm_rmi_populate {
+	__u64 base;
+	__u64 size;
+	__u64 source_uaddr;
+	__u32 flags;
+	__u32 reserved;
+  };
+
+Populate the guest address range described by `base` and `size` with data from
+the userspace buffer at `source_uaddr`. The guest_memfd range backing the
+memory must have `KVM_MEMORY_ATTRIBUTE_PRIVATE` set.
+
+Arm CCA cannot perform an in-place shared-to-private conversion while
+preserving memory contents. Therefore, `source_uaddr` must be a valid,
+page-aligned userspace pointer. The operation uses `RMI_RTT_DATA_MAP_INIT`,
+which also sets the region to `RIPAS_RAM`.
+
+This is only valid before any VCPUs have been run. The ioctl might not populate
+the entire region and in this case the kernel updates the fields `base`, `size`
+and `source_uaddr`. User space may have to repeatedly call it until `size` is 0
+to populate the entire region.
+
+`flags` can be set to `KVM_ARM_RMI_POPULATE_FLAGS_MEASURE` to request that the
+populated data is hashed and added to the guest's Realm Initial Measurement
+(RIM) stored by the RMM. This can then be retrieved by the guest (using the RSI
+interface) to present to an attestation server.
+
 .. _kvm_run:
 
 5. The kvm_run structure
@@ -9131,6 +9169,15 @@ through hugetlbfs can be enabled for a VM. After the capability is
 enabled, cmma can't be enabled anymore and pfmfi and the storage key
 interpretation are disabled. If cmma has already been enabled or the
 hpage_2g module parameter is not set to 1, -EINVAL is returned.
+
+7.48 KVM_CAP_ARM_RMI
+--------------------
+
+:Architectures: arm64
+:Target: VM
+:Parameters: None
+
+This capability indicates that support for CCA realms is available.
 
 8. Other capabilities.
 ======================
