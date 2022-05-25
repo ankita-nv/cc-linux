@@ -816,4 +816,9 @@ static inline bool kvm_realm_is_created(struct kvm *kvm)
 	return kvm_is_realm(kvm) && kvm_realm_state(kvm) != REALM_STATE_NONE;
 }
 
+static inline bool vcpu_is_rec(const struct kvm_vcpu *vcpu)
+{
+	return kvm_is_realm(vcpu->kvm);
+}
+
 #endif /* __ARM64_KVM_EMULATE_H__ */

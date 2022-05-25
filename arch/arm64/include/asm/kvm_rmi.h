@@ -75,12 +75,32 @@ struct realm {
 	bool rtts_destroyed;
 };
 
+/**
+ * struct realm_rec - Additional per VCPU data for a Realm
+ *
+ * @mpidr: MPIDR (Multiprocessor Affinity Register) value to identify this VCPU
+ * @rec_page: Kernel VA of the RMM's private page for this REC
+ * @rec_phys: Physical address of @rec_page
+ * @run: Kernel VA of the RmiRecRun structure shared with the RMM
+ * @run_phys: Physical address of @run
+ * @sro: A preallocated SRO state context
+ */
+struct realm_rec {
+	unsigned long mpidr;
+	void *rec_page;
+	phys_addr_t rec_phys;
+	struct rec_run *run;
+	phys_addr_t run_phys;
+	struct rmi_sro_state *sro;
+};
+
 void kvm_init_rmi(void);
 u32 kvm_rmm_ipa_limit(void);
 
 int kvm_init_realm(struct kvm *kvm);
 void kvm_destroy_realm(struct kvm *kvm);
 int kvm_realm_teardown_stage2(struct kvm *kvm);
+void kvm_destroy_rec(struct kvm_vcpu *vcpu);
 
 static inline bool kvm_realm_is_private_address(struct realm *realm,
 						unsigned long addr)
