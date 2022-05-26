@@ -37,6 +37,16 @@ static void rec_exit_sync(struct kvm_vcpu *vcpu)
 			kvm_make_request(KVM_REQ_RMI, vcpu);
 		break;
 	}
+	case ESR_ELx_EC_DABT_LOW:
+		/*
+		 * The RMM reports the value of an MMIO write in gprs[0],
+		 * irrespective of the register named by the instruction.
+		 */
+		if (kvm_vcpu_dabt_iswrite(vcpu) &&
+		    kvm_vcpu_dabt_isvalid(vcpu))
+			vcpu_set_reg(vcpu, kvm_vcpu_dabt_get_rd(vcpu),
+				     rec->run->exit.gprs[0]);
+		break;
 	}
 }
 
