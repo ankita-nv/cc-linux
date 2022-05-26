@@ -18,6 +18,7 @@
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_nested.h>
+#include <asm/kvm_rmi.h>
 #include <asm/debug-monitors.h>
 #include <asm/stacktrace/nvhe.h>
 #include <asm/traps.h>
@@ -37,9 +38,14 @@ static void kvm_handle_guest_serror(struct kvm_vcpu *vcpu, u64 esr)
 
 static int handle_hvc(struct kvm_vcpu *vcpu)
 {
+	int ret;
+
 	trace_kvm_hvc_arm64(*vcpu_pc(vcpu), vcpu_get_reg(vcpu, 0),
 			    kvm_vcpu_hvc_get_imm(vcpu));
 	vcpu->stat.hvc_exit_stat++;
+
+	if (kvm_rec_handle_hvc(vcpu, &ret))
+		return ret;
 
 	/* Forward hvc instructions to the virtual EL2 if the guest has EL2. */
 	if (vcpu_has_nv(vcpu)) {
@@ -447,6 +453,9 @@ int handle_exit(struct kvm_vcpu *vcpu, int exception_index)
 {
 	struct kvm_run *run = vcpu->run;
 
+	if (exception_index < 0)
+		return exception_index;
+
 	if (ARM_SERROR_PENDING(exception_index)) {
 		/*
 		 * The SError is handled by handle_exit_early(). If the guest
@@ -478,6 +487,8 @@ int handle_exit(struct kvm_vcpu *vcpu, int exception_index)
 		 */
 		run->exit_reason = KVM_EXIT_FAIL_ENTRY;
 		return -EINVAL;
+	case ARM_EXCEPTION_EXIT:
+		return 0;
 	default:
 		kvm_pr_unimpl("Unsupported exception type: %d",
 			      exception_index);
@@ -511,6 +522,9 @@ static void handle_exit_pkvm_state(struct kvm_vcpu *vcpu, int exception_index)
 void handle_exit_early(struct kvm_vcpu *vcpu, int exception_index)
 {
 	handle_exit_pkvm_state(vcpu, exception_index);
+
+	if (exception_index < 0 || exception_index == ARM_EXCEPTION_EXIT)
+		return;
 
 	if (ARM_SERROR_PENDING(exception_index)) {
 		if (this_cpu_has_cap(ARM64_HAS_RAS_EXTN)) {

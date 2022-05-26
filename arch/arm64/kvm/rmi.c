@@ -6,6 +6,7 @@
 #include <linux/kvm_host.h>
 
 #include <asm/kvm_emulate.h>
+#include <asm/kvm_hyp.h>
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_pgtable.h>
 #include <asm/rmi_cmds.h>
@@ -203,6 +204,61 @@ int kvm_realm_teardown_stage2(struct kvm *kvm)
 
 	realm_unmap_stage2(kvm);
 	return realm_destroy_rtts(kvm);
+}
+
+int kvm_rec_handle_request(struct kvm_vcpu *vcpu)
+{
+	struct realm_rec *rec = &vcpu->arch.rec;
+	u64 esr;
+
+	switch (rec->run->exit.exit_reason) {
+	case RMI_EXIT_SYNC:
+		esr = rec->run->exit.esr;
+		if (ESR_ELx_EC(esr) == ESR_ELx_EC_SYS64 &&
+		    (esr & ESR_ELx_SYS64_ISS_DIR_MASK) ==
+				ESR_ELx_SYS64_ISS_DIR_READ) {
+			int rt = ESR_ELx_SYS64_ISS_RT(esr);
+
+			if (rt < REC_RUN_GPRS)
+				rec->run->enter.gprs[rt] =
+					vcpu_get_reg(vcpu, rt);
+		}
+		break;
+	default:
+		KVM_BUG(1, vcpu->kvm, "Unhandled realm exit_reason");
+		return -ENXIO;
+	}
+
+	return 1;
+}
+
+static void noinstr load_realm_timer_state(struct kvm_vcpu *vcpu)
+{
+	struct rec_exit *rec_exit = &vcpu->arch.rec.run->exit;
+
+	/*
+	 * The RMM reports the EL1 timer state on every REC exit. Install that
+	 * state before returning to the generic KVM run loop, which expects
+	 * the loaded vCPU's timers to be live.
+	 */
+	write_sysreg_el0(rec_exit->cntv_cval, SYS_CNTV_CVAL);
+	write_sysreg_el0(rec_exit->cntp_cval, SYS_CNTP_CVAL);
+	isb();
+
+	write_sysreg_el0(rec_exit->cntv_ctl, SYS_CNTV_CTL);
+	write_sysreg_el0(rec_exit->cntp_ctl, SYS_CNTP_CTL);
+}
+
+int noinstr kvm_rec_enter(struct kvm_vcpu *vcpu)
+{
+	struct realm_rec *rec = &vcpu->arch.rec;
+	int ret;
+
+	ret = rmi_rec_enter(rec->rec_phys, rec->run_phys);
+	if (!ret)
+		load_realm_timer_state(vcpu);
+
+	return ret;
 }
 
 static int __maybe_unused kvm_create_rec(struct kvm_vcpu *vcpu)

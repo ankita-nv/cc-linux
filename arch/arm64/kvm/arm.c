@@ -1227,6 +1227,13 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 		if (kvm_check_request(KVM_REQ_SUSPEND, vcpu))
 			return kvm_vcpu_suspend(vcpu);
 
+		if (kvm_check_request(KVM_REQ_RMI, vcpu)) {
+			int ret = kvm_rec_handle_request(vcpu);
+
+			if (ret <= 0)
+				return ret;
+		}
+
 		if (kvm_dirty_ring_check_request(vcpu))
 			return 0;
 
@@ -1312,8 +1319,17 @@ static int noinstr kvm_arm_vcpu_enter_exit(struct kvm_vcpu *vcpu)
 	int ret;
 
 	guest_state_enter_irqoff();
-	ret = kvm_call_hyp_ret(__kvm_vcpu_run, vcpu);
+	if (vcpu_is_rec(vcpu))
+		ret = kvm_rec_enter(vcpu);
+	else
+		ret = kvm_call_hyp_ret(__kvm_vcpu_run, vcpu);
 	guest_state_exit_irqoff();
+
+	if (vcpu_is_rec(vcpu)) {
+		instrumentation_begin();
+		ret = kvm_rec_exit(vcpu, ret);
+		instrumentation_end();
+	}
 
 	return ret;
 }

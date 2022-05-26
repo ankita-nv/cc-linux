@@ -102,6 +102,11 @@ void kvm_destroy_realm(struct kvm *kvm);
 int kvm_realm_teardown_stage2(struct kvm *kvm);
 void kvm_destroy_rec(struct kvm_vcpu *vcpu);
 
+int kvm_rec_enter(struct kvm_vcpu *vcpu);
+int kvm_rec_exit(struct kvm_vcpu *vcpu, int rec_run_status);
+int kvm_rec_handle_request(struct kvm_vcpu *vcpu);
+bool kvm_rec_handle_hvc(struct kvm_vcpu *vcpu, int *ret);
+
 static inline bool kvm_realm_is_private_address(struct realm *realm,
 						unsigned long addr)
 {
