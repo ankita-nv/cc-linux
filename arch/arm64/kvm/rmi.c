@@ -3,6 +3,7 @@
  * Copyright (C) 2023-2026 ARM Ltd.
  */
 
+#include <uapi/linux/psci.h>
 #include <linux/kvm_host.h>
 
 #include <asm/kvm_emulate.h>
@@ -118,6 +119,17 @@ static void free_rtt(phys_addr_t phys)
 		return;
 
 	kvm_account_pgtable_pages(phys_to_virt(phys), -1);
+}
+
+int realm_psci_complete(struct kvm_vcpu *source, unsigned long status)
+{
+	long ret;
+
+	ret = rmi_psci_complete(source->arch.rec.rec_phys, status);
+	if (ret)
+		return -ENXIO;
+
+	return 0;
 }
 
 static long realm_rtt_create(struct realm *realm,
@@ -1145,6 +1157,30 @@ static int kvm_complete_ripas_change(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+static int kvm_rec_complete_psci(struct kvm_vcpu *vcpu)
+{
+	struct rec_run *run = vcpu->arch.rec.run;
+	unsigned long status = PSCI_RET_DENIED;
+	unsigned long ret = vcpu_get_reg(vcpu, 0);
+	int r;
+
+	switch (run->exit.gprs[0]) {
+	case PSCI_0_2_FN64_CPU_ON: {
+		if (ret != PSCI_RET_SUCCESS &&
+		    ret != PSCI_RET_ALREADY_ON)
+			status = PSCI_RET_DENIED;
+		else
+			status = PSCI_RET_SUCCESS;
+		break;
+	}
+	default:
+		return 1;
+	}
+
+	r = realm_psci_complete(vcpu, status);
+	return r ?: 1;
+}
+
 int kvm_rec_handle_request(struct kvm_vcpu *vcpu)
 {
 	struct realm_rec *rec = &vcpu->arch.rec;
@@ -1163,6 +1199,8 @@ int kvm_rec_handle_request(struct kvm_vcpu *vcpu)
 					vcpu_get_reg(vcpu, rt);
 		}
 		break;
+	case RMI_EXIT_PSCI:
+		return kvm_rec_complete_psci(vcpu);
 	case RMI_EXIT_RIPAS_CHANGE:
 		return kvm_complete_ripas_change(vcpu);
 	default:

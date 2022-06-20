@@ -123,6 +123,8 @@ int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
 		  enum kvm_pgtable_prot prot,
 		  struct kvm_mmu_memory_cache *memcache);
 
+int realm_psci_complete(struct kvm_vcpu *source, unsigned long status);
+
 static inline bool kvm_realm_is_private_address(struct realm *realm,
 						unsigned long addr)
 {
