@@ -1203,6 +1203,10 @@ int kvm_rec_handle_request(struct kvm_vcpu *vcpu)
 		return kvm_rec_complete_psci(vcpu);
 	case RMI_EXIT_RIPAS_CHANGE:
 		return kvm_complete_ripas_change(vcpu);
+	case RMI_EXIT_HOST_CALL:
+		for (int i = 0; i < REC_RUN_GPRS; i++)
+			rec->run->enter.gprs[i] = vcpu_get_reg(vcpu, i);
+		break;
 	default:
 		KVM_BUG(1, vcpu->kvm, "Unhandled realm exit_reason");
 		return -ENXIO;

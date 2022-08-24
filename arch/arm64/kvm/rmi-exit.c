@@ -164,6 +164,7 @@ int kvm_rec_exit(struct kvm_vcpu *vcpu, int rec_run_ret)
 	case RMI_EXIT_SERROR:
 		return ARM_EXCEPTION_EL1_SERROR;
 	case RMI_EXIT_PSCI:
+	case RMI_EXIT_HOST_CALL:
 		rec_exit_hvc(vcpu);
 		kvm_make_request(KVM_REQ_RMI, vcpu);
 		return ARM_EXCEPTION_TRAP;
