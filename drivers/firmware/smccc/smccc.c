@@ -12,6 +12,7 @@
 #include <linux/arm-smccc-bus.h>
 #include <linux/platform_device.h>
 #include <linux/arm-smccc-rsi.h>
+#include <linux/arm-smccc-rmi.h>
 
 #include <asm/archrandom.h>
 
@@ -108,11 +109,15 @@ static const struct smccc_device_info smccc_devices[] __initconst = {
 		.requires_smc   = false,
 		.device_name    = "arm-smccc-trng",
 	},
-
 	{
 		.func_id        = SMC_RSI_ABI_VERSION,
 		.requires_smc   = true,
 		.device_name    = RSI_DEV_NAME,
+	},
+	{
+		.func_id        = SMC_RMI_VERSION,
+		.requires_smc   = true,
+		.device_name    = RMI_DEV_NAME,
 	},
 };
 
