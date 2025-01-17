@@ -24,6 +24,10 @@
 #include <asm/fixmap.h>
 #endif
 
+#ifdef CONFIG_ARM64
+#include <asm/rsi.h>
+#endif
+
 #include <asm/serial.h>
 
 static struct console early_con = {
@@ -36,9 +40,42 @@ static struct earlycon_device early_console_dev = {
 	.con = &early_con,
 };
 
+#ifdef CONFIG_ARM64
+static struct realm_config earlycon_rconf __initdata;
+
+/*
+ * Realms use the most significant implemented IPA bit as the shared
+ * address alias selector for MMIO.
+ */
+static resource_size_t __init earlycon_realm_shared_ipa(resource_size_t paddr)
+{
+	unsigned long ipa_bits;
+
+	if (rsi_request_version(RSI_ABI_VERSION, NULL, NULL) != RSI_SUCCESS)
+		return paddr;
+
+	if (rsi_get_realm_config(&earlycon_rconf) != RSI_SUCCESS)
+		return paddr;
+
+	ipa_bits = earlycon_rconf.ipa_bits;
+	if (!ipa_bits || ipa_bits > sizeof(resource_size_t) * 8)
+		return paddr;
+
+	return paddr | (resource_size_t)(1ULL << (ipa_bits - 1));
+}
+#else
+static resource_size_t __init earlycon_realm_shared_ipa(resource_size_t paddr)
+{
+	return paddr;
+}
+#endif
+
 static void __iomem * __init earlycon_map(resource_size_t paddr, size_t size)
 {
 	void __iomem *base;
+
+	paddr = earlycon_realm_shared_ipa(paddr);
+
 #ifdef CONFIG_FIX_EARLYCON_MEM
 	set_fixmap_io(FIX_EARLYCON_MEM_BASE, paddr & PAGE_MASK);
 	base = (void __iomem *)__fix_to_virt(FIX_EARLYCON_MEM_BASE);
