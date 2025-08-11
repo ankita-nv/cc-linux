@@ -114,6 +114,42 @@ static bool kvm_gmem_range_has_attributes(struct inode *inode,
 	return true;
 }
 
+static struct folio *__kvm_gmem_get_folio(struct address_space *mapping,
+					  pgoff_t index,
+					  struct mempolicy *policy)
+{
+	const gfp_t gfp = mapping_gfp_mask(mapping);
+	struct folio *folio;
+	int err;
+
+	folio = filemap_lock_folio(mapping, index);
+	if (!IS_ERR(folio))
+		return folio;
+
+	folio = filemap_alloc_folio(gfp, 0, policy);
+	if (!folio)
+		return ERR_PTR(-ENOMEM);
+
+	err = mem_cgroup_charge(folio, NULL, gfp);
+	if (err)
+		goto err_put;
+
+	__folio_set_locked(folio);
+
+	err = __filemap_add_folio(mapping, folio, index, gfp, NULL);
+	if (err) {
+		__folio_clear_locked(folio);
+		goto err_put;
+	}
+	inode_add_bytes(mapping->host, folio_size(folio));
+
+	return folio;
+
+err_put:
+	folio_put(folio);
+	return ERR_PTR(err);
+}
+
 /*
  * Returns a locked folio on success.  The caller is responsible for
  * setting the up-to-date flag before the memory is mapped into the guest.
@@ -126,6 +162,7 @@ static bool kvm_gmem_range_has_attributes(struct inode *inode,
 static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 {
 	/* TODO: Support huge pages. */
+	struct address_space *mapping = inode->i_mapping;
 	struct mempolicy *policy;
 	struct folio *folio;
 
@@ -133,14 +170,15 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 	 * Fast-path: See if folio is already present in mapping to avoid
 	 * policy_lookup.
 	 */
-	folio = filemap_lock_folio(inode->i_mapping, index);
+	folio = filemap_lock_folio(mapping, index);
 	if (!IS_ERR(folio))
 		return folio;
 
 	policy = mpol_shared_policy_lookup(&GMEM_I(inode)->policy, index);
-	folio = __filemap_get_folio_mpol(inode->i_mapping, index,
-					 FGP_LOCK | FGP_CREAT,
-					 mapping_gfp_mask(inode->i_mapping), policy);
+	do {
+		folio = __kvm_gmem_get_folio(mapping, index, policy);
+	} while (IS_ERR(folio) && PTR_ERR(folio) == -EEXIST);
+
 	mpol_cond_put(policy);
 
 	if (IS_ERR(folio))
@@ -154,8 +192,6 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 	 * operations).
 	 */
 	WARN_ON_ONCE(folio_order(folio));
-	inode_add_bytes(inode, folio_size(folio));
-
 	return folio;
 }
 
@@ -834,20 +870,20 @@ static int kvm_gmem_error_folio(struct address_space *mapping, struct folio *fol
 	return MF_DELAYED;
 }
 
-#ifdef CONFIG_HAVE_KVM_ARCH_GMEM_RECLAIM
 static void kvm_gmem_free_folio(struct folio *folio)
 {
+	folio_clear_unevictable(folio);
+
+#ifdef CONFIG_HAVE_KVM_ARCH_GMEM_RECLAIM
 	kvm_arch_gmem_reclaim(folio_file_pfn(folio, 0), folio_nr_pages(folio));
-}
 #endif
+}
 
 static const struct address_space_operations kvm_gmem_aops = {
 	.dirty_folio = noop_dirty_folio,
 	.migrate_folio	= kvm_gmem_migrate_folio,
 	.error_remove_folio = kvm_gmem_error_folio,
-#ifdef CONFIG_HAVE_KVM_ARCH_GMEM_RECLAIM
 	.free_folio = kvm_gmem_free_folio,
-#endif
 };
 
 static int kvm_gmem_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
