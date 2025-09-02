@@ -18,14 +18,10 @@ int arm64_mem_crypt_ops_register(const struct arm64_mem_crypt_ops *ops);
 int set_memory_encrypted(unsigned long addr, int numpages);
 int set_memory_decrypted(unsigned long addr, int numpages);
 int __set_memory_enc_dec(unsigned long addr, int numpages, bool encrypt);
+bool force_dma_unencrypted(struct device *dev);
 
 #define mem_cc_shared_granule_size mem_cc_shared_granule_size
 size_t mem_cc_shared_granule_size(void);
-
-static inline bool force_dma_unencrypted(struct device *dev)
-{
-	return is_realm_world() || is_protected_kvm_guest();
-}
 
 /*
  * For Arm CCA guests, canonical addresses are "encrypted", so no changes

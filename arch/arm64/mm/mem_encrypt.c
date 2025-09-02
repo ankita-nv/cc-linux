@@ -18,6 +18,7 @@
 #include <linux/err.h>
 #include <linux/mm.h>
 #include <linux/mem_encrypt.h>
+#include <linux/device.h>
 
 static const struct arm64_mem_crypt_ops *crypt_ops;
 
@@ -72,3 +73,12 @@ size_t mem_cc_shared_granule_size(void)
 	return crypt_ops->cc_shared_granule_size();
 }
 EXPORT_SYMBOL_GPL(mem_cc_shared_granule_size);
+
+bool force_dma_unencrypted(struct device *dev)
+{
+	if (device_cc_accepted(dev))
+		return false;
+
+	return is_realm_world() || is_protected_kvm_guest();
+}
+EXPORT_SYMBOL_GPL(force_dma_unencrypted);
