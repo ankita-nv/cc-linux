@@ -906,7 +906,6 @@ static inline void *cma_reserve_early(struct cma *cma, unsigned long size)
 struct anon_vma *folio_anon_vma(const struct folio *folio);
 
 #ifdef CONFIG_MMU
-void unmap_mapping_folio(struct folio *folio);
 extern long populate_vma_page_range(struct vm_area_struct *vma,
 		unsigned long start, unsigned long end, int *locked);
 extern long faultin_page_range(struct mm_struct *mm, unsigned long start,
@@ -1134,7 +1133,6 @@ static inline bool vma_supports_mlock(const struct vm_area_struct *vma)
 }
 
 #else /* !CONFIG_MMU */
-static inline void unmap_mapping_folio(struct folio *folio) { }
 static inline void mlock_new_folio(struct folio *folio) { }
 static inline bool need_mlock_drain(int cpu) { return false; }
 static inline void mlock_drain_local(void) { }
