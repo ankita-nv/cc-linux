@@ -400,6 +400,7 @@ enum split_type {
 	SPLIT_TYPE_NON_UNIFORM,
 };
 
+void __split_folio_to_order(struct folio *folio, int old_order, int new_order);
 int __split_huge_page_to_list_to_order(struct page *page, struct list_head *list,
 		unsigned int new_order);
 int folio_split_unmapped(struct folio *folio, unsigned int new_order);
@@ -640,6 +641,12 @@ thp_get_unmapped_area_vmaflags(struct file *filp, unsigned long addr,
 			       unsigned long flags, vma_flags_t vma_flags)
 {
 	return 0;
+}
+
+static inline void __split_folio_to_order(struct folio *folio, int old_order,
+					  int new_order)
+{
+	VM_WARN_ON_ONCE_FOLIO(1, folio);
 }
 
 static inline int
