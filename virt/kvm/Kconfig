@@ -104,6 +104,11 @@ config KVM_GUEST_MEMFD
        select XARRAY_MULTI
        bool
 
+config KVM_GUEST_MEMFD_HUGETLB
+	bool "Enable HugeTLB support for guest_memfd"
+	depends on HUGETLB_PAGE
+	select KVM_GUEST_MEMFD
+
 config HAVE_KVM_ARCH_GMEM_CONVERT
        bool
        depends on KVM_GUEST_MEMFD

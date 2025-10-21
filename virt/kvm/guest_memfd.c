@@ -8,8 +8,10 @@
 #include <linux/mempolicy.h>
 #include <linux/pseudo_fs.h>
 #include <linux/pagemap.h>
+#include <linux/string.h>
 #include <linux/swap.h>
 
+#include "guest_memfd_hugetlb.h"
 #include "kvm_mm.h"
 #include "guest_memfd.h"
 
@@ -1011,11 +1013,25 @@ int kvm_gmem_create(struct kvm *kvm, struct kvm_create_guest_memfd *args)
 {
 	loff_t size = args->size;
 	u64 flags = args->flags;
+	u8 page_order = 0;
+
+	if (args->reserve8 || args->reserve16 || args->reserve32 ||
+	    memchr_inv(args->reserved, 0, sizeof(args->reserved)))
+		return -EINVAL;
 
 	if (flags & ~kvm_gmem_get_supported_flags(kvm))
 		return -EINVAL;
 
-	if (size <= 0 || !PAGE_ALIGNED(size))
+	if (args->page_order && !(flags & GUEST_MEMFD_FLAG_HUGETLB))
+		return -EINVAL;
+
+	if (flags & GUEST_MEMFD_FLAG_HUGETLB) {
+		page_order = args->page_order;
+		if (!gmem_hugetlb_valid_order(page_order))
+			return -EINVAL;
+	}
+
+	if (size <= 0 || !IS_ALIGNED(size, PAGE_SIZE << page_order))
 		return -EINVAL;
 
 	return __kvm_gmem_create(kvm, size, flags);
