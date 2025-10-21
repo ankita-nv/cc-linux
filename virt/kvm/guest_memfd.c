@@ -119,29 +119,45 @@ static bool kvm_gmem_range_has_attributes(struct inode *inode,
 	return true;
 }
 
-static struct folio *__kvm_gmem_get_folio(struct address_space *mapping,
+static struct folio *__kvm_gmem_get_folio(struct inode *inode,
 					  pgoff_t index,
 					  struct mempolicy *policy)
 {
+	struct address_space *mapping = inode->i_mapping;
 	const gfp_t gfp = mapping_gfp_mask(mapping);
+	bool is_hugetlb = IS_ENABLED(CONFIG_KVM_GUEST_MEMFD_HUGETLB) &&
+			  (GMEM_I(inode)->flags & GUEST_MEMFD_FLAG_HUGETLB);
 	struct folio *folio;
+	pgoff_t index_floor;
 	int err;
 
 	folio = filemap_lock_folio(mapping, index);
 	if (!IS_ERR(folio))
 		return folio;
 
-	folio = filemap_alloc_folio(gfp, 0, policy);
+	if (is_hugetlb) {
+		folio = gmem_hugetlb_alloc_folio(inode->i_private,
+						 GMEM_I(inode)->page_order, policy);
+		if (IS_ERR(folio))
+			return folio;
+	} else {
+		folio = filemap_alloc_folio(gfp, 0, policy);
+	}
+
 	if (!folio)
 		return ERR_PTR(-ENOMEM);
 
-	err = mem_cgroup_charge(folio, NULL, gfp);
-	if (err)
-		goto err_put;
+	/* hugetlb_alloc_folio() already performed the memcg charge. */
+	if (!is_hugetlb) {
+		err = mem_cgroup_charge(folio, NULL, gfp);
+		if (err)
+			goto err_put;
+	}
 
 	__folio_set_locked(folio);
 
-	err = __filemap_add_folio(mapping, folio, index, gfp, NULL);
+	index_floor = round_down(index, folio_nr_pages(folio));
+	err = __filemap_add_folio(mapping, folio, index_floor, gfp, NULL);
 	if (err) {
 		__folio_clear_locked(folio);
 		goto err_put;
@@ -166,7 +182,6 @@ err_put:
  */
 static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 {
-	/* TODO: Support huge pages. */
 	struct address_space *mapping = inode->i_mapping;
 	struct mempolicy *policy;
 	struct folio *folio;
@@ -181,22 +196,10 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 
 	policy = mpol_shared_policy_lookup(&GMEM_I(inode)->policy, index);
 	do {
-		folio = __kvm_gmem_get_folio(mapping, index, policy);
+		folio = __kvm_gmem_get_folio(inode, index, policy);
 	} while (IS_ERR(folio) && PTR_ERR(folio) == -EEXIST);
 
 	mpol_cond_put(policy);
-
-	if (IS_ERR(folio))
-		return folio;
-
-	/*
-	 * External interfaces like kvm_gmem_get_pfn() support dealing
-	 * with hugepages to a degree, but internally, guest_memfd currently
-	 * assumes that all folios are order-0 and handling would need
-	 * to be updated for anything otherwise (e.g. page-clearing
-	 * operations).
-	 */
-	WARN_ON_ONCE(folio_order(folio));
 	return folio;
 }
 
@@ -1180,14 +1183,14 @@ static struct folio *__kvm_gmem_get_pfn(struct file *file,
 	if (IS_ERR(folio))
 		return folio;
 
-	if (folio_test_hwpoison(folio)) {
+	if (folio_contain_hwpoisoned_page(folio)) {
 		folio_unlock(folio);
 		folio_put(folio);
 		return ERR_PTR(-EHWPOISON);
 	}
 
 	if (!folio_test_uptodate(folio)) {
-		clear_highpage(folio_page(folio, 0));
+		folio_zero_user(folio, 0);
 		folio_mark_uptodate(folio);
 	}
 

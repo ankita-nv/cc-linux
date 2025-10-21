@@ -1,6 +1,7 @@
 #ifndef __KVM_GUEST_MEMFD_HUGETLB_H__
 #define __KVM_GUEST_MEMFD_HUGETLB_H__
 
+#include <linux/err.h>
 #include <linux/mm_types.h>
 #include <linux/types.h>
 
@@ -10,6 +11,8 @@ bool gmem_hugetlb_valid_order(u8 order);
 int gmem_hugetlb_init(struct inode *inode, u64 flags, size_t size,
 		      u8 page_order);
 void gmem_hugetlb_teardown(struct inode *inode, u8 page_order, u64 flags);
+struct folio *gmem_hugetlb_alloc_folio(void *priv, u8 page_order,
+				       struct mempolicy *mpol);
 
 #else
 
@@ -27,6 +30,12 @@ static inline int gmem_hugetlb_init(struct inode *inode, u64 flags,
 static inline void gmem_hugetlb_teardown(struct inode *inode, u8 page_order,
 					 u64 flags)
 {
+}
+
+static inline struct folio *gmem_hugetlb_alloc_folio(
+		void *priv, u8 page_order, struct mempolicy *mpol)
+{
+	return ERR_PTR(-EOPNOTSUPP);
 }
 
 #endif /* CONFIG_KVM_GUEST_MEMFD_HUGETLB */
