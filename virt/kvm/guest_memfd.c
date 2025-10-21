@@ -884,6 +884,13 @@ static void kvm_gmem_free_folio(struct folio *folio)
 {
 	folio_clear_unevictable(folio);
 
+	/*
+	 * Clear PG_uptodate for HugeTLB folios to reset page. For
+	 * native-page-size pages, PG_uptodate remains safely cleared as part of
+	 * regular freeing processes.
+	 */
+	folio_clear_uptodate(folio);
+
 #ifdef CONFIG_HAVE_KVM_ARCH_GMEM_RECLAIM
 	kvm_arch_gmem_reclaim(folio_file_pfn(folio, 0), folio_nr_pages(folio));
 #endif
