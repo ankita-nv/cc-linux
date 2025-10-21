@@ -418,7 +418,7 @@ static void test_mem_conversions(enum vm_mem_backing_src_type src_type, u32 nr_v
 	else
 		gmem_flags = 0;
 
-	memfd = vm_create_guest_memfd(vm, memfd_size, gmem_flags);
+	memfd = vm_create_guest_memfd(vm, memfd_size, gmem_flags, 0);
 
 	for (i = 0; i < nr_memslots; i++)
 		vm_mem_add(vm, src_type, BASE_DATA_GPA + slot_size * i,
