@@ -106,8 +106,9 @@ config KVM_GUEST_MEMFD
 
 config KVM_GUEST_MEMFD_HUGETLB
 	bool "Enable HugeTLB support for guest_memfd"
-	depends on HUGETLB_PAGE
+	depends on HUGETLB_PAGE && TRANSPARENT_HUGEPAGE
 	select KVM_GUEST_MEMFD
+	select HUGETLB_RESTRUCTURING
 
 config HAVE_KVM_ARCH_GMEM_CONVERT
        bool
