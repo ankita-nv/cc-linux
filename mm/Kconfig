@@ -1511,6 +1511,11 @@ config LAZY_MMU_MODE_KUNIT_TEST
 
 	  If unsure, say N.
 
+config HUGETLB_RESTRUCTURING
+	bool
+	default n
+	depends on HUGETLB_PAGE && TRANSPARENT_HUGEPAGE
+
 source "mm/damon/Kconfig"
 
 endmenu
