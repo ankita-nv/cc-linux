@@ -463,6 +463,9 @@ do {									\
 
 static void __test_guest_memfd(struct kvm_vm *vm, u64 flags)
 {
+	if (page_order > 0)
+		flags |= GUEST_MEMFD_FLAG_HUGETLB;
+
 	test_create_guest_memfd_multiple(vm);
 	test_create_guest_memfd_invalid_sizes(vm, flags);
 
