@@ -719,9 +719,9 @@ static void kvm_gmem_make_shared(struct inode *inode, pgoff_t start, pgoff_t end
 static void kvm_gmem_make_shared(struct inode *inode, pgoff_t start, pgoff_t end) {}
 #endif
 
-static int __kvm_gmem_set_attributes(struct inode *inode, pgoff_t start,
-				     size_t nr_pages, uint64_t attrs,
-				     pgoff_t *err_index)
+static int kvm_gmem_convert(struct inode *inode, pgoff_t start,
+			    size_t nr_pages, uint64_t attrs,
+			    pgoff_t *err_index)
 {
 	bool to_private = attrs & KVM_MEMORY_ATTRIBUTE_PRIVATE;
 	struct address_space *mapping = inode->i_mapping;
@@ -734,16 +734,11 @@ static int __kvm_gmem_set_attributes(struct inode *inode, pgoff_t start,
 
 	mt = &gi->attributes;
 
-	filemap_invalidate_lock(mapping);
-
-	if (kvm_gmem_range_has_attributes(inode, start, nr_pages, attrs))
-		goto out;
-
 	mas_init(&mas, mt, start);
 	r = kvm_gmem_mas_preallocate(&mas, attrs, start, nr_pages);
 	if (r) {
 		*err_index = start;
-		goto out;
+		return r;
 	}
 
 	if (to_private) {
@@ -752,8 +747,7 @@ static int __kvm_gmem_set_attributes(struct inode *inode, pgoff_t start,
 		if (!kvm_gmem_is_safe_for_conversion(inode, start, nr_pages,
 						     err_index)) {
 			mas_destroy(&mas);
-			r = -EAGAIN;
-			goto out;
+			return -EAGAIN;
 		}
 	}
 
@@ -771,7 +765,28 @@ static int __kvm_gmem_set_attributes(struct inode *inode, pgoff_t start,
 	mas_store_prealloc(&mas, xa_mk_value(attrs));
 
 	kvm_gmem_invalidate_end(inode, start, end);
-out:
+
+	return 0;
+}
+
+static int __kvm_gmem_set_attributes(struct inode *inode, pgoff_t start,
+				     size_t nr_pages, uint64_t attrs,
+				     pgoff_t *err_index)
+{
+	struct address_space *mapping = inode->i_mapping;
+	struct gmem_inode *gi = GMEM_I(inode);
+	struct maple_tree *mt;
+	int r = 0;
+
+	mt = &gi->attributes;
+
+	filemap_invalidate_lock(mapping);
+
+	if (kvm_gmem_range_has_attributes(inode, start, nr_pages, attrs))
+		goto done;
+
+	r = kvm_gmem_convert(inode, start, nr_pages, attrs, err_index);
+done:
 	filemap_invalidate_unlock(mapping);
 	return r;
 }
