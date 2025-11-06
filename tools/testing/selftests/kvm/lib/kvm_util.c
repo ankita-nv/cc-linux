@@ -1030,7 +1030,7 @@ void vm_set_user_memory_region2(struct kvm_vm *vm, u32 slot, u32 flags,
 /* FIXME: This thing needs to be ripped apart and rewritten. */
 void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
 		gpa_t gpa, u32 slot, u64 npages, u32 flags,
-		int gmem_fd, u64 gmem_offset, u64 gmem_flags)
+		int gmem_fd, u64 gmem_offset, u64 gmem_flags, u8 gmem_order)
 {
 	int ret;
 	struct userspace_mem_region *region;
@@ -1112,7 +1112,7 @@ void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
 			TEST_ASSERT(!gmem_offset,
 				    "Offset must be zero when creating new guest_memfd");
 			gmem_fd = vm_create_guest_memfd(vm, mem_size,
-							gmem_flags, 0);
+							gmem_flags, gmem_order);
 		} else {
 			/*
 			 * Install a unique fd for each memslot so that the fd
@@ -1200,7 +1200,7 @@ void vm_userspace_mem_region_add(struct kvm_vm *vm,
 				 enum vm_mem_backing_src_type src_type,
 				 gpa_t gpa, u32 slot, u64 npages, u32 flags)
 {
-	vm_mem_add(vm, src_type, gpa, slot, npages, flags, -1, 0, 0);
+	vm_mem_add(vm, src_type, gpa, slot, npages, flags, -1, 0, 0, 0);
 }
 
 /*
