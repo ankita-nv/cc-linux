@@ -568,6 +568,26 @@ config MCHP_LAN966X_PCI
 	    - lan966x-miim (MDIO_MSCC_MIIM)
 	    - lan966x-switch (LAN966X_SWITCH)
 
+config ARM64_TIMER_VALIDATOR
+	tristate "ARMv8 Generic Timer Validator"
+	depends on ARM64
+	default m
+	help
+	  This module validates the ARMv8 generic timer (cntpct_el0/cntvct_el0)
+	  across all CPUs in a multi-package system (supports up to 4 packages).
+
+	  It performs three tests:
+	   1. Checks that timer value is never zero (ARMv8 spec requirement)
+	   2. Validates per-CPU monotonic behavior
+	   3. Validates global timer synchronization
+
+	  The module uses IRQ-disabled synchronized sampling to ensure all CPUs
+	  read the timer at the exact same moment, which is critical for
+	  detecting cross-package timer skew and synchronization issues.
+
+	  Works in both bare metal and virtual machines. To compile this driver
+	  as a module, choose M here: the module will be called armv8_timer.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"
