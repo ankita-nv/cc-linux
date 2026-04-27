@@ -181,8 +181,25 @@ flag KVM_VM_MIPS_VZ.
 ARM64:
 ^^^^^^
 
-On arm64, the physical address size for a VM (IPA Size limit) is limited
-to 40bits by default. The limit can be configured if the host supports the
+On arm64, the machine type identifier is used to encode a type and the
+physical address size for the VM. The lower byte (bits[7:0]) encodes the
+address size and the upper bits[31:30] encode a machine type. The machine
+types that might be available are:
+
+ =========================   =======   ========================================
+ Type                        [31:30]   Description
+ =========================   =======   ========================================
+ KVM_VM_TYPE_ARM_NORMAL      0b00      A standard VM
+ KVM_VM_TYPE_ARM_REALM       0b01      A "realm" VM using the Arm Confidential
+                                       Compute extensions, the VM's memory is
+                                       protected from the host.
+ KVM_VM_TYPE_ARM_PROTECTED   0b10      A "protected" VM using pKVM to
+                                       isolate the VM from the host.
+ Reserved                    0b11      Reserved for future use
+ =========================   =======   ========================================
+
+The physical address size for a VM (IPA Size limit) is limited to 40bits
+by default. The limit can be configured if the host supports the
 extension KVM_CAP_ARM_VM_IPA_SIZE. When supported, use
 KVM_VM_TYPE_ARM_IPA_SIZE(IPA_Bits) to set the size in the machine type
 identifier, where IPA_Bits is the maximum width of any physical
