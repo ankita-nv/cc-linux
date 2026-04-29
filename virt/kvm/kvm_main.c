@@ -1360,6 +1360,7 @@ static int kvm_vm_release(struct inode *inode, struct file *filp)
 
 	kvm_irqfd_release(kvm);
 
+	RCU_INIT_POINTER(kvm->_file, NULL);
 	kvm_put_kvm(kvm);
 	return 0;
 }
@@ -5584,6 +5585,7 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
 		r = PTR_ERR(file);
 		goto put_kvm;
 	}
+	rcu_assign_pointer(kvm->_file, file);
 
 	/*
 	 * Don't call kvm_put_kvm anymore at this point; file->f_op is
