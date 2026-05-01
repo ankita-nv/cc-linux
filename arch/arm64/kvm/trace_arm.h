@@ -3,6 +3,7 @@
 #define _TRACE_ARM_ARM64_KVM_H
 
 #include <asm/kvm_emulate.h>
+#include <linux/arm-smccc-rmi.h>
 #include <kvm/arm_arch_timer.h>
 #include <linux/tracepoint.h>
 
@@ -48,6 +49,130 @@ TRACE_EVENT(kvm_exit,
 		  __entry->esr_ec,
 		  __print_symbolic(__entry->esr_ec, kvm_arm_exception_class),
 		  __entry->vcpu_pc)
+);
+
+/*
+ * Realm (CCA) entry/exit tracepoints.
+ *
+ * The host has no visibility into a Realm vCPU's live PC or general state,
+ * so the generic kvm_entry/kvm_exit events are not useful for Realms (PC
+ * is always the static value KVM last wrote, and the exit ESR field is
+ * meaningless because the trap class is not directly observable).
+ *
+ * These events instead surface what the host actually knows: the previous
+ * exit reason at entry time, and the RMM-reported exit_reason / ESR / FAR
+ * / HPFAR at exit time. For RIPAS_CHANGE exits the requested base/top/value
+ * are also recorded.
+ */
+TRACE_EVENT(kvm_rec_entry,
+	TP_PROTO(const struct rec_run *run),
+	TP_ARGS(run),
+
+	TP_STRUCT__entry(
+		__field(u8, prev_exit_reason)
+		__field(u64, enter_flags)
+		__field(u64, enter_gpr0)
+	),
+
+	TP_fast_assign(
+		__entry->prev_exit_reason	= run->exit.exit_reason;
+		__entry->enter_flags		= run->enter.flags;
+		__entry->enter_gpr0		= run->enter.gprs[0];
+	),
+
+	TP_printk("prev_exit %s, flags 0x%llx, gpr0 0x%llx",
+		  __print_symbolic(__entry->prev_exit_reason,
+				   { RMI_EXIT_SYNC,		"SYNC"		},
+				   { RMI_EXIT_IRQ,		"IRQ"		},
+				   { RMI_EXIT_FIQ,		"FIQ"		},
+				   { RMI_EXIT_PSCI,		"PSCI"		},
+				   { RMI_EXIT_RIPAS_CHANGE,	"RIPAS_CHANGE"	},
+				   { RMI_EXIT_HOST_CALL,	"HOST_CALL"	},
+				   { RMI_EXIT_SERROR,		"SERROR"	}),
+		  __entry->enter_flags, __entry->enter_gpr0)
+);
+
+TRACE_EVENT(kvm_rec_exit,
+	TP_PROTO(int rec_run_ret, const struct rec_run *run),
+	TP_ARGS(rec_run_ret, run),
+
+	TP_STRUCT__entry(
+		__field(int, rec_run_ret)
+		__field(u8, exit_reason)
+		__field(unsigned int, esr_ec)
+		__field(u64, esr)
+		__field(u64, far)
+		__field(u64, hpfar)
+		__field(u64, ipa)
+		__field(u64, ripas_base)
+		__field(u64, ripas_top)
+		__field(u8, ripas_value)
+	),
+
+	TP_fast_assign(
+		__entry->rec_run_ret	= rec_run_ret;
+		__entry->exit_reason	= run->exit.exit_reason;
+		__entry->esr		= run->exit.esr;
+		__entry->esr_ec		= ESR_ELx_EC(run->exit.esr);
+		__entry->far		= run->exit.far;
+		__entry->hpfar		= run->exit.hpfar;
+		__entry->ipa		= (run->exit.exit_reason == RMI_EXIT_SYNC) ?
+					  ((run->exit.hpfar >> 4) << 12) |
+					  (run->exit.far & GENMASK_ULL(11, 0)) : 0;
+		__entry->ripas_base	= run->exit.ripas_base;
+		__entry->ripas_top	= run->exit.ripas_top;
+		__entry->ripas_value	= run->exit.ripas_value;
+	),
+
+	TP_printk("ret 0x%x, reason %s, esr 0x%llx(%s), ipa 0x%llx, far 0x%llx, hpfar 0x%llx, ripas [0x%llx-0x%llx] %u",
+		__entry->rec_run_ret,
+		__print_symbolic(__entry->exit_reason,
+				 { RMI_EXIT_SYNC,		"SYNC"		},
+				 { RMI_EXIT_IRQ,		"IRQ"		},
+				 { RMI_EXIT_FIQ,		"FIQ"		},
+				 { RMI_EXIT_PSCI,		"PSCI"		},
+				 { RMI_EXIT_RIPAS_CHANGE,	"RIPAS_CHANGE"	},
+				 { RMI_EXIT_HOST_CALL,		"HOST_CALL"	},
+				 { RMI_EXIT_SERROR,		"SERROR"	}),
+		__entry->esr,
+		__print_symbolic(__entry->esr_ec, kvm_arm_exception_class),
+		__entry->ipa, __entry->far, __entry->hpfar,
+		__entry->ripas_base, __entry->ripas_top,
+		__entry->ripas_value)
+);
+
+/*
+ * Fired once per fault / populate mapping inside a Realm, just before the
+ * dispatch to realm_map_protected() or realm_map_non_secure(). Captures the
+ * IPA (post alignment), the host PFN, the map size, protection bits, and
+ * whether this is a protected (private) or non-secure (shared) mapping.
+ */
+TRACE_EVENT(kvm_realm_map_ipa,
+	TP_PROTO(phys_addr_t ipa, kvm_pfn_t pfn,
+		 unsigned long map_size, enum kvm_pgtable_prot prot,
+		 bool is_protected),
+	TP_ARGS(ipa, pfn, map_size, prot, is_protected),
+
+	TP_STRUCT__entry(
+		__field(phys_addr_t, ipa)
+		__field(kvm_pfn_t, pfn)
+		__field(unsigned long, map_size)
+		__field(unsigned int, prot)
+		__field(bool, is_protected)
+	),
+
+	TP_fast_assign(
+		__entry->ipa		= ipa;
+		__entry->pfn		= pfn;
+		__entry->map_size	= map_size;
+		__entry->prot		= (unsigned int)prot;
+		__entry->is_protected	= is_protected;
+	),
+
+	TP_printk("ipa 0x%016llx, pfn 0x%llx, size 0x%lx, prot 0x%x, %s",
+		  __entry->ipa, (u64)__entry->pfn,
+		  __entry->map_size, __entry->prot,
+		  __entry->is_protected ? "protected" : "shared")
 );
 
 TRACE_EVENT(kvm_guest_fault,

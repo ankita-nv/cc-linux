@@ -13,6 +13,8 @@
 #include <asm/rmi_cmds.h>
 #include <asm/virt.h>
 
+#include "trace.h"
+
 static inline unsigned long rmi_rtt_level_mapsize(int level)
 {
 	if (WARN_ON(level > KVM_PGTABLE_LAST_LEVEL))
@@ -1153,6 +1155,8 @@ int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
 	struct realm *realm = &kvm->arch.realm;
 
 	ipa = ALIGN_DOWN(ipa, map_size);
+	trace_kvm_realm_map_ipa(ipa, pfn, map_size, prot,
+				kvm_realm_is_private_address(realm, ipa));
 	if (!kvm_realm_is_private_address(realm, ipa)) {
 		return realm_map_non_secure(kvm, ipa, pfn, map_size, prot,
 					    memcache);
