@@ -3364,6 +3364,13 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 	struct realm *realm = &kvm->arch.realm;
 	struct kvm_s2_mmu *mmu = &kvm->arch.mmu;
 
+	/* TODO: This should be done in VMM to handle
+	 * NS IOMMU mappings correctly. For now, remove the
+	 * potential NS mappings to avoid duplicate mappings
+	 * to the same ranges.
+	 */
+	kvm_realm_unmap_range(kvm, start_ipa, end_ipa - start_ipa, false, false);
+
 	ret = rmi_init_device_gpt_range(start_pa, end_ipa - start_ipa);
 	if (ret)
 		return ret;
