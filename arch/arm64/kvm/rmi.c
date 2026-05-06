@@ -456,7 +456,14 @@ static int realm_create_rtt_levels(struct realm *realm,
 			return -ENOMEM;
 
 		ret = realm_rtt_create(realm, ipa, level, rtt);
-		if (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT &&
+		if ((ret >= 0) &&
+		    (RMI_RETURN_STATUS(ret) == RMI_BLOCKED)) {
+			free_rtt(rtt);
+			return -EAGAIN;
+		}
+
+		if ((ret >= 0) &&
+		    (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) &&
 		    RMI_RETURN_INDEX(ret) == level - 1) {
 			/* The RTT already exists, continue */
 			free_rtt(rtt);
@@ -1083,113 +1090,222 @@ static unsigned long addr_range_desc(unsigned long phys, int level,
 }
 
 /*
- * Check why a protected range delegation failed at @ipa.
+ * Read and classify the primary RTTE covering @ipa.
  *
- * Returns 1 when an existing matching protected mapping covers @ipa and the
- * caller can retry after @next_ipa, -EAGAIN when a child RTT blocks the
- * current mapping level, 0 when no existing RTTE explains the delegation
- * failure, or a negative errno for an invalid/conflicting RTTE.
+ * Return 0 for an assigned or unassigned entry, -EAGAIN if a table exists at
+ * @map_level and the caller must descend, -EBUSY if the RMM reports
+ * RMI_BLOCKED, or -ENXIO if the RTTE cannot be read or has an unsupported
+ * state. For assigned and unassigned entries, @next_ipa is set to the
+ * exclusive end of the entry.
  */
-static int realm_map_target(unsigned long rd, unsigned long ipa,
-			    phys_addr_t phys, int map_level,
-			    unsigned long ipa_top, unsigned long *next_ipa)
+static int realm_read_rtte(unsigned long rd, unsigned long ipa, int map_level,
+			   unsigned long ipa_top, struct rtt_entry *rtte,
+			   unsigned long *next_ipa)
+{
+	unsigned long map_size;
+	unsigned long read_ipa;
+	int ret;
+
+	read_ipa = ALIGN_DOWN(ipa, rmi_rtt_level_mapsize(map_level));
+	ret = rmi_rtt_read_entry(rd, read_ipa, map_level, rtte);
+
+	if (RMI_RETURN_STATUS(ret) == RMI_BLOCKED)
+		return -EBUSY;
+
+	if (ret != RMI_SUCCESS)
+		return -ENXIO;
+
+	if (WARN_ONCE(rtte->walk_level > map_level ||
+		      rtte->walk_level > KVM_PGTABLE_LAST_LEVEL,
+		      "RMI: invalid RTT walk level %lu/%d: %d\n",
+		      rtte->walk_level, map_level, -ENXIO))
+		return -ENXIO;
+
+	map_size = rmi_rtt_level_mapsize(rtte->walk_level);
+	*next_ipa = min(ALIGN_DOWN(ipa, map_size) + map_size, ipa_top);
+
+	switch (rtte->state) {
+	case RMI_UNASSIGNED:
+	case RMI_ASSIGNED:
+		break;
+	case RMI_TABLE:
+		return (rtte->walk_level == map_level) ? -EAGAIN : -ENXIO;
+	default:
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+/*
+ * Select the largest block order supported by the existing RTT hierarchy at
+ * @ipa. A single walk to L2 distinguishes an L1 block from an L2 block and an
+ * L2 table. Keep @max_order if the hierarchy cannot be classified so the map
+ * path retains its existing retry and recovery behaviour.
+ */
+int realm_rtt_map_order(struct kvm *kvm, unsigned long ipa, int max_order)
+{
+	struct realm *realm = &kvm->arch.realm;
+	const int map_level = KVM_PGTABLE_LAST_LEVEL - 1;
+	unsigned long next_ipa;
+	struct rtt_entry rtte;
+	int ret;
+
+	lockdep_assert_held(&kvm->mmu_lock);
+
+	ret = realm_read_rtte(virt_to_phys(realm->rd), ipa, map_level,
+			      ALIGN_DOWN(ipa, PMD_SIZE) + PMD_SIZE,
+			      &rtte, &next_ipa);
+	if (ret == -EAGAIN)
+		return 0;
+	if (ret || rtte.walk_level < map_level)
+		return max_order;
+
+	return min(max_order, PMD_ORDER);
+}
+
+/*
+ * Check the protected mapping covering @ipa.
+ *
+ * Return 1 if an assigned RAM entry maps @ipa to @phys. Return 0 for an
+ * unassigned entry, -EAGAIN if the caller must descend through an RTT table,
+ * -EBUSY if the RMM reports RMI_BLOCKED, -EFAULT for a conflicting mapping,
+ * or -ENXIO if the RTTE cannot be read or has an unsupported state. For
+ * matching and unassigned entries, @next_ipa is set to the exclusive end of
+ * the entry.
+ */
+static int realm_check_protected_mapping(unsigned long rd, unsigned long ipa,
+					 phys_addr_t phys, int map_level,
+					 unsigned long ipa_top,
+					 unsigned long *next_ipa)
 {
 	struct rtt_entry rtte;
 	unsigned long map_size;
 	phys_addr_t rtte_phys;
 	int ret;
 
-	ret = rmi_rtt_read_entry(rd, ipa, map_level, &rtte);
-	if (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT)
-		return 0;
+	ret = realm_read_rtte(rd, ipa, map_level, ipa_top, &rtte, next_ipa);
 	if (ret)
-		return -ENXIO;
+		return ret;
 
-	switch (rtte.state) {
-	case RMI_UNASSIGNED:
+	if (rtte.state == RMI_UNASSIGNED)
 		return 0;
-	case RMI_TABLE:
-		if (rtte.walk_level == map_level)
-			return -EAGAIN;
-		return 0;
-	case RMI_ASSIGNED:
-		break;
-	default:
-		return -ENXIO;
-	}
 
 	map_size = rmi_rtt_level_mapsize(rtte.walk_level);
 	rtte_phys = kvm_pte_to_phys(rtte.desc) + (ipa & (map_size - 1));
+
 	if ((rtte.ripas != RMI_RAM) || (rtte_phys != phys))
 		return -EFAULT;
 
-	*next_ipa = min(ALIGN_DOWN(ipa, map_size) + map_size, ipa_top);
 	return 1;
 }
+
+struct realm_map_run {
+	unsigned long ipa;
+	unsigned long top;
+	phys_addr_t phys;
+};
 
 /*
  * Delegate the next contiguous run of backing memory that still needs a
  * protected mapping.
  *
- * Range delegation normally covers the whole target in a single operation, but
- * it can stop early when part of the range was already delegated and mapped by
- * an earlier or concurrent population path. Leading already-mapped granules are
- * skipped, and delegation stops at the first granule that blocks it. The run
- * returned in [*run_ipa, *run_top) was therefore freshly delegated by this call
- * and contains no already-mapped granule, so the caller can map it and, on
- * failure, undelegate exactly the granules that changed ownership without ever
- * touching guest_memfd-backed mappings. The backing PA is the caller's @phys
- * offset by (*run_ipa - @ipa), since the IPA->PA mapping is linear.
+ * Range delegation can skip granules already in the delegated state, including
+ * granules delegated by another fault. If delegation makes no progress, inspect
+ * the RTT and either skip a matching mapping or retry the delegation bounded to
+ * the unmapped span the walk found. The backing PA is the caller's @phys offset
+ * by (run->ipa - @ipa), since the IPA->PA mapping is linear.
  *
- * Returns 0 with *run_top == *run_ipa == ipa_top when nothing remains to map
+ * Returns 0 with run->top == run->ipa == ipa_top when nothing remains to map
  * (the rest of the range is already mapped), 0 with a non-empty run to map, or
- * a negative errno. On error this call leaves nothing delegated.
+ * -E2BIG when a coarse zero-progress request should be retried around the
+ * fault, or another negative errno.
  */
-static int realm_prepare_protected_map(struct realm *realm, unsigned long rd,
-				       unsigned long ipa, phys_addr_t phys,
-				       unsigned long ipa_top,
-				       unsigned long *run_ipa,
-				       unsigned long *run_top)
+static int realm_prepare_protected_map(struct realm *realm, unsigned long ipa,
+				       phys_addr_t phys, unsigned long ipa_top,
+				       bool allow_fault_fallback,
+				       struct realm_map_run *run)
 {
+	phys_addr_t rd = virt_to_phys(realm->rd);
 	unsigned long next_ipa;
 	int map_level;
 	int ret;
 
 	while (ipa < ipa_top) {
-		unsigned long delegated_size = 0;
+		unsigned long request_size = ipa_top - ipa;
+		unsigned long delegated_size;
+		bool skipped = false;
+		int delegate_status;
 
-		ret = realm_delegate_range(phys, ipa_top - ipa,
+retry_delegate:
+		delegated_size = 0;
+		ret = realm_delegate_range(phys, request_size,
 					   &delegated_size);
 		if (delegated_size) {
 			/*
-			 * Hand back the freshly delegated prefix as the run to
-			 * map. Delegation excludes any granule that stopped it,
-			 * so the run never contains an already-mapped hole. Any
-			 * terminal error is rediscovered on the next call, once
-			 * this run has been mapped.
+			 * Hand back the delegated prefix as the run to map. It may
+			 * include granules already delegated by another fault, but
+			 * RMI_RTT_DATA_MAP treats an exact existing mapping as
+			 * success.
 			 */
-			*run_ipa = ipa;
-			*run_top = ipa + delegated_size;
+			run->ipa = ipa;
+			run->top = ipa + delegated_size;
+			run->phys = phys;
 			return 0;
 		}
 
 		if (ret < 0)
 			return ret;
+		if (RMI_RETURN_STATUS(ret) == RMI_BUSY ||
+		    RMI_RETURN_STATUS(ret) == RMI_BLOCKED)
+			return -EAGAIN;
+
+		/* The RTT walk below reuses @ret, so keep the delegate status. */
+		delegate_status = RMI_RETURN_STATUS(ret);
 
 		/*
-		 * Delegation made no progress: the granule at @ipa is already
-		 * delegated or mapped. If it is mapped to the expected PA, skip
-		 * it and continue; otherwise it is a genuine conflict.
+		 * A failed range made no state change. Let the fault handler retry
+		 * only the fault-containing subrange.
 		 */
-		map_level = find_aligned_map_level(realm, ipa, phys, ipa_top);
+		if (allow_fault_fallback && (request_size > PAGE_SIZE) &&
+		    (delegate_status == RMI_ERROR_INPUT))
+			return -E2BIG;
+
+		/*
+		 * Delegation made no progress. This can be a Granule-state conflict
+		 * or a tracking-region constraint. If @ipa is already mapped to the
+		 * expected PA, skip it and continue; otherwise propagate the
+		 * conflict through the mapping recovery path.
+		 */
+		map_level = find_aligned_map_level(realm, ipa, phys,
+						   ipa + request_size);
 retry_check:
-		ret = realm_map_target(rd, ipa, phys, map_level, ipa_top,
-				       &next_ipa);
+		ret = realm_check_protected_mapping(rd, ipa, phys, map_level,
+						    ipa_top, &next_ipa);
 		if (ret > 0) {
+			if (WARN_ON_ONCE(next_ipa <= ipa))
+				return -ENXIO;
+
 			phys += next_ipa - ipa;
 			ipa = next_ipa;
-			continue;
+			if (ipa >= ipa_top)
+				break;
+
+			/*
+			 * Walk the rest of an already-mapped span with
+			 * RTT_READ_ENTRY alone. Re-entering the loop would issue
+			 * a whole-range delegate per mapped entry, and that
+			 * delegate cannot succeed until the walk reaches an entry
+			 * which is not already mapped.
+			 */
+			skipped = true;
+			map_level = find_aligned_map_level(realm, ipa, phys,
+							   ipa_top);
+			goto retry_check;
 		}
+
+		if (ret == -EBUSY)
+			return -EAGAIN;
 
 		if (ret == -EAGAIN) {
 			/*
@@ -1203,31 +1319,54 @@ retry_check:
 			goto retry_check;
 		}
 
+		if (ret == 0) {
+			/* Reissue delegation from the first entry not already mapped. */
+			if (skipped)
+				continue;
+
+			/*
+			 * DEN0137 §B4.5.10 leaves out_top UNKNOWN unless the
+			 * result is RMI_SUCCESS, and permits the RMM to refuse
+			 * the whole request with RMI_ERROR_INPUT when the range
+			 * spans a Granule which is unpopulated or whose state is
+			 * neither GRAN_UNDELEGATED nor GRAN_DELEGATED. An RMM
+			 * which instead stops short of that Granule reports the
+			 * delegated prefix, which is handled above. Such a
+			 * failure carries no usable progress, so bound the
+			 * request to [ipa, next_ipa), which no RTTE maps.
+			 */
+			if ((delegate_status == RMI_ERROR_INPUT) &&
+			    ((next_ipa - ipa) < request_size)) {
+				request_size = next_ipa - ipa;
+				goto retry_delegate;
+			}
+		}
+
 		return ret < 0 ? ret : -ENXIO;
 	}
 
 	/* The whole range is already mapped; nothing left to delegate or map. */
-	*run_ipa = ipa_top;
-	*run_top = ipa_top;
+	run->ipa = ipa_top;
+	run->top = ipa_top;
+	run->phys = phys;
 	return 0;
 }
 
 /*
  * Install protected RTT entries for memory that has already been delegated.
  *
- * @mapped_ipa tracks the exclusive end of the successfully mapped prefix so
- * realm_map_protected() can unwind only the portion that changed on failure.
+ * Matching mappings installed by another fault are treated as progress.
  */
-static int realm_map_delegated_range(struct realm *realm, unsigned long rd,
-				     unsigned long ipa, phys_addr_t phys,
-				     unsigned long ipa_top,
-				     struct kvm_mmu_memory_cache *memcache,
-				     unsigned long *mapped_ipa)
+static int realm_map_delegated_range(struct realm *realm,
+				     const struct realm_map_run *run,
+				     struct kvm_mmu_memory_cache *memcache)
 {
+	phys_addr_t rd = virt_to_phys(realm->rd);
+	phys_addr_t phys = run->phys;
+	unsigned long ipa = run->ipa;
+	unsigned long ipa_top = run->top;
 	int map_level;
 	int ret = 0;
-
-	*mapped_ipa = ipa;
 
 	while (ipa < ipa_top) {
 		unsigned long block_size;
@@ -1248,17 +1387,60 @@ retry_chunk:
 					    RMI_OP_MEM_DELEGATED);
 
 		ret = rmi_rtt_data_map(rd, ipa, ipa + chunk_size, flags,
-				       range_desc,
-				       &out_top);
+				       range_desc, &out_top);
+		if ((ret >= 0) && (RMI_RETURN_STATUS(ret) == RMI_BLOCKED))
+			return -EAGAIN;
 
-		if (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) {
-			/* Create missing RTTs and retry */
+		if ((ret >= 0) && (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT)) {
+			unsigned long next_ipa;
 			int level = RMI_RETURN_INDEX(ret);
+			int state;
+
+			if (WARN_ONCE(level > KVM_PGTABLE_LAST_LEVEL,
+				      "RMI: DATA_MAP invalid RTT level %d: %d\n",
+				      level, -ENXIO))
+				return -ENXIO;
+
+			/*
+			 * RMI_ERROR_RTT also reports incompatible or concurrently
+			 * modified entries. Read the walk result before assuming that
+			 * an RTT is missing.
+			 */
+			state = realm_check_protected_mapping(rd, ipa, phys, level,
+								ipa_top, &next_ipa);
+			if (state > 0) {
+				phys += next_ipa - ipa;
+				ipa = next_ipa;
+				continue;
+			}
+
+			/* Retry the fault after a blocked RTTE read. */
+			if (state == -EBUSY)
+				return -EAGAIN;
+
+			if (state == -EAGAIN) {
+				/*
+				 * A table appeared at the level reported by the failed
+				 * command. Retry if the target is below it; otherwise
+				 * descend into it.
+				 */
+				if (level < map_level)
+					goto retry_chunk;
+				if (map_level < KVM_PGTABLE_LAST_LEVEL) {
+					map_level++;
+					goto retry_lower_level;
+				}
+				return -ENXIO;
+			}
+
+			/* Propagate a conflicting or malformed RTTE. */
+			if (state < 0)
+				return state;
 
 			if (level < map_level) {
-				ret = realm_create_rtt_levels(realm,
-							      ipa, level,
-							      map_level,
+				/* The walk stopped above the target; create its RTTs. */
+				ret = realm_create_rtt_levels(realm, ipa,
+							      level, map_level,
 							      memcache);
 				if (ret)
 					return ret;
@@ -1267,11 +1449,13 @@ retry_chunk:
 
 			if (level == map_level &&
 			    map_level < KVM_PGTABLE_LAST_LEVEL) {
+				/* Retry an unassigned target at a finer level. */
 				map_level++;
 				goto retry_lower_level;
 			}
 
 			if (chunk_size > block_size) {
+				/* Retry the first entry of the failing counted range. */
 				chunk_size = block_size;
 				goto retry_chunk;
 			}
@@ -1280,8 +1464,9 @@ retry_chunk:
 				return -ENXIO;
 		}
 
-		if (WARN_ON(ret))
-			return ret < 0 ? ret : -ENXIO;
+		/* Let the caller classify concurrent mapping failures. */
+		if (ret)
+			return ret;
 
 		if (WARN_ON(out_top <= ipa || out_top > ipa + chunk_size ||
 			    !IS_ALIGNED(out_top - ipa, block_size)))
@@ -1289,85 +1474,225 @@ retry_chunk:
 
 		phys += out_top - ipa;
 		ipa = out_top;
-		*mapped_ipa = ipa;
 	}
 
 	return 0;
 }
 
-int realm_map_protected(struct kvm *kvm,
-			unsigned long ipa,
-			kvm_pfn_t pfn,
-			unsigned long map_size,
-			struct kvm_mmu_memory_cache *memcache)
+static int __realm_map_protected(struct kvm *kvm, unsigned long ipa,
+				 kvm_pfn_t pfn, unsigned long map_size,
+				 struct kvm_mmu_memory_cache *memcache,
+				 bool allow_fault_fallback)
 {
 	struct realm *realm = &kvm->arch.realm;
 	phys_addr_t phys = __pfn_to_phys(pfn);
-	phys_addr_t rd = virt_to_phys(realm->rd);
 	unsigned long ipa_top = ipa + map_size;
 	unsigned long cur_ipa = ipa;
 	int ret;
+
+	lockdep_assert_held(&kvm->mmu_lock);
 
 	if (WARN_ON(!IS_ALIGNED(map_size | ipa, PAGE_SIZE)))
 		return -EINVAL;
 
 	/*
-	 * Delegate and map one contiguous run at a time. Each run is hole-free
-	 * (realm_prepare_protected_map() stops delegation at, and skips, any
-	 * already-mapped granule), so on failure the cleanup only ever
-	 * undelegates memory this call delegated - never a granule that is
-	 * still mapped into guest_memfd. The IPA->PA mapping is linear, so each
-	 * run's backing PA is @phys offset by (run_ipa - @ipa).
+	 * Delegate and map one contiguous run at a time. A run can include
+	 * granules already delegated by another fault. The IPA->PA mapping is
+	 * linear, so each run's backing PA is @phys offset by (run.ipa - @ipa).
 	 */
 	while (cur_ipa < ipa_top) {
-		unsigned long run_ipa;
-		unsigned long run_top;
-		unsigned long mapped_ipa;
-		phys_addr_t run_phys;
+		struct realm_map_run run;
 
-		ret = realm_prepare_protected_map(realm, rd, cur_ipa,
+		ret = realm_prepare_protected_map(realm, cur_ipa,
 						  phys + (cur_ipa - ipa),
-						  ipa_top, &run_ipa, &run_top);
+						  ipa_top,
+						  allow_fault_fallback, &run);
 		if (ret)
 			return ret;
 
 		/* No more memory needs mapping (remainder already mapped). */
-		if (run_top <= run_ipa)
+		if (run.top <= run.ipa)
 			break;
 
-		run_phys = phys + (run_ipa - ipa);
-		ret = realm_map_delegated_range(realm, rd, run_ipa, run_phys,
-						run_top, memcache, &mapped_ipa);
-		if (ret) {
-			/*
-			 * Roll back only this run. The mapped prefix is
-			 * unmapped+undelegated; the still-delegated tail
-			 * [mapped_ipa, run_top) is undelegated. Earlier runs and
-			 * pre-existing mappings are left untouched and are
-			 * reclaimed on Realm teardown or reused on refault.
-			 */
-			if (run_ipa < mapped_ipa)
-				realm_unmap_private_range(kvm, run_ipa,
-							  mapped_ipa, true);
-			if (mapped_ipa < run_top)
-				realm_undelegate_map_range(run_phys +
-							   (mapped_ipa - run_ipa),
-							   run_top - mapped_ipa);
+		ret = realm_map_delegated_range(realm, &run, memcache);
+		if (ret)
 			return ret;
-		}
 
-		cur_ipa = run_top;
+		cur_ipa = run.top;
 	}
 
 	return 0;
 }
 
-static int realm_map_non_secure(struct kvm *kvm,
-				unsigned long ipa,
-				kvm_pfn_t pfn,
-				unsigned long size,
-				enum kvm_pgtable_prot prot,
-				struct kvm_mmu_memory_cache *memcache)
+int realm_map_protected(struct kvm *kvm, unsigned long ipa, kvm_pfn_t pfn,
+			unsigned long map_size,
+			struct kvm_mmu_memory_cache *memcache)
+{
+	bool allow_fault_fallback;
+
+	allow_fault_fallback = (map_size == PUD_SIZE ||
+				map_size == PMD_SIZE) &&
+			       IS_ALIGNED(ipa | __pfn_to_phys(pfn), map_size);
+
+	return __realm_map_protected(kvm, ipa, pfn, map_size, memcache,
+				     allow_fault_fallback);
+}
+
+enum realm_map_recovery {
+	REALM_MAP_RECOVER_RETRY,
+	REALM_MAP_RECOVER_FAIL,
+	REALM_MAP_RECOVER_REFAULT,
+};
+
+struct realm_map_request {
+	struct kvm *kvm;
+	unsigned long ipa;
+	kvm_pfn_t pfn;
+	unsigned long size;
+	struct kvm_mmu_memory_cache *memcache;
+};
+
+static int realm_recover_protected_map(const struct realm_map_request *req,
+				       int map_ret, enum realm_map_recovery recovery)
+{
+	struct kvm *kvm = req->kvm;
+	struct realm *realm = &kvm->arch.realm;
+	phys_addr_t start_phys = __pfn_to_phys(req->pfn);
+	phys_addr_t phys = start_phys;
+	phys_addr_t rd = virt_to_phys(realm->rd);
+	unsigned long start_ipa = req->ipa;
+	unsigned long end_ipa = start_ipa + req->size;
+	unsigned long ipa = start_ipa;
+	bool has_unmapped = false;
+	int ret;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	while (ipa < end_ipa) {
+		unsigned long next_ipa;
+		int map_level;
+		int entry_state;
+
+		map_level = find_aligned_map_level(realm, ipa, phys, end_ipa);
+retry:
+		entry_state = realm_check_protected_mapping(rd, ipa, phys,
+							    map_level, end_ipa,
+							    &next_ipa);
+		if (entry_state > 0) {
+			phys += next_ipa - ipa;
+			ipa = next_ipa;
+			continue;
+		}
+
+		if (entry_state == -EBUSY)
+			return -EAGAIN;
+
+		if (entry_state == -EAGAIN) {
+			if (map_level >= KVM_PGTABLE_LAST_LEVEL)
+				return -ENXIO;
+			map_level++;
+			goto retry;
+		}
+
+		if (entry_state < 0) {
+			pr_warn_ratelimited("RMI: DATA_MAP recovery failed ret=%d status=%ld err=%d\n",
+					    map_ret,
+					    map_ret >= 0 ?
+					    (long)RMI_RETURN_STATUS(map_ret) : -1L,
+					    entry_state);
+			return entry_state;
+		}
+
+		/* No RTTE maps this part of the failed range. */
+		if (recovery != REALM_MAP_RECOVER_RETRY) {
+			ret = realm_undelegate_map_range(phys, next_ipa - ipa);
+			if (ret) {
+				pr_warn_ratelimited("RMI: DATA_MAP cleanup failed ret=%d status=%ld err=%d\n",
+						    map_ret,
+						    map_ret >= 0 ?
+						    (long)RMI_RETURN_STATUS(map_ret) : -1L,
+						    ret);
+				return ret;
+			}
+		}
+
+		has_unmapped = true;
+		phys += next_ipa - ipa;
+		ipa = next_ipa;
+	}
+
+	if (!has_unmapped)
+		return 0;
+
+	/*
+	 * Another fault can complete part of the range between delegation and
+	 * DATA_MAP. Linux may also have converted the resulting RMI failure to
+	 * -ENXIO before reaching this recovery path. Retry the complete
+	 * delegate+map sequence once while the write lock excludes all other fault
+	 * handlers. Leave delegated, unassigned granules in place for the retry;
+	 * clean them up only if the serialized attempt also fails.
+	 */
+	if ((recovery == REALM_MAP_RECOVER_RETRY) &&
+	    ((map_ret == -ENXIO) || (map_ret == -EAGAIN) ||
+	     ((map_ret >= 0) &&
+	      (RMI_RETURN_STATUS(map_ret) == RMI_ERROR_INPUT)))) {
+		ret = __realm_map_protected(kvm, start_ipa, req->pfn, req->size,
+					    req->memcache, false);
+		if (!ret)
+			return 0;
+
+		return realm_recover_protected_map(req, ret,
+						   REALM_MAP_RECOVER_FAIL);
+	}
+
+	/* Clean up an unassigned tail before propagating a terminal failure. */
+	if (recovery == REALM_MAP_RECOVER_RETRY)
+		return realm_recover_protected_map(req, map_ret,
+						   REALM_MAP_RECOVER_FAIL);
+
+	if (recovery == REALM_MAP_RECOVER_REFAULT)
+		return 0;
+
+	if (map_ret >= 0) {
+		pr_warn_ratelimited("RMI: DATA_MAP failed ipa=%#lx phys=%pa size=%#lx ret=%#x status=%u\n",
+				    start_ipa, &start_phys, req->size,
+				    (unsigned int)map_ret,
+				    (unsigned int)RMI_RETURN_STATUS(map_ret));
+		return -ENXIO;
+	}
+
+	pr_warn_ratelimited("RMI: DATA_MAP failed ipa=%#lx phys=%pa size=%#lx err=%d\n",
+			    start_ipa, &start_phys, req->size, map_ret);
+	return map_ret;
+}
+
+int realm_recover_protected(struct kvm *kvm, unsigned long ipa,
+			    kvm_pfn_t pfn, unsigned long map_size,
+			    int map_ret,
+			    struct kvm_mmu_memory_cache *memcache,
+			    bool mmu_invalidated)
+{
+	const struct realm_map_request req = {
+		.kvm = kvm,
+		.ipa = ipa,
+		.pfn = pfn,
+		.size = map_size,
+		.memcache = memcache,
+	};
+	enum realm_map_recovery recovery;
+
+	recovery = mmu_invalidated ? REALM_MAP_RECOVER_REFAULT :
+					   REALM_MAP_RECOVER_RETRY;
+
+	return realm_recover_protected_map(&req, map_ret, recovery);
+}
+
+int realm_map_non_secure(struct kvm *kvm,
+			 unsigned long ipa,
+			 kvm_pfn_t pfn,
+			 unsigned long size,
+			 enum kvm_pgtable_prot prot,
+			 struct kvm_mmu_memory_cache *memcache)
 {
 	struct realm *realm = &kvm->arch.realm;
 	unsigned long attr, flags = 0;
@@ -1380,6 +1705,8 @@ static int realm_map_non_secure(struct kvm *kvm,
 	unsigned long out_top;
 	int map_level;
 	int ret;
+
+	lockdep_assert_held(&kvm->mmu_lock);
 
 	if (WARN_ON(!IS_ALIGNED(size | ipa, PAGE_SIZE)))
 		return -EINVAL;
@@ -1425,15 +1752,19 @@ retry_chunk:
 		ret = rmi_rtt_unprot_map(rd, ipa, ipa + chunk_size,
 					 flags, range_desc,
 					 &out_top);
+		if ((ret >= 0) &&
+		    (RMI_RETURN_STATUS(ret) == RMI_BLOCKED))
+			return -EAGAIN;
 
-		if (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) {
+		if ((ret >= 0) &&
+		    (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT)) {
 			/* Create missing RTTs and retry */
 			int level = RMI_RETURN_INDEX(ret);
 
 			if (level < map_level) {
-				ret = realm_create_rtt_levels(realm,
-							      ipa, level,
-							      map_level,
+				/* The walk stopped above the target; create its RTTs. */
+				ret = realm_create_rtt_levels(realm, ipa,
+							      level, map_level,
 							      memcache);
 				if (ret)
 					return ret;
@@ -1442,11 +1773,13 @@ retry_chunk:
 
 			if (level == map_level &&
 			    map_level < KVM_PGTABLE_LAST_LEVEL) {
+				/* Retry an unassigned target at a finer level. */
 				map_level++;
 				goto retry_lower_level;
 			}
 
 			if (chunk_size > block_size) {
+				/* Retry the first entry of the failing counted range. */
 				chunk_size = block_size;
 				goto retry_chunk;
 			}
@@ -1467,27 +1800,6 @@ retry_chunk:
 	}
 
 	return 0;
-}
-
-int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
-		  kvm_pfn_t pfn, unsigned long map_size,
-		  enum kvm_pgtable_prot prot,
-		  struct kvm_mmu_memory_cache *memcache)
-{
-	struct realm *realm = &kvm->arch.realm;
-
-	ipa = ALIGN_DOWN(ipa, map_size);
-	trace_kvm_realm_map_ipa(ipa, pfn, map_size, prot,
-				kvm_realm_is_private_address(realm, ipa));
-	if (!kvm_realm_is_private_address(realm, ipa))
-		return realm_map_non_secure(kvm, ipa, pfn, map_size, prot,
-					    memcache);
-
-	/* It is impossible to map protected pages read-only. */
-	if (WARN_ON(!(prot & KVM_PGTABLE_PROT_W)))
-		return -EFAULT;
-
-	return realm_map_protected(kvm, ipa, pfn, map_size, memcache);
 }
 
 static int populate_region_cb(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,

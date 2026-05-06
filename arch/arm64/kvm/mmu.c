@@ -1582,6 +1582,84 @@ static bool kvm_vma_mte_allowed(struct vm_area_struct *vma)
 	return vma->vm_flags & VM_MTE_ALLOWED;
 }
 
+static int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
+			 phys_addr_t fault_ipa,
+			 kvm_pfn_t pfn, unsigned long map_size,
+			 enum kvm_pgtable_prot prot,
+			 unsigned long mmu_seq,
+			 struct kvm_mmu_memory_cache *memcache)
+{
+	struct realm *realm = &kvm->arch.realm;
+	bool invalidated;
+	int ret;
+
+	lockdep_assert_held(&kvm->mmu_lock);
+
+	/*
+	 * Write permission is required for now even though it's possible to
+	 * map unprotected pages (granules) as read-only. It's impossible to
+	 * map protected pages (granules) as read-only.
+	 */
+	if (WARN_ON(!(prot & KVM_PGTABLE_PROT_W)))
+		return -EFAULT;
+
+	ipa = ALIGN_DOWN(ipa, PAGE_SIZE);
+	trace_kvm_realm_map_ipa(ipa, pfn, map_size, prot,
+				kvm_realm_is_private_address(realm, ipa));
+	if (!kvm_realm_is_private_address(realm, ipa))
+		return realm_map_non_secure(kvm, ipa, pfn, map_size, prot,
+					    memcache);
+
+	fault_ipa = ALIGN_DOWN(fault_ipa, PAGE_SIZE);
+	if ((fault_ipa < ipa) || ((fault_ipa - ipa) >= map_size))
+		fault_ipa = ipa;
+
+	for (;;) {
+		phys_addr_t next_ipa;
+
+		ret = realm_map_protected(kvm, ipa, pfn, map_size, memcache);
+		if (ret != -E2BIG)
+			break;
+
+		/* Retry a zero-progress range at the next smaller level. */
+		if (map_size == PUD_SIZE)
+			map_size = PMD_SIZE;
+		else if (map_size == PMD_SIZE)
+			map_size = PAGE_SIZE;
+		else
+			break;
+
+		next_ipa = ALIGN_DOWN(fault_ipa, map_size);
+		pfn += (next_ipa - ipa) >> PAGE_SHIFT;
+		ipa = next_ipa;
+	}
+
+	if (!ret)
+		return 0;
+
+	/*
+	 * Mapping is monotonic while fault handlers hold mmu_lock for read.
+	 * Exclude other fault handlers while classifying the failed range so
+	 * the RTT snapshot remains stable during cleanup.
+	 *
+	 * An MMU invalidation can run while upgrading the lock. In that case,
+	 * the PFN and memory attributes used by this fault are stale: preserve
+	 * matching RTTEs, clean up delegated but unmapped granules, and refault
+	 * instead of retrying the map with the stale tuple.
+	 */
+	kvm_fault_unlock(kvm);
+	write_lock(&kvm->mmu_lock);
+	invalidated = mmu_invalidate_retry(kvm, mmu_seq);
+	ret = realm_recover_protected(kvm, ipa, pfn, map_size, ret,
+				      memcache, invalidated);
+	if (invalidated && !ret)
+		ret = -EAGAIN;
+	write_unlock(&kvm->mmu_lock);
+	kvm_fault_lock(kvm);
+
+	return ret;
+}
+
 static bool kvm_vma_is_cacheable(struct vm_area_struct *vma)
 {
 	switch (FIELD_GET(PTE_ATTRINDX_MASK, pgprot_val(vma->vm_page_prot))) {
@@ -1653,6 +1731,71 @@ struct kvm_s2_fault_desc {
 	unsigned long		hva;
 };
 
+/*
+ * kvm_gmem_get_pfn() validates that the folio-aligned file range is contained
+ * in the memslot's guest_memfd binding. Before installing a multi-page realm
+ * mapping, also make sure that the aligned GFN range stays inside the memslot,
+ * has the same block offset as the PFN, and has uniform memory attributes
+ * matching the fault type:
+ *
+ *   - if @is_priv_fault: every GFN in [map_start, map_end) has the
+ *     KVM_MEMORY_ATTRIBUTE_PRIVATE bit set;
+ *   - otherwise: every GFN in [map_start, map_end) has the bit
+ *     clear (i.e. the entire range is shared).
+ *
+ * Otherwise a memslot with an unaligned base_gfn or gmem.pgoff could make
+ * ALIGN_DOWN(fault_ipa, size) cover GFNs outside the slot, or pair the wrong
+ * aligned PFN with the aligned IPA.
+ *
+ * Because mem_attr_array stores entries only for explicitly-PRIVATE
+ * GFNs, the all-shared probe (attrs=0) collapses to a single xa_find;
+ * the all-private probe is bounded by the proposed huge mapping.
+ */
+static int realm_clamp_order(struct kvm *kvm, struct kvm_memory_slot *slot,
+			     gfn_t gfn, kvm_pfn_t pfn, int max_order,
+			     bool is_priv_fault)
+{
+	unsigned long attrs = is_priv_fault ? KVM_MEMORY_ATTRIBUTE_PRIVATE : 0;
+	unsigned long npages;
+	gfn_t map_start;
+
+	/* Realm mappings support only PUD, PMD, and page granules. */
+	max_order = max_order >= PUD_ORDER ? PUD_ORDER :
+		    max_order >= PMD_ORDER ? PMD_ORDER : 0;
+	if (!max_order)
+		return 0;
+
+	/* Clamp to the largest range allowed by the slot, PFN, and attributes. */
+	while (max_order > 0) {
+		npages = BIT(max_order);
+		map_start = ALIGN_DOWN(gfn, npages);
+
+		if (is_gfn_in_memslot(slot, map_start) &&
+		    is_gfn_in_memslot(slot, map_start + npages - 1) &&
+		    IS_ALIGNED(gfn ^ pfn, npages) &&
+		    kvm_range_has_vm_memory_attributes(kvm, map_start,
+						map_start + npages,
+						KVM_MEMORY_ATTRIBUTE_PRIVATE,
+						attrs))
+			break;
+
+		max_order = max_order == PUD_ORDER ? PMD_ORDER : 0;
+	}
+
+	if (!max_order)
+		return 0;
+
+	/*
+	 * Bound protected delegation to the existing RTT hierarchy.
+	 * Unprotected mappings descend while retaining the full range.
+	 */
+	if (is_priv_fault)
+		max_order = realm_rtt_map_order(kvm, gfn_to_gpa(gfn),
+						max_order);
+
+	return max_order;
+}
+
 static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 {
 	bool write_fault, exec_fault;
@@ -1668,6 +1811,8 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 	void *memcache = NULL;
 	kvm_pfn_t pfn;
 	gfn_t gfn;
+	bool is_priv_fault = false;
+	int max_order = 0;
 	int ret;
 
 	if (!perm_fault) {
@@ -1675,6 +1820,29 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 		ret = topup_mmu_memcache(vcpu, memcache);
 		if (ret)
 			return ret;
+	}
+
+	if (kvm_is_realm(vcpu->kvm)) {
+		/* check for memory attribute mismatch */
+		bool is_priv_gfn = kvm_mem_is_private(kvm, gpa >> PAGE_SHIFT);
+		/*
+		 * For Realms, the shared address is an alias of the private
+		 * PA with the top bit set; if the fault address matches the
+		 * GPA, it is the private alias.
+		 */
+		is_priv_fault = (gpa == s2fd->fault_ipa);
+
+		if (is_priv_gfn != is_priv_fault) {
+			kvm_prepare_memory_fault_exit(vcpu, gpa, PAGE_SIZE,
+						      kvm_is_write_fault(vcpu),
+						      false,
+						      is_priv_fault);
+			/*
+			 * KVM_EXIT_MEMORY_FAULT requires an return code of
+			 * -EFAULT, see the API documentation
+			 */
+			return -EFAULT;
+		}
 	}
 
 	if (s2fd->nested)
@@ -1691,7 +1859,8 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 	/* Pairs with the smp_wmb() in kvm_mmu_invalidate_end(). */
 	smp_rmb();
 
-	ret = kvm_gmem_get_pfn(kvm, s2fd->memslot, gfn, &pfn, &page, NULL);
+	ret = kvm_gmem_get_pfn(kvm, s2fd->memslot, gfn, &pfn, &page,
+			       kvm_is_realm(kvm) ? &max_order : NULL);
 	if (ret) {
 		kvm_prepare_memory_fault_exit(vcpu, gpa, PAGE_SIZE,
 					      write_fault, exec_fault, false);
@@ -1717,9 +1886,31 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 	}
 
 	if (kvm_is_realm(kvm)) {
-		prot &= ~KVM_PGTABLE_PROT_X;
-		ret = realm_map_ipa(kvm, s2fd->fault_ipa, pfn,
-				    PAGE_SIZE, prot, memcache);
+		unsigned long mapping_size;
+		phys_addr_t huge_ipa;
+		kvm_pfn_t aligned_pfn;
+
+		/*
+		 * For realms, only honour the folio's order if the aligned
+		 * range stays within the memslot's guest_memfd binding, maps
+		 * to the same PFN subrange, and has uniform attributes.
+		 */
+		if (memslot_is_logging(s2fd->memslot))
+			max_order = 0;
+		else if (max_order)
+			max_order = realm_clamp_order(kvm, s2fd->memslot, gfn,
+						      pfn, max_order,
+						      is_priv_fault);
+
+		mapping_size = PAGE_SIZE << max_order;
+		huge_ipa = ALIGN_DOWN(s2fd->fault_ipa, mapping_size);
+		aligned_pfn = pfn & ~((mapping_size >> PAGE_SHIFT) - 1);
+
+		ret = realm_map_ipa(kvm, huge_ipa, s2fd->fault_ipa,
+				    aligned_pfn, mapping_size,
+				    KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W,
+				    mmu_seq,
+				    memcache);
 		goto out_release_page;
 	}
 
@@ -2120,8 +2311,9 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
 		sanitise_mte_tags(kvm, pfn, mapping_size);
 
 	if (kvm_is_realm(kvm)) {
-		ret = realm_map_ipa(kvm, s2fd->fault_ipa, pfn, mapping_size,
-				    prot, memcache);
+		ret = realm_map_ipa(kvm, map_ipa, s2fd->fault_ipa, pfn,
+				    mapping_size, prot, s2vi->mmu_seq,
+				    memcache);
 	} else if (mapping_size == perm_fault_granule) {
 		/*
 		 * Under the premise of getting a FSC_PERM fault, we just need to relax
@@ -2788,6 +2980,29 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
 	mmap_read_unlock(current->mm);
 	return ret;
 }
+
+#ifdef CONFIG_KVM_VM_MEMORY_ATTRIBUTES
+bool kvm_arch_pre_set_vm_memory_attributes(struct kvm *kvm,
+					   struct kvm_gfn_range *range)
+{
+	WARN_ON_ONCE(!kvm_arch_has_private_mem(kvm));
+	return false;
+}
+
+bool kvm_arch_post_set_vm_memory_attributes(struct kvm *kvm,
+					    struct kvm_gfn_range *range)
+{
+	if (WARN_ON_ONCE(!kvm_arch_has_private_mem(kvm)))
+		return false;
+
+	if (range->arg.attributes & KVM_MEMORY_ATTRIBUTE_PRIVATE)
+		range->attr_filter = KVM_FILTER_SHARED;
+	else
+		range->attr_filter = KVM_FILTER_PRIVATE;
+
+	return kvm_unmap_gfn_range(kvm, range);
+}
+#endif
 
 void kvm_arch_free_memslot(struct kvm *kvm, struct kvm_memory_slot *slot)
 {
