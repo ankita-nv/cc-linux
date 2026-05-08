@@ -6,6 +6,8 @@
 #include <linux/kvm_host.h>
 #include <uapi/linux/psci.h>
 
+#include <kvm/arm_arch_timer.h>
+
 #include <linux/arm-smccc-rmi.h>
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_rmi.h>
@@ -66,6 +68,18 @@ static void rec_exit_hvc(struct kvm_vcpu *vcpu)
 	    (psci_fn == PSCI_0_2_FN_CPU_ON ||
 	     psci_fn == PSCI_0_2_FN64_CPU_ON))
 		rec->psci_complete_pending = true;
+}
+
+static void update_arch_timer_irq_lines(struct kvm_vcpu *vcpu)
+{
+	struct realm_rec *rec = &vcpu->arch.rec;
+
+	__vcpu_assign_sys_reg(vcpu, CNTV_CTL_EL0, rec->run->exit.cntv_ctl);
+	__vcpu_assign_sys_reg(vcpu, CNTV_CVAL_EL0, rec->run->exit.cntv_cval);
+	__vcpu_assign_sys_reg(vcpu, CNTP_CTL_EL0, rec->run->exit.cntp_ctl);
+	__vcpu_assign_sys_reg(vcpu, CNTP_CVAL_EL0, rec->run->exit.cntp_cval);
+
+	kvm_realm_timers_update(vcpu);
 }
 
 bool kvm_rec_handle_hvc(struct kvm_vcpu *vcpu, int *ret)
@@ -154,6 +168,7 @@ int kvm_rec_exit(struct kvm_vcpu *vcpu, int rec_run_ret)
 
 	/* Reset the emulation flags for the next run of the REC */
 	rec->run->enter.flags = 0;
+	update_arch_timer_irq_lines(vcpu);
 
 	switch (rec->run->exit.exit_reason) {
 	case RMI_EXIT_SYNC:

@@ -493,6 +493,33 @@ static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level,
 			    timer_ctx);
 }
 
+void kvm_realm_timers_update(struct kvm_vcpu *vcpu)
+{
+	struct arch_timer_cpu *arch_timer = &vcpu->arch.timer_cpu;
+	int i;
+
+	for (i = 0; i < NR_KVM_EL0_TIMERS; i++) {
+		struct arch_timer_context *timer = &arch_timer->timers[i];
+		u32 ctl = timer_get_ctl(timer);
+		bool can_fire, status, level;
+
+		/*
+		 * Compute can-fire/level inline rather than calling
+		 * kvm_timer_irq_can_fire(), so this is safe to call without
+		 * regard to arch_timer_context::loaded. The timer regs read
+		 * here are the realm shadows that update_arch_timer_irq_lines()
+		 * just populated from rec_run.exit, not host HW state.
+		 */
+		can_fire = (ctl & (ARCH_TIMER_CTRL_IT_MASK |
+				   ARCH_TIMER_CTRL_ENABLE)) ==
+			   ARCH_TIMER_CTRL_ENABLE;
+		status = ctl & ARCH_TIMER_CTRL_IT_STAT;
+		level = can_fire && status;
+
+		kvm_timer_update_irq(vcpu, level, timer);
+	}
+}
+
 /* Only called for a fully emulated timer */
 static void timer_emulate(struct arch_timer_context *ctx)
 {
@@ -905,6 +932,24 @@ void kvm_timer_vcpu_load(struct kvm_vcpu *vcpu)
 	if (unlikely(!timer->enabled))
 		return;
 
+	/*
+	 * For Realm vCPUs the RMI specification makes RMM the owner of
+	 * the realm's timer state: RMM saves/restores CNTHCTL_EL2 and
+	 * the EL0 timer registers across RMI_REC_ENTER/RMI_REC_EXIT.
+	 * timer_restore_state(), timer_set_traps() and the host VGIC
+	 * injection done by kvm_timer_vcpu_load_gic() here would all be
+	 * wasted (and the latter would inject vIRQs based on a stale
+	 * view of the realm timer). Leaving arch_timer_context::loaded
+	 * == false also keeps kvm_timer_irq_can_fire() from tripping
+	 * its WARN_ON when the post-REC_EXIT kvm_realm_timers_update()
+	 * path runs. Still cancel the bg_timer that may have been armed
+	 * while the vCPU was blocked.
+	 */
+	if (vcpu_is_rec(vcpu)) {
+		kvm_timer_unblocking(vcpu);
+		return;
+	}
+
 	get_timer_map(vcpu, &map);
 
 	if (static_branch_likely(&has_gic_active_state)) {
@@ -939,6 +984,22 @@ void kvm_timer_vcpu_put(struct kvm_vcpu *vcpu)
 
 	if (unlikely(!timer->enabled))
 		return;
+
+	/*
+	 * Mirror kvm_timer_vcpu_load(): per the RMI specification the
+	 * realm's timer state is owned by RMM and lives in the rec_run
+	 * shadow that update_arch_timer_irq_lines() refreshes on each
+	 * REC_EXIT. Skipping timer_save_state() avoids reading host/NS
+	 * timer regs (RMM has already restored them on the way out of
+	 * the realm) and stomping the realm CNTV/CNTP shadows with
+	 * those values. Still arm the bg_timer if the vCPU is blocking,
+	 * so it wakes when the realm's vtimer would fire.
+	 */
+	if (vcpu_is_rec(vcpu)) {
+		if (kvm_vcpu_is_blocking(vcpu))
+			kvm_timer_blocking(vcpu);
+		return;
+	}
 
 	get_timer_map(vcpu, &map);
 
