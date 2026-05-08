@@ -12,6 +12,8 @@
 
 #include <asm/page.h>
 
+unsigned long rmi_feat_reg(unsigned long id);
+
 /**
  * rmi_rmm_config_set() - Configure the RMM
  * @cfg_ptr: PA of a struct rmm_config
