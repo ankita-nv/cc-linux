@@ -1144,6 +1144,68 @@ void debugfs_create_str(const char *name, umode_t mode,
 }
 EXPORT_SYMBOL_GPL(debugfs_create_str);
 
+static ssize_t debugfs_read_file_cpumask(struct file *file,
+					 char __user *user_buf,
+					 size_t count, loff_t *ppos)
+{
+	struct dentry *dentry = F_DENTRY(file);
+	struct cpumask *cpumask;
+	char *kernel_buf;
+	ssize_t ret;
+	int len;
+
+	ret = debugfs_file_get(dentry);
+	if (unlikely(ret))
+		return ret;
+
+	kernel_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!kernel_buf) {
+		debugfs_file_put(dentry);
+		return -ENOMEM;
+	}
+
+	cpumask = (struct cpumask *)file->private_data;
+	len = scnprintf(kernel_buf, PAGE_SIZE, "%*pb\n",
+			cpumask_pr_args(cpumask));
+	debugfs_file_put(dentry);
+
+	if (len + 1 >= PAGE_SIZE) {
+		kfree(kernel_buf);
+		return -EIO;
+	}
+
+	ret = simple_read_from_buffer(user_buf, count, ppos, kernel_buf, len);
+	kfree(kernel_buf);
+
+	return ret;
+}
+
+static const struct file_operations fops_cpumask_ro = {
+	.read	= debugfs_read_file_cpumask,
+	.open	= simple_open,
+	.llseek	= default_llseek,
+};
+
+/**
+ * debugfs_create_cpumask - create a read-only debugfs file backed by a cpumask
+ * @name: file name to create.
+ * @mode: file permissions; write modes are not supported.
+ * @parent: parent debugfs directory, or %NULL for the debugfs root.
+ * @value: the cpumask the file should expose.
+ *
+ * The cpumask is rendered using "%*pb" (cpumask_pr_args), the same format
+ * used by the cpumask attributes under /sys/devices/system/cpu/.
+ */
+void debugfs_create_cpumask(const char *name, umode_t mode,
+			    struct dentry *parent, struct cpumask *value)
+{
+	WARN_ON_ONCE(mode & 0222);
+
+	debugfs_create_mode_unsafe(name, mode, parent, value, &fops_cpumask_ro,
+				   &fops_cpumask_ro, &fops_cpumask_ro);
+}
+EXPORT_SYMBOL_GPL(debugfs_create_cpumask);
+
 static ssize_t read_file_blob(struct file *file, char __user *user_buf,
 			      size_t count, loff_t *ppos)
 {

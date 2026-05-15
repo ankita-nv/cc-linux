@@ -11,11 +11,13 @@
 #include <linux/cacheinfo.h>
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/interrupt.h>
+#include <linux/seq_file.h>
 #include <linux/irq.h>
 #include <linux/irqdesc.h>
 #include <linux/list.h>
@@ -83,6 +85,9 @@ static DECLARE_WORK(mpam_broken_work, &mpam_disable);
 
 /* When mpam is disabled, the printed reason to aid debugging */
 static char *mpam_disable_reason;
+
+/* Root of the /sys/kernel/debug/mpam hierarchy. */
+static struct dentry *mpam_debugfs;
 
 /*
  * Whether resctrl has been setup. Used by cpuhp in preference to
@@ -820,32 +825,32 @@ static void mpam_ris_hw_probe(struct mpam_msc_ris *ris)
 
 	/* Cache Capacity Partitioning */
 	if (FIELD_GET(MPAMF_IDR_HAS_CCAP_PART, ris->idr)) {
-		u32 ccap_features = mpam_read_partsel_reg(msc, CCAP_IDR);
+		ris->ccap_idr = mpam_read_partsel_reg(msc, CCAP_IDR);
 
-		props->cmax_wd = FIELD_GET(MPAMF_CCAP_IDR_CMAX_WD, ccap_features);
+		props->cmax_wd = FIELD_GET(MPAMF_CCAP_IDR_CMAX_WD, ris->ccap_idr);
 		if (props->cmax_wd &&
-		    FIELD_GET(MPAMF_CCAP_IDR_HAS_CMAX_SOFTLIM, ccap_features))
+		    FIELD_GET(MPAMF_CCAP_IDR_HAS_CMAX_SOFTLIM, ris->ccap_idr))
 			mpam_set_feature(mpam_feat_cmax_softlim, props);
 
 		if (props->cmax_wd &&
-		    !FIELD_GET(MPAMF_CCAP_IDR_NO_CMAX, ccap_features))
+		    !FIELD_GET(MPAMF_CCAP_IDR_NO_CMAX, ris->ccap_idr))
 			mpam_set_feature(mpam_feat_cmax_cmax, props);
 
 		if (props->cmax_wd &&
-		    FIELD_GET(MPAMF_CCAP_IDR_HAS_CMIN, ccap_features))
+		    FIELD_GET(MPAMF_CCAP_IDR_HAS_CMIN, ris->ccap_idr))
 			mpam_set_feature(mpam_feat_cmax_cmin, props);
 
-		props->cassoc_wd = FIELD_GET(MPAMF_CCAP_IDR_CASSOC_WD, ccap_features);
+		props->cassoc_wd = FIELD_GET(MPAMF_CCAP_IDR_CASSOC_WD, ris->ccap_idr);
 		if (props->cassoc_wd &&
-		    FIELD_GET(MPAMF_CCAP_IDR_HAS_CASSOC, ccap_features))
+		    FIELD_GET(MPAMF_CCAP_IDR_HAS_CASSOC, ris->ccap_idr))
 			mpam_set_feature(mpam_feat_cmax_cassoc, props);
 	}
 
 	/* Cache Portion partitioning */
 	if (FIELD_GET(MPAMF_IDR_HAS_CPOR_PART, ris->idr)) {
-		u32 cpor_features = mpam_read_partsel_reg(msc, CPOR_IDR);
+		ris->cpor_idr = mpam_read_partsel_reg(msc, CPOR_IDR);
 
-		props->cpbm_wd = FIELD_GET(MPAMF_CPOR_IDR_CPBM_WD, cpor_features);
+		props->cpbm_wd = FIELD_GET(MPAMF_CPOR_IDR_CPBM_WD, ris->cpor_idr);
 		if (props->cpbm_wd)
 			mpam_set_feature(mpam_feat_cpor_part, props);
 	}
@@ -1357,8 +1362,10 @@ static void __ris_msmon_read(void *arg)
 	}
 	mpam_mon_sel_unlock(msc);
 
-	if (nrdy)
+	if (nrdy) {
+		msc->nrdy_retry_count++;
 		m->err = -EBUSY;
+	}
 
 	if (m->err)
 		return;
@@ -2131,6 +2138,9 @@ static void mpam_msc_destroy(struct mpam_msc *msc)
 	list_del_rcu(&msc->all_msc_list);
 	platform_set_drvdata(pdev, NULL);
 
+	debugfs_remove_recursive(msc->debugfs);
+	msc->debugfs = NULL;
+
 	add_to_garbage(msc);
 }
 
@@ -2212,12 +2222,22 @@ static struct mpam_msc *do_mpam_msc_drv_probe(struct platform_device *pdev)
 		}
 		msc->mapped_hwpage_sz = msc_res->end - msc_res->start;
 		msc->mapped_hwpage = io;
+		msc->phys_base = msc_res->start;
 	} else {
 		return ERR_PTR(-EINVAL);
 	}
 
 	list_add_rcu(&msc->all_msc_list, &mpam_all_msc);
 	platform_set_drvdata(pdev, msc);
+
+	if (mpam_debugfs) {
+		char name[20];
+
+		snprintf(name, sizeof(name), "msc.%u", msc->id);
+		msc->debugfs = debugfs_create_dir(name, mpam_debugfs);
+		debugfs_create_x32("max_nrdy_usec", 0400, msc->debugfs,
+				   &msc->nrdy_usec);
+	}
 
 	return msc;
 }
@@ -2859,6 +2879,165 @@ static int mpam_allocate_config(void)
 	return 0;
 }
 
+static void mpam_debugfs_setup_ris(struct mpam_msc_ris *ris)
+{
+	char name[40];
+	struct dentry *d;
+	struct mpam_props *rprops = &ris->props;
+
+	if (!ris->vmsc->msc->debugfs)
+		return;
+
+	snprintf(name, sizeof(name), "ris.%u", ris->ris_idx);
+	d = debugfs_create_dir(name, ris->vmsc->msc->debugfs);
+	debugfs_create_x64("mpamf_idr", 0400, d, &ris->idr);
+	debugfs_create_x32("mpamf_cpor_idr", 0400, d, &ris->cpor_idr);
+	debugfs_create_x32("mpamf_ccap_idr", 0400, d, &ris->ccap_idr);
+	debugfs_create_ulong("features", 0400, d, &rprops->features[0]);
+	debugfs_create_x16("cpbm_wd", 0400, d, &rprops->cpbm_wd);
+	debugfs_create_x16("mbw_pbm_bits", 0400, d, &rprops->mbw_pbm_bits);
+	debugfs_create_x16("num_csu_mon", 0400, d, &rprops->num_csu_mon);
+	debugfs_create_x16("num_mbwu_mon", 0400, d, &rprops->num_mbwu_mon);
+	debugfs_create_cpumask("affinity", 0400, d, &ris->affinity);
+	ris->debugfs = d;
+}
+
+static void mpam_debugfs_setup_vmsc(struct mpam_component *comp,
+				    struct mpam_vmsc *vmsc)
+{
+	char name[40];
+	char path[40];
+	struct dentry *d;
+	struct mpam_msc_ris *ris;
+	int msc_id = vmsc->msc->id;
+
+	if (!comp->debugfs)
+		return;
+
+	snprintf(name, sizeof(name), "vmsc.%u", msc_id);
+	d = debugfs_create_dir(name, comp->debugfs);
+	debugfs_create_ulong("features", 0400, d, &vmsc->props.features[0]);
+	vmsc->debugfs = d;
+
+	list_for_each_entry_rcu(ris, &vmsc->ris, vmsc_list) {
+		snprintf(name, sizeof(name), "msc.%u_ris.%u",
+			 msc_id, ris->ris_idx);
+		snprintf(path, sizeof(path), "../../../msc.%u/ris.%u",
+			 msc_id, ris->ris_idx);
+		debugfs_create_symlink(name, d, path);
+	}
+}
+
+static void mpam_debugfs_setup_comp(struct mpam_class *class,
+				    struct mpam_component *comp)
+{
+	char name[40];
+	struct mpam_vmsc *vmsc;
+
+	if (!class->debugfs)
+		return;
+
+	snprintf(name, sizeof(name), "comp.%u", comp->comp_id);
+	comp->debugfs = debugfs_create_dir(name, class->debugfs);
+
+	list_for_each_entry_rcu(vmsc, &comp->vmsc, comp_list)
+		mpam_debugfs_setup_vmsc(comp, vmsc);
+}
+
+/*
+ * Walk every probed MSC / class / component / vMSC / RIS and surface
+ * their identifying registers and discovered properties under
+ * /sys/kernel/debug/mpam/. The hierarchy mirrors the in-memory
+ * representation so users can correlate resctrl visibility with the
+ * underlying MPAM topology.
+ *
+ * Caller must hold mpam_list_lock.
+ */
+static void mpam_debugfs_setup(void)
+{
+	char name[40];
+	struct dentry *d;
+	struct mpam_msc *msc;
+	struct mpam_class *class;
+	struct mpam_msc_ris *ris;
+	struct mpam_component *comp;
+
+	lockdep_assert_held(&mpam_list_lock);
+
+	if (!mpam_debugfs)
+		return;
+
+	list_for_each_entry(msc, &mpam_all_msc, all_msc_list) {
+		d = msc->debugfs;
+		if (!d)
+			continue;
+		debugfs_create_u32("fw_id", 0400, d, &msc->pdev->id);
+		debugfs_create_x32("iface", 0400, d, &msc->iface);
+		debugfs_create_x32("mpamf_iidr", 0400, d, &msc->iidr);
+		/*
+		 * Physical base + size of the MPAM feature page the MSC owns
+		 * (Arm IHI 0099B.a §9.1, MPAMF_BASE_<ns/s/rt/rl>). Useful when
+		 * correlating a resctrl path with a firmware MPAM table entry
+		 * or with a memory map. phys_addr_t is u64 on arm64.
+		 */
+		debugfs_create_x64("phys_base", 0400, d,
+				   (u64 *)&msc->phys_base);
+		debugfs_create_size_t("phys_size", 0400, d,
+				      &msc->mapped_hwpage_sz);
+		debugfs_create_x64("nrdy_retry_count", 0400, d,
+				   &msc->nrdy_retry_count);
+		list_for_each_entry(ris, &msc->ris, msc_list)
+			mpam_debugfs_setup_ris(ris);
+	}
+
+	list_for_each_entry_rcu(class, &mpam_classes, classes_list) {
+		snprintf(name, sizeof(name), "class.%u", class->level);
+		d = debugfs_create_dir(name, mpam_debugfs);
+		debugfs_create_ulong("features", 0400, d,
+				     &class->props.features[0]);
+		debugfs_create_x32("nrdy_usec", 0400, d, &class->nrdy_usec);
+		debugfs_create_x16("quirks", 0400, d, &class->quirks);
+		debugfs_create_x8("level", 0400, d, &class->level);
+		debugfs_create_cpumask("affinity", 0400, d, &class->affinity);
+		class->debugfs = d;
+
+		list_for_each_entry_rcu(comp, &class->components, class_list)
+			mpam_debugfs_setup_comp(class, comp);
+	}
+}
+
+/*
+ * "force_disable" debugfs trigger. Writing 1 simulates a fatal MPAM
+ * error and runs the same teardown path the error interrupt does.
+ * Recovery requires a reboot.
+ */
+static int mpam_force_disable_show(struct seq_file *s, void *data)
+{
+	seq_puts(s, "Write 1 to this file to trigger an MPAM error.\n");
+	return 0;
+}
+
+static ssize_t mpam_force_disable_write(struct file *file,
+					const char __user *userbuf,
+					size_t count, loff_t *ppos)
+{
+	u32 user_val;
+	int err;
+
+	err = kstrtou32_from_user(userbuf, count, 10, &user_val);
+	if (err)
+		return err;
+
+	if (user_val == 1) {
+		mpam_disable_reason = "debugfs trigger";
+		mpam_disable(NULL);
+	}
+
+	return count;
+}
+
+DEFINE_SHOW_STORE_ATTRIBUTE(mpam_force_disable);
+
 static void mpam_enable_once(void)
 {
 	int err;
@@ -2892,9 +3071,15 @@ static void mpam_enable_once(void)
 			pr_err("Failed to allocate configuration arrays.\n");
 			break;
 		}
+
+		mpam_debugfs_setup();
 	} while (0);
 	mutex_unlock(&mpam_list_lock);
 	cpus_read_unlock();
+
+	if (mpam_debugfs)
+		debugfs_create_file("force_disable", 0600, mpam_debugfs, NULL,
+				    &mpam_force_disable_fops);
 
 	if (!err) {
 		err = mpam_resctrl_setup();
@@ -3118,6 +3303,8 @@ static int __init mpam_msc_driver_init(void)
 		pr_err("No MSC devices found in firmware\n");
 		return -EINVAL;
 	}
+
+	mpam_debugfs = debugfs_create_dir("mpam", NULL);
 
 	return platform_driver_register(&mpam_msc_driver);
 }

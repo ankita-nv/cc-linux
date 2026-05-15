@@ -8,6 +8,7 @@
 #include <linux/atomic.h>
 #include <linux/bitmap.h>
 #include <linux/cpumask.h>
+#include <linux/debugfs.h>
 #include <linux/io.h>
 #include <linux/jump_label.h>
 #include <linux/llist.h>
@@ -67,6 +68,7 @@ struct mpam_msc {
 	/* Not modified after mpam_is_enabled() becomes true */
 	enum mpam_msc_iface	iface;
 	u32			nrdy_usec;
+	u64			nrdy_retry_count;
 	cpumask_t		accessibility;
 	bool			has_extd_esr;
 
@@ -129,9 +131,13 @@ struct mpam_msc {
 
 	void __iomem		*mapped_hwpage;
 	size_t			mapped_hwpage_sz;
+	phys_addr_t		phys_base;
 
 	/* Values only used on some platforms for quirks */
 	u32			t241_id;
+
+	/* debugfs directory for this MSC, populated when MPAM is enabled. */
+	struct dentry		*debugfs;
 
 	struct mpam_garbage	garbage;
 };
@@ -309,6 +315,9 @@ struct mpam_class {
 	struct ida		ida_csu_mon;
 	struct ida		ida_mbwu_mon;
 
+	/* debugfs directory for this class, populated when MPAM is enabled. */
+	struct dentry		*debugfs;
+
 	struct mpam_garbage	garbage;
 };
 
@@ -369,6 +378,8 @@ struct mpam_component {
 	/* parent: */
 	struct mpam_class	*class;
 
+	struct dentry		*debugfs;
+
 	struct mpam_garbage	garbage;
 };
 
@@ -387,12 +398,16 @@ struct mpam_vmsc {
 	/* parent: */
 	struct mpam_component	*comp;
 
+	struct dentry		*debugfs;
+
 	struct mpam_garbage	garbage;
 };
 
 struct mpam_msc_ris {
 	u8			ris_idx;
 	u64			idr;
+	u32			cpor_idr;
+	u32			ccap_idr;
 	struct mpam_props	props;
 	bool			in_reset_state;
 
@@ -409,6 +424,8 @@ struct mpam_msc_ris {
 
 	/* msmon mbwu configuration is preserved over reset */
 	struct msmon_mbwu_state	*mbwu_state;
+
+	struct dentry		*debugfs;
 
 	struct mpam_garbage	garbage;
 };
