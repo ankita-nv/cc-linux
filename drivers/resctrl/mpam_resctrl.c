@@ -716,6 +716,13 @@ static int update_rmid_limits(struct mpam_class *class)
 	return 0;
 }
 
+static bool cache_has_usable_cmax(struct mpam_class *class)
+{
+	struct mpam_props *cprops = &class->props;
+
+	return mpam_has_feature(mpam_feat_cmax_cmax, cprops);
+}
+
 static bool cache_has_usable_cpor(struct mpam_class *class)
 {
 	struct mpam_props *cprops = &class->props;
@@ -805,16 +812,43 @@ static u32 get_mba_granularity(struct mpam_props *cprops)
  *
  * Find the nearest percentage value to the upper bound of the selected band:
  */
-static u32 mbw_max_to_percent(u16 mbw_max, struct mpam_props *cprops)
+/*
+ * Convert MPAM's 16-bit fixed-point fraction value to a percentage.
+ * The fraction occupies @wd most-significant bits (Arm DDI0598C_b).
+ * Used for both MBW_MAX (bwa_wd) and CMAX (cmax_wd) controls.
+ */
+static u32 fract16_to_percent(u16 fract, u8 wd)
 {
-	u32 val = mbw_max;
+	u32 val = fract;
 
-	val >>= 16 - cprops->bwa_wd;
+	val >>= 16 - wd;
 	val += 1;
 	val *= MAX_MBA_BW;
-	val = DIV_ROUND_CLOSEST(val, 1 << cprops->bwa_wd);
+	val = DIV_ROUND_CLOSEST(val, 1 << wd);
 
 	return val;
+}
+
+static u16 percent_to_fract16(u8 pc, u8 wd)
+{
+	u32 val = pc;
+
+	val <<= wd;
+	val = DIV_ROUND_CLOSEST(val, MAX_MBA_BW);
+	val = max(val, 1) - 1;
+	val <<= 16 - wd;
+
+	return val;
+}
+
+static u16 percent_to_cmax(u8 pc, struct mpam_props *cprops)
+{
+	return percent_to_fract16(pc, cprops->cmax_wd);
+}
+
+static u32 mbw_max_to_percent(u16 mbw_max, struct mpam_props *cprops)
+{
+	return fract16_to_percent(mbw_max, cprops->bwa_wd);
 }
 
 /*
@@ -829,14 +863,7 @@ static u32 mbw_max_to_percent(u16 mbw_max, struct mpam_props *cprops)
  */
 static u16 percent_to_mbw_max(u8 pc, struct mpam_props *cprops)
 {
-	u32 val = pc;
-
-	val <<= cprops->bwa_wd;
-	val = DIV_ROUND_CLOSEST(val, MAX_MBA_BW);
-	val = max(val, 1) - 1;
-	val <<= 16 - cprops->bwa_wd;
-
-	return val;
+	return percent_to_fract16(pc, cprops->bwa_wd);
 }
 
 static u32 get_mba_min(struct mpam_props *cprops)
@@ -1014,8 +1041,10 @@ static void mpam_resctrl_pick_caches(void)
 			continue;
 		}
 
-		if (!cache_has_usable_cpor(class)) {
-			pr_debug("class %u cache misses CPOR\n", class->level);
+		if (!cache_has_usable_cpor(class) &&
+		    !cache_has_usable_cmax(class)) {
+			pr_debug("class %u cache misses CPOR and CMAX\n",
+				 class->level);
 			continue;
 		}
 
@@ -1025,6 +1054,22 @@ static void mpam_resctrl_pick_caches(void)
 				 cpumask_pr_args(cpu_possible_mask));
 			continue;
 		}
+
+		/*
+		 * CPOR and CMAX are independent and may both be exposed for
+		 * the same class. CPOR drives RDT_RESOURCE_L{2,3} (bitmap),
+		 * CMAX drives RDT_RESOURCE_L{2,3}_MAX (percentage cap).
+		 */
+		if (cache_has_usable_cmax(class)) {
+			if (class->level == 2)
+				res = &mpam_resctrl_controls[RDT_RESOURCE_L2_MAX];
+			else
+				res = &mpam_resctrl_controls[RDT_RESOURCE_L3_MAX];
+			res->class = class;
+		}
+
+		if (!cache_has_usable_cpor(class))
+			continue;
 
 		if (class->level == 2)
 			res = &mpam_resctrl_controls[RDT_RESOURCE_L2];
@@ -1332,6 +1377,29 @@ static int mpam_resctrl_control_init(struct mpam_resctrl_res *res)
 		r->name = "MB_HLIM";
 		r->alloc_capable = true;
 		break;
+	case RDT_RESOURCE_L2_MAX:
+	case RDT_RESOURCE_L3_MAX:
+		/*
+		 * Cache-capacity controls (MPAM CMAX/CMIN) are exposed as a
+		 * percentage. Use the same RESCTRL_SCHEMA_RANGE format as MBA
+		 * with min/granularity derived from the architectural
+		 * cmax_wd width.
+		 */
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->membw.delay_linear = true;
+		r->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
+		r->membw.min_bw = max(MAX_MBA_BW / (1 << cprops->cmax_wd), 1);
+		r->membw.bw_gran = max(MAX_MBA_BW / (1 << cprops->cmax_wd), 1);
+		r->membw.max_bw = MAX_MBA_BW;
+		r->alloc_capable = true;
+		if (r->rid == RDT_RESOURCE_L2_MAX) {
+			r->name = "L2_MAX";
+			r->ctrl_scope = RESCTRL_L2_CACHE;
+		} else {
+			r->name = "L3_MAX";
+			r->ctrl_scope = RESCTRL_L3_CACHE;
+		}
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -1505,6 +1573,10 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_ctrl_domain *d,
 	case RDT_RESOURCE_L3:
 		configured_by = mpam_feat_cpor_part;
 		break;
+	case RDT_RESOURCE_L2_MAX:
+	case RDT_RESOURCE_L3_MAX:
+		configured_by = mpam_feat_cmax_cmax;
+		break;
 	case RDT_RESOURCE_MBA:
 		if (mpam_has_feature(mpam_feat_mbw_max, cprops)) {
 			configured_by = mpam_feat_mbw_max;
@@ -1529,6 +1601,8 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_ctrl_domain *d,
 		return mbw_max_to_percent(cfg->mbw_max, cprops);
 	case mpam_feat_mbw_hardlim:
 		return cfg->mbw_hardlim ? 1 : 0;
+	case mpam_feat_cmax_cmax:
+		return fract16_to_percent(cfg->cmax, cprops->cmax_wd);
 	default:
 		return resctrl_get_default_ctrl(r);
 	}
@@ -1578,6 +1652,11 @@ int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_ctrl_domain *d,
 	case RDT_RESOURCE_L3:
 		cfg.cpbm = cfg_val;
 		mpam_set_feature(mpam_feat_cpor_part, &cfg);
+		break;
+	case RDT_RESOURCE_L2_MAX:
+	case RDT_RESOURCE_L3_MAX:
+		cfg.cmax = percent_to_cmax(cfg_val, cprops);
+		mpam_set_feature(mpam_feat_cmax_cmax, &cfg);
 		break;
 	case RDT_RESOURCE_MBA:
 		if (!mpam_has_feature(mpam_feat_mbw_max, cprops))

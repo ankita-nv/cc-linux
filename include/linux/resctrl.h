@@ -61,7 +61,15 @@ enum resctrl_res_level {
 	 * HARDLIM selector in the same MBA control register.
 	 */
 	RDT_RESOURCE_MBA_HLIM,
-	RDT_RESOURCE_LAST = RDT_RESOURCE_MBA_HLIM
+	/*
+	 * Cache capacity (MPAM CMAX/CMIN) is orthogonal to the cache
+	 * portion bitmap. L3_MAX / L2_MAX expose the cmax / cmin controls
+	 * as a percentage cap on top of the existing L3 / L2 bitmap.
+	 */
+	RDT_RESOURCE_L3_MAX,
+	RDT_RESOURCE_L2_MAX,
+
+	RDT_RESOURCE_LAST = RDT_RESOURCE_L2_MAX
 };
 
 #define RDT_NUM_RESOURCES (RDT_RESOURCE_LAST + 1)

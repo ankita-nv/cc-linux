@@ -2646,6 +2646,8 @@ static unsigned long fflags_from_resource(struct rdt_resource *r)
 	switch (r->rid) {
 	case RDT_RESOURCE_L3:
 	case RDT_RESOURCE_L2:
+	case RDT_RESOURCE_L3_MAX:
+	case RDT_RESOURCE_L2_MAX:
 		return RFTYPE_RES_CACHE;
 	case RDT_RESOURCE_MBA:
 	case RDT_RESOURCE_SMBA:
