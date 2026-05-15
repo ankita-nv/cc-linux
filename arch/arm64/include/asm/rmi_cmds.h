@@ -26,11 +26,14 @@ static inline int rmi_rtt_read_entry(unsigned long rd, unsigned long ipa,
 	struct arm_smccc_1_2_regs res;
 	unsigned long status;
 
+	kvm_rmi_smc_count(regs.a0);
 	do {
 		arm_smccc_1_2_invoke(&regs, &res);
 		status = RMI_RETURN_STATUS(res.a0);
-		if (status == RMI_BUSY)
+		if (status == RMI_BUSY) {
+			kvm_rmi_smc_busy_count(regs.a0);
 			cpu_relax();
+		}
 	} while (status == RMI_BUSY);
 
 	if (res.a0 == RMI_SUCCESS && rtt) {

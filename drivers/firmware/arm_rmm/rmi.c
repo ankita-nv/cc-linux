@@ -4,8 +4,10 @@
  */
 
 #include <linux/arm-rmi-cmds.h>
+#include <linux/atomic.h>
 #include <linux/cpufeature.h>
 #include <linux/crash_dump.h>
+#include <linux/debugfs.h>
 #include <linux/kexec.h>
 #include <linux/maple_tree.h>
 #include <linux/memblock.h>
@@ -16,7 +18,9 @@
 #include <linux/processor.h>
 #include <linux/reboot.h>
 #include <linux/sched/mm.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/string.h>
 #include <linux/xarray.h>
 
@@ -453,11 +457,14 @@ static void rmi_smccc_invoke(const struct arm_smccc_1_2_regs *regs_in,
 	 * hint that keeps a BUSY retry burst from being mistaken for a
 	 * softlockup.
 	 */
+	kvm_rmi_smc_count(regs.a0);
 	do {
 		arm_smccc_1_2_invoke(&regs, regs_out);
 		status = RMI_RETURN_STATUS(regs_out->a0);
-		if (status == RMI_BUSY)
+		if (status == RMI_BUSY) {
+			kvm_rmi_smc_busy_count(regs.a0);
 			cpu_relax();
+		}
 	} while (status == RMI_BUSY);
 }
 
@@ -2092,3 +2099,198 @@ out_free_sro:
 	return 0;
 }
 subsys_initcall(arm64_init_rmi);
+
+/* Per-FID RMI SMC diagnostic counters exposed through debugfs. */
+#define RMI_SMC_SLOT(_name)						\
+	[RMI_SMC_SLOT_IDX(SMC_RMI_##_name)] = {				\
+		.fid  = SMC_RMI_##_name,				\
+		.name = #_name,						\
+	}
+
+struct rmi_smc_slot rmi_smc_slots[256] = {
+	RMI_SMC_SLOT(VERSION),
+	RMI_SMC_SLOT(FEATURES),
+	RMI_SMC_SLOT(RMM_CONFIG_GET),
+	RMI_SMC_SLOT(RMM_CONFIG_SET),
+	RMI_SMC_SLOT(RMM_ACTIVATE),
+	RMI_SMC_SLOT(RMM_DEACTIVATE),
+	RMI_SMC_SLOT(RMM_STATE_GET),
+	RMI_SMC_SLOT(GRANULE_TRACKING_GET),
+	RMI_SMC_SLOT(GRANULE_TRACKING_SET),
+	RMI_SMC_SLOT(GRANULE_RANGE_DELEGATE),
+	RMI_SMC_SLOT(GRANULE_RANGE_UNDELEGATE),
+	RMI_SMC_SLOT(GPT_INFO),
+	RMI_SMC_SLOT(GPT_L1_CREATE),
+	RMI_SMC_SLOT(GPT_L1_DESTROY),
+	RMI_SMC_SLOT(REALM_ACTIVATE),
+	RMI_SMC_SLOT(REALM_CREATE),
+	RMI_SMC_SLOT(REALM_DESTROY),
+	RMI_SMC_SLOT(REALM_TERMINATE),
+	RMI_SMC_SLOT(REC_CREATE),
+	RMI_SMC_SLOT(REC_DESTROY),
+	RMI_SMC_SLOT(REC_ENTER),
+	RMI_SMC_SLOT(RTT_CREATE),
+	RMI_SMC_SLOT(RTT_DESTROY),
+	RMI_SMC_SLOT(RTT_FOLD),
+	RMI_SMC_SLOT(RTT_INIT_RIPAS),
+	RMI_SMC_SLOT(RTT_SET_RIPAS),
+	RMI_SMC_SLOT(RTT_READ_ENTRY),
+	RMI_SMC_SLOT(RTT_SET_S2AP),
+	RMI_SMC_SLOT(RTT_DATA_MAP_INIT),
+	RMI_SMC_SLOT(RTT_DATA_MAP),
+	RMI_SMC_SLOT(RTT_DATA_UNMAP),
+	RMI_SMC_SLOT(RTT_UNPROT_MAP),
+	RMI_SMC_SLOT(RTT_UNPROT_UNMAP),
+	RMI_SMC_SLOT(RTT_AUX_CREATE),
+	RMI_SMC_SLOT(RTT_AUX_DESTROY),
+	RMI_SMC_SLOT(RTT_AUX_FOLD),
+	RMI_SMC_SLOT(RTT_AUX_PROT_MAP),
+	RMI_SMC_SLOT(RTT_AUX_PROT_UNMAP),
+	RMI_SMC_SLOT(RTT_AUX_UNPROT_MAP),
+	RMI_SMC_SLOT(RTT_AUX_UNPROT_UNMAP),
+	RMI_SMC_SLOT(RTT_DEV_VALIDATE),
+	RMI_SMC_SLOT(RTT_DEV_MAP),
+	RMI_SMC_SLOT(RTT_DEV_UNMAP),
+	RMI_SMC_SLOT(RTT_ARCH_DEV_MAP),
+	RMI_SMC_SLOT(RTT_ARCH_DEV_UNMAP),
+	RMI_SMC_SLOT(PSCI_COMPLETE),
+	RMI_SMC_SLOT(OP_CONTINUE),
+	RMI_SMC_SLOT(OP_CANCEL),
+	RMI_SMC_SLOT(OP_MEM_DONATE),
+	RMI_SMC_SLOT(OP_MEM_RECLAIM),
+	RMI_SMC_SLOT(VSMMU_CREATE),
+	RMI_SMC_SLOT(VSMMU_DESTROY),
+	RMI_SMC_SLOT(VSMMU_FEATURES),
+	RMI_SMC_SLOT(VSMMU_CMD_GET),
+	RMI_SMC_SLOT(VSMMU_CMD_COMPLETE),
+	RMI_SMC_SLOT(VSMMU_EVENT_HANDLE),
+	RMI_SMC_SLOT(PSMMU_INFO),
+	RMI_SMC_SLOT(PSMMU_IRQ_NOTIFY),
+	RMI_SMC_SLOT(PSMMU_ACTIVATE),
+	RMI_SMC_SLOT(PSMMU_DEACTIVATE),
+	RMI_SMC_SLOT(PSMMU_ST_L2_CREATE),
+	RMI_SMC_SLOT(PSMMU_ST_L2_DESTROY),
+	RMI_SMC_SLOT(PSMMU_EVENT_CONSUME),
+	RMI_SMC_SLOT(DPT_L0_CREATE),
+	RMI_SMC_SLOT(DPT_L0_DESTROY),
+	RMI_SMC_SLOT(DPT_L1_CREATE),
+	RMI_SMC_SLOT(DPT_L1_DESTROY),
+	RMI_SMC_SLOT(PDEV_ABORT),
+	RMI_SMC_SLOT(PDEV_COMMUNICATE),
+	RMI_SMC_SLOT(PDEV_CREATE),
+	RMI_SMC_SLOT(PDEV_DESTROY),
+	RMI_SMC_SLOT(PDEV_GET_STATE),
+	RMI_SMC_SLOT(PDEV_STREAM_KEY_REFRESH),
+	RMI_SMC_SLOT(PDEV_SET_PUBKEY),
+	RMI_SMC_SLOT(PDEV_STOP),
+	RMI_SMC_SLOT(PDEV_STREAM_CONNECT),
+	RMI_SMC_SLOT(PDEV_STREAM_DISCONNECT),
+	RMI_SMC_SLOT(PDEV_STREAM_COMPLETE),
+	RMI_SMC_SLOT(PDEV_STREAM_KEY_PURGE),
+	RMI_SMC_SLOT(PDEV_STREAM_INFO),
+	RMI_SMC_SLOT(VDEV_ABORT),
+	RMI_SMC_SLOT(VDEV_COMMUNICATE),
+	RMI_SMC_SLOT(VDEV_CREATE),
+	RMI_SMC_SLOT(VDEV_DESTROY),
+	RMI_SMC_SLOT(VDEV_GET_STATE),
+	RMI_SMC_SLOT(VDEV_UNLOCK),
+	RMI_SMC_SLOT(VDEV_GET_INTERFACE_REPORT),
+	RMI_SMC_SLOT(VDEV_GET_MEASUREMENTS),
+	RMI_SMC_SLOT(VDEV_LOCK),
+	RMI_SMC_SLOT(VDEV_START),
+};
+
+#undef RMI_SMC_SLOT
+
+static int rmi_smc_slot_cmp_desc(const void *a, const void *b)
+{
+	const struct rmi_smc_slot *sa = a;
+	const struct rmi_smc_slot *sb = b;
+	long ca = atomic64_read(&sa->count[0]);
+	long cb = atomic64_read(&sb->count[0]);
+
+	if (ca > cb)
+		return -1;
+	if (ca < cb)
+		return 1;
+	return 0;
+}
+
+static int rmi_smc_counters_show(struct seq_file *m, void *v)
+{
+	struct rmi_smc_slot *snap;
+	long total = 0, total_busy = 0;
+	size_t i;
+
+	snap = kmalloc_array(ARRAY_SIZE(rmi_smc_slots), sizeof(*snap),
+			     GFP_KERNEL);
+	if (!snap)
+		return -ENOMEM;
+
+	for (i = 0; i < ARRAY_SIZE(rmi_smc_slots); i++) {
+		snap[i].fid = rmi_smc_slots[i].fid;
+		snap[i].name = rmi_smc_slots[i].name;
+		atomic64_set(&snap[i].count[0],
+			     atomic64_read(&rmi_smc_slots[i].count[0]));
+		atomic64_set(&snap[i].count[1],
+			     atomic64_read(&rmi_smc_slots[i].count[1]));
+	}
+
+	sort(snap, ARRAY_SIZE(rmi_smc_slots), sizeof(*snap),
+	     rmi_smc_slot_cmp_desc, NULL);
+
+	seq_printf(m, "%-10s  %-32s  %12s  %12s\n",
+		   "FID", "NAME", "COUNT", "BUSY");
+	for (i = 0; i < ARRAY_SIZE(rmi_smc_slots); i++) {
+		long count = atomic64_read(&snap[i].count[0]);
+		long busy = atomic64_read(&snap[i].count[1]);
+
+		if (!count || !snap[i].fid)
+			continue;
+		seq_printf(m, "0x%08lx  %-32s  %12ld  %12ld\n",
+			   snap[i].fid, snap[i].name, count, busy);
+		total += count;
+		total_busy += busy;
+	}
+	seq_printf(m, "%-10s  %-32s  %12ld  %12ld\n",
+		   "", "TOTAL", total, total_busy);
+
+	kfree(snap);
+	return 0;
+}
+
+static int rmi_smc_counters_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, rmi_smc_counters_show, NULL);
+}
+
+static ssize_t rmi_smc_counters_write(struct file *file,
+				      const char __user *ubuf,
+				      size_t len, loff_t *ppos)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(rmi_smc_slots); i++) {
+		atomic64_set(&rmi_smc_slots[i].count[0], 0);
+		atomic64_set(&rmi_smc_slots[i].count[1], 0);
+	}
+	return len;
+}
+
+static const struct file_operations rmi_smc_counters_fops = {
+	.owner		= THIS_MODULE,
+	.open		= rmi_smc_counters_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= rmi_smc_counters_write,
+};
+
+static int __init rmi_debugfs_init(void)
+{
+	if (!is_rmi_available())
+		return 0;
+
+	debugfs_create_file("rmi_smc_counters", 0600, NULL, NULL,
+			    &rmi_smc_counters_fops);
+	return 0;
+}
+late_initcall(rmi_debugfs_init);

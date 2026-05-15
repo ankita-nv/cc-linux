@@ -7,6 +7,7 @@
 #define __LINUX_ARM_RMI_CMDS_H_
 
 #include <linux/arm-smccc-rmi.h>
+#include <linux/atomic.h>
 #include <linux/bug.h>
 #include <linux/numa.h>
 #include <linux/processor.h>
@@ -27,10 +28,35 @@ struct rmi_sro_state {
 	u16 trackid;
 };
 
+struct rmi_smc_slot {
+	unsigned long	fid;
+	const char	*name;
+	atomic64_t	count[2];
+};
+
+extern struct rmi_smc_slot rmi_smc_slots[256];
+
+/*
+ * Called from the noinstr REC entry path inside the guest Extended
+ * Quiescent State via rmi_smccc_invoke_v1_1(), so use the uninstrumented
+ * raw_atomic64_* accessors and force inlining to avoid an instrumentable
+ * symbol.
+ */
+static __always_inline void kvm_rmi_smc_count(unsigned long fid)
+{
+	raw_atomic64_inc(&rmi_smc_slots[RMI_SMC_SLOT_IDX(fid)].count[0]);
+}
+
+static __always_inline void kvm_rmi_smc_busy_count(unsigned long fid)
+{
+	raw_atomic64_inc(&rmi_smc_slots[RMI_SMC_SLOT_IDX(fid)].count[1]);
+}
+
 /* Issue one SMCCC 1.1 RMI call without retrying the returned status. */
 #define rmi_smccc_invoke_v1_1(fid, ...)					\
 	do {								\
 		unsigned long __fid = (fid);				\
+		kvm_rmi_smc_count(__fid);				\
 		arm_smccc_1_1_invoke(__fid, __VA_ARGS__);		\
 	} while (0)
 
@@ -38,11 +64,14 @@ struct rmi_sro_state {
 #define rmi_smccc(fid, ...) do {						\
 	unsigned long __fid = (fid);					\
 	unsigned long __status;						\
+	kvm_rmi_smc_count(__fid);					\
 	do {								\
 		arm_smccc_1_1_invoke(__fid, ##__VA_ARGS__);		\
 		__status = RMI_RETURN_STATUS(res.a0);			\
-		if (__status == RMI_BUSY)				\
+		if (__status == RMI_BUSY) {				\
+			kvm_rmi_smc_busy_count(__fid);			\
 			cpu_relax();					\
+		}							\
 	} while (__status == RMI_BUSY);				\
 } while (0)
 
