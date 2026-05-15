@@ -528,7 +528,26 @@ static int mpam_ris_get_affinity(struct mpam_msc *msc, cpumask_t *affinity,
 		break;
 	case MPAM_CLASS_MEMORY:
 		get_cpumask_from_node_id(comp->comp_id, affinity);
-		/* affinity may be empty for CPU-less memory nodes */
+		/*
+		 * On systems where a memory-class MSC is reported with a
+		 * proximity domain that has no CPUs of its own (a "CPU-less"
+		 * memory node - common on multi-socket servers with persistent
+		 * memory or memory-only nodes), get_cpumask_from_node_id()
+		 * returns an empty cpumask. Memory traffic from any CPU may
+		 * still reach this MSC, so fall back to cpu_possible_mask.
+		 */
+		if (cpumask_empty(affinity)) {
+			dev_warn_once(&msc->pdev->dev, "CPU-less numa node\n");
+			cpumask_copy(affinity, cpu_possible_mask);
+		} else if (class->level > 3) {
+			/*
+			 * Memory-class MSCs above the last level cache may be
+			 * reached by any CPU regardless of which node owns
+			 * the MSC; use the full possible mask so the
+			 * resctrl domain covers every CPU.
+			 */
+			cpumask_copy(affinity, cpu_possible_mask);
+		}
 		break;
 	case MPAM_CLASS_UNKNOWN:
 		return 0;
