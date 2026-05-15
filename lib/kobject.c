@@ -924,6 +924,42 @@ struct kobject *kset_find_obj(struct kset *kset, const char *name)
 }
 EXPORT_SYMBOL_GPL(kset_find_obj);
 
+/**
+ * kset_get_next_obj - return the next kobject in @kset after @prev.
+ * @kset: the kset to walk.
+ * @prev: previous kobject (caller-held reference), or %NULL to start at
+ *        the head of the list.
+ *
+ * Drops the reference on @prev and returns a fresh reference on the
+ * next kobject in the kset's list, or %NULL after the last entry.
+ * If @prev has already been removed from the kset, iteration stops.
+ * The caller is responsible for releasing the returned reference with
+ * kobject_put() when finished.
+ */
+struct kobject *kset_get_next_obj(struct kset *kset, struct kobject *prev)
+{
+	struct kobject *k;
+
+	spin_lock(&kset->list_lock);
+
+	if (!prev)
+		k = list_first_entry_or_null(&kset->list, typeof(*k), entry);
+	else if (list_empty(&prev->entry))
+		k = NULL;
+	else
+		k = list_next_entry(prev, entry);
+
+	if (k && list_entry_is_head(k, &kset->list, entry))
+		k = NULL;
+
+	k = kobject_get_unless_zero(k);
+	spin_unlock(&kset->list_lock);
+	kobject_put(prev);
+
+	return k;
+}
+EXPORT_SYMBOL_GPL(kset_get_next_obj);
+
 static void kset_release(struct kobject *kobj)
 {
 	struct kset *kset = container_of(kobj, struct kset, kobj);
