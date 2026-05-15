@@ -1636,11 +1636,35 @@ static void mpam_reprogram_ris_partid(struct mpam_msc_ris *ris, u16 partid,
 	if (mpam_has_feature(mpam_feat_mbw_prop, rprops))
 		mpam_write_partsel_reg(msc, MBW_PROP, 0);
 
-	if (mpam_has_feature(mpam_feat_cmax_cmax, rprops))
-		mpam_write_partsel_reg(msc, CMAX, cmax);
+	if (mpam_has_feature(mpam_feat_cmax_cmax, rprops)) {
+		u32 cmax_val = cmax;
 
-	if (mpam_has_feature(mpam_feat_cmax_cmin, rprops))
-		mpam_write_partsel_reg(msc, CMIN, 0);
+		if (mpam_has_feature(mpam_feat_cmax_cmax, cfg))
+			cmax_val = cfg->cmax & MPAMCFG_CMAX_CMAX;
+
+		/*
+		 * SOFTLIM is only writable when the RIS reports
+		 * MPAMF_CCAP_IDR.HAS_CMAX_SOFTLIM (mpam_feat_cmax_softlim
+		 * on rprops). Setting the bit on hardware that does not
+		 * advertise the feature is RES0.
+		 */
+		if (mpam_has_feature(mpam_feat_cmax_softlim, rprops) &&
+		    mpam_has_feature(mpam_feat_cmax_cmax, cfg) &&
+		    cfg->cmax_softlim)
+			cmax_val |= MPAMCFG_CMAX_SOFTLIM;
+
+		mpam_write_partsel_reg(msc, CMAX, cmax_val);
+	}
+
+	if (mpam_has_feature(mpam_feat_cmax_cmin, rprops)) {
+		u32 cmin_val = 0;
+
+		/* MPAMCFG_CMIN.CMIN[15:0] has the same layout as CMAX[15:0]. */
+		if (mpam_has_feature(mpam_feat_cmax_cmin, cfg))
+			cmin_val = cfg->cmin;
+
+		mpam_write_partsel_reg(msc, CMIN, cmin_val);
+	}
 
 	if (mpam_has_feature(mpam_feat_cmax_cassoc, rprops))
 		mpam_write_partsel_reg(msc, CASSOC, MPAMCFG_CASSOC_CASSOC);
@@ -2958,6 +2982,10 @@ static bool mpam_update_config(struct mpam_config *cfg,
 	maybe_update_config(cfg, mpam_feat_mbw_part, newcfg, mbw_pbm, has_changes);
 	maybe_update_config(cfg, mpam_feat_mbw_max, newcfg, mbw_max, has_changes);
 	maybe_update_config(cfg, mpam_feat_mbw_hardlim, newcfg, mbw_hardlim,
+			    has_changes);
+	maybe_update_config(cfg, mpam_feat_cmax_cmax, newcfg, cmax, has_changes);
+	maybe_update_config(cfg, mpam_feat_cmax_cmin, newcfg, cmin, has_changes);
+	maybe_update_config(cfg, mpam_feat_cmax_softlim, newcfg, cmax_softlim,
 			    has_changes);
 
 	return has_changes;

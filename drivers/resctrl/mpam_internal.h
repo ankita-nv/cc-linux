@@ -321,11 +321,30 @@ struct mpam_config {
 	u16	mbw_max;
 
 	/*
+	 * Cache capacity controls (Arm IHI 0099B.a §9.6.2 MPAMCFG_CMAX,
+	 * §9.6.3 MPAMCFG_CMIN). Values use MPAM's 16-bit fixed-point
+	 * fraction encoding; the implemented bit width is reported by
+	 * MPAMF_CCAP_IDR.CMAX_WD. Valid only when mpam_feat_cmax_cmax /
+	 * mpam_feat_cmax_cmin is set.
+	 */
+	u16	cmax;
+	u16	cmin;
+
+	/*
 	 * MPAMCFG_MBW_MAX.HARDLIM (Arm IHI 0099B.a): true enforces the
 	 * mbw_max value as a hard cap, false as a soft cap. Valid only
 	 * when mpam_feat_mbw_hardlim is set.
 	 */
 	bool	mbw_hardlim;
+
+	/*
+	 * MPAMCFG_CMAX.SOFTLIM (Arm IHI 0099B.a §9.6.2): true makes CMAX
+	 * a soft cap (allocations beyond CMAX may use invalid or disabled
+	 * lines), false a hard cap. Programmable only when the RIS reports
+	 * MPAMF_CCAP_IDR.HAS_CMAX_SOFTLIM, i.e. mpam_feat_cmax_softlim is
+	 * set on the matching mpam_props.
+	 */
+	bool	cmax_softlim;
 
 	struct mpam_garbage	garbage;
 };
