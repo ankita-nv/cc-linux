@@ -172,6 +172,7 @@ enum mpam_device_features {
 	mpam_feat_mbw_part,
 	mpam_feat_mbw_min,
 	mpam_feat_mbw_max,
+	mpam_feat_mbw_hardlim,
 	mpam_feat_mbw_prop,
 	mpam_feat_intpri_part,
 	mpam_feat_intpri_part_0_low,
@@ -318,6 +319,13 @@ struct mpam_config {
 	u32	cpbm;
 	u32	mbw_pbm;
 	u16	mbw_max;
+
+	/*
+	 * MPAMCFG_MBW_MAX.HARDLIM (Arm IHI 0099B.a): true enforces the
+	 * mbw_max value as a hard cap, false as a soft cap. Valid only
+	 * when mpam_feat_mbw_hardlim is set.
+	 */
+	bool	mbw_hardlim;
 
 	struct mpam_garbage	garbage;
 };
@@ -573,6 +581,18 @@ static inline void mpam_resctrl_teardown_class(struct mpam_class *class) { }
 
 /* MPAMF_MBW_IDR - MPAM features memory bandwidth partitioning ID register */
 #define MPAMF_MBW_IDR_BWA_WD		GENMASK(5, 0)
+/*
+ * MAX_LIM (Arm IHI 0099B.a, MPAM MSC spec §9.5.8 MPAMF_MBW_IDR.MAX_LIM[9:8])
+ * advertises which MPAMCFG_MBW_MAX limit behaviours the implementation
+ * supports:
+ *   0b00 - both soft and hard limit; MPAMCFG_MBW_MAX.HARDLIM selects
+ *   0b01 - soft limit only; HARDLIM is RES0
+ *   0b10 - hard limit only; HARDLIM is effectively always 1
+ */
+#define MPAMF_MBW_IDR_MAX_LIM		GENMASK(9, 8)
+#define MPAMF_MBW_IDR_MAX_LIM_BOTH	0x0
+#define MPAMF_MBW_IDR_MAX_LIM_SOFT_ONLY	0x1
+#define MPAMF_MBW_IDR_MAX_LIM_HARD_ONLY	0x2
 #define MPAMF_MBW_IDR_HAS_MIN		BIT(10)
 #define MPAMF_MBW_IDR_HAS_MAX		BIT(11)
 #define MPAMF_MBW_IDR_HAS_PBM		BIT(12)

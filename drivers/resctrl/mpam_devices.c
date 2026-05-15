@@ -848,8 +848,31 @@ static void mpam_ris_hw_probe(struct mpam_msc_ris *ris)
 		 */
 		props->bwa_wd = min(props->bwa_wd, 16);
 
-		if (props->bwa_wd && FIELD_GET(MPAMF_MBW_IDR_HAS_MAX, mbw_features))
+		if (props->bwa_wd && FIELD_GET(MPAMF_MBW_IDR_HAS_MAX, mbw_features)) {
+			u32 max_lim = FIELD_GET(MPAMF_MBW_IDR_MAX_LIM,
+						mbw_features);
+
 			mpam_set_feature(mpam_feat_mbw_max, props);
+			/*
+			 * MPAMF_MBW_IDR.MAX_LIM (Arm IHI 0099B.a §9.5.8)
+			 * advertises which MPAMCFG_MBW_MAX.HARDLIM
+			 * behaviours the MSC implements:
+			 *   0b00 BOTH       software-selectable
+			 *   0b01 SOFT_ONLY  HARDLIM is RES0
+			 *   0b10 HARD_ONLY  hardware forces HARDLIM=1
+			 *   0b11 reserved   treated as RES0 per spec
+			 *
+			 * Only advertise mpam_feat_mbw_hardlim when the MSC
+			 * actually lets software choose. The reserved 0b11
+			 * encoding is flagged once for visibility, then
+			 * treated like SOFT_ONLY (no software toggle).
+			 */
+			WARN_ONCE(max_lim > MPAMF_MBW_IDR_MAX_LIM_HARD_ONLY,
+				  "MSC %u: reserved MPAMF_MBW_IDR.MAX_LIM=0x%x\n",
+				  msc->id, max_lim);
+			if (max_lim == MPAMF_MBW_IDR_MAX_LIM_BOTH)
+				mpam_set_feature(mpam_feat_mbw_hardlim, props);
+		}
 
 		if (props->bwa_wd && FIELD_GET(MPAMF_MBW_IDR_HAS_MIN, mbw_features))
 			mpam_set_feature(mpam_feat_mbw_min, props);
@@ -1597,10 +1620,17 @@ static void mpam_reprogram_ris_partid(struct mpam_msc_ris *ris, u16 partid,
 	}
 
 	if (mpam_has_feature(mpam_feat_mbw_max, rprops)) {
-		if (mpam_has_feature(mpam_feat_mbw_max, cfg))
-			mpam_write_partsel_reg(msc, MBW_MAX, cfg->mbw_max);
-		else
+		if (mpam_has_feature(mpam_feat_mbw_max, cfg)) {
+			u32 mbw_val = cfg->mbw_max & MPAMCFG_MBW_MAX_MAX;
+
+			if (mpam_has_feature(mpam_feat_mbw_hardlim, cfg) &&
+			    cfg->mbw_hardlim)
+				mbw_val |= MPAMCFG_MBW_MAX_HARDLIM;
+
+			mpam_write_partsel_reg(msc, MBW_MAX, mbw_val);
+		} else {
 			mpam_write_partsel_reg(msc, MBW_MAX, MPAMCFG_MBW_MAX_MAX);
+		}
 	}
 
 	if (mpam_has_feature(mpam_feat_mbw_prop, rprops))
@@ -2927,6 +2957,8 @@ static bool mpam_update_config(struct mpam_config *cfg,
 	maybe_update_config(cfg, mpam_feat_cpor_part, newcfg, cpbm, has_changes);
 	maybe_update_config(cfg, mpam_feat_mbw_part, newcfg, mbw_pbm, has_changes);
 	maybe_update_config(cfg, mpam_feat_mbw_max, newcfg, mbw_max, has_changes);
+	maybe_update_config(cfg, mpam_feat_mbw_hardlim, newcfg, mbw_hardlim,
+			    has_changes);
 
 	return has_changes;
 }
