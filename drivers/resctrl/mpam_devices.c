@@ -1472,7 +1472,8 @@ void mpam_msmon_reset_mbwu(struct mpam_component *comp, struct mon_cfg *ctx)
 	}
 }
 
-static void mpam_reset_msc_bitmap(struct mpam_msc *msc, u16 reg, u16 wd)
+static void __maybe_unused
+mpam_reset_msc_bitmap(struct mpam_msc *msc, u16 reg, u16 wd)
 {
 	u32 num_words, msb;
 	u32 bm = ~0;
@@ -1552,28 +1553,28 @@ static u16 mpam_wa_t241_force_mbw_min_to_one(struct mpam_props *props)
 static u16 mpam_wa_t241_calc_min_from_max(struct mpam_props *props,
 					  struct mpam_config *cfg)
 {
-	u16 val = 0;
-	u16 max;
 	u16 delta = ((5 * MPAMCFG_MBW_MAX_MAX) / 100) - 1;
+	u16 max;
 
-	if (mpam_has_feature(mpam_feat_mbw_max, cfg)) {
-		max = cfg->mbw_max;
-	} else {
-		/* Resetting. Hence, use the ris specific default. */
-		max = GENMASK(15, 16 - props->bwa_wd);
-	}
+	/*
+	 * Every path into here uses a fully populated cfg (the reset path
+	 * uses mpam_init_reset_cfg(), the runtime path uses the per-PARTID
+	 * config that mpam_reset_component_cfg() and mpam_update_config()
+	 * keep in sync). So mpam_feat_mbw_max is always set on the cfg by
+	 * the time we get here.
+	 */
+	if (WARN_ON_ONCE(!mpam_has_feature(mpam_feat_mbw_max, cfg)))
+		return 0;
 
-	if (max > delta)
-		val = max - delta;
+	max = cfg->mbw_max;
 
-	return val;
+	return max > delta ? max - delta : 0;
 }
 
 /* Called via IPI. Call while holding an SRCU reference */
 static void mpam_reprogram_ris_partid(struct mpam_msc_ris *ris, u16 partid,
 				      struct mpam_config *cfg)
 {
-	u16 cmax = MPAMCFG_CMAX_CMAX;
 	struct mpam_msc *msc = ris->vmsc->msc;
 	struct mpam_props *rprops = &ris->props;
 
@@ -1592,19 +1593,13 @@ static void mpam_reprogram_ris_partid(struct mpam_msc_ris *ris, u16 partid,
 		__mpam_intpart_sel(ris->ris_idx, partid, msc);
 	}
 
-	if (mpam_has_feature(mpam_feat_cpor_part, rprops)) {
-		if (mpam_has_feature(mpam_feat_cpor_part, cfg))
-			mpam_write_partsel_reg(msc, CPBM, cfg->cpbm);
-		else
-			mpam_reset_msc_bitmap(msc, MPAMCFG_CPBM, rprops->cpbm_wd);
-	}
+	if (mpam_has_feature(mpam_feat_cpor_part, rprops) &&
+	    mpam_has_feature(mpam_feat_cpor_part, cfg))
+		mpam_write_partsel_reg(msc, CPBM, cfg->cpbm);
 
-	if (mpam_has_feature(mpam_feat_mbw_part, rprops)) {
-		if (mpam_has_feature(mpam_feat_mbw_part, cfg))
-			mpam_write_partsel_reg(msc, MBW_PBM, cfg->mbw_pbm);
-		else
-			mpam_reset_msc_bitmap(msc, MPAMCFG_MBW_PBM, rprops->mbw_pbm_bits);
-	}
+	if (mpam_has_feature(mpam_feat_mbw_part, rprops) &&
+	    mpam_has_feature(mpam_feat_mbw_part, cfg))
+		mpam_write_partsel_reg(msc, MBW_PBM, cfg->mbw_pbm);
 
 	if (mpam_has_feature(mpam_feat_mbw_min, rprops)) {
 		u16 val = 0;
@@ -1619,28 +1614,24 @@ static void mpam_reprogram_ris_partid(struct mpam_msc_ris *ris, u16 partid,
 		mpam_write_partsel_reg(msc, MBW_MIN, val);
 	}
 
-	if (mpam_has_feature(mpam_feat_mbw_max, rprops)) {
-		if (mpam_has_feature(mpam_feat_mbw_max, cfg)) {
-			u32 mbw_val = cfg->mbw_max & MPAMCFG_MBW_MAX_MAX;
+	if (mpam_has_feature(mpam_feat_mbw_max, rprops) &&
+	    mpam_has_feature(mpam_feat_mbw_max, cfg)) {
+		u32 mbw_val = cfg->mbw_max & MPAMCFG_MBW_MAX_MAX;
 
-			if (mpam_has_feature(mpam_feat_mbw_hardlim, cfg) &&
-			    cfg->mbw_hardlim)
-				mbw_val |= MPAMCFG_MBW_MAX_HARDLIM;
+		if (mpam_has_feature(mpam_feat_mbw_hardlim, cfg) &&
+		    cfg->mbw_hardlim)
+			mbw_val |= MPAMCFG_MBW_MAX_HARDLIM;
 
-			mpam_write_partsel_reg(msc, MBW_MAX, mbw_val);
-		} else {
-			mpam_write_partsel_reg(msc, MBW_MAX, MPAMCFG_MBW_MAX_MAX);
-		}
+		mpam_write_partsel_reg(msc, MBW_MAX, mbw_val);
 	}
 
-	if (mpam_has_feature(mpam_feat_mbw_prop, rprops))
+	if (mpam_has_feature(mpam_feat_mbw_prop, rprops) &&
+	    mpam_has_feature(mpam_feat_mbw_prop, cfg))
 		mpam_write_partsel_reg(msc, MBW_PROP, 0);
 
-	if (mpam_has_feature(mpam_feat_cmax_cmax, rprops)) {
-		u32 cmax_val = cmax;
-
-		if (mpam_has_feature(mpam_feat_cmax_cmax, cfg))
-			cmax_val = cfg->cmax & MPAMCFG_CMAX_CMAX;
+	if (mpam_has_feature(mpam_feat_cmax_cmax, rprops) &&
+	    mpam_has_feature(mpam_feat_cmax_cmax, cfg)) {
+		u32 cmax_val = cfg->cmax & MPAMCFG_CMAX_CMAX;
 
 		/*
 		 * SOFTLIM is only writable when the RIS reports
@@ -1649,22 +1640,16 @@ static void mpam_reprogram_ris_partid(struct mpam_msc_ris *ris, u16 partid,
 		 * advertise the feature is RES0.
 		 */
 		if (mpam_has_feature(mpam_feat_cmax_softlim, rprops) &&
-		    mpam_has_feature(mpam_feat_cmax_cmax, cfg) &&
 		    cfg->cmax_softlim)
 			cmax_val |= MPAMCFG_CMAX_SOFTLIM;
 
 		mpam_write_partsel_reg(msc, CMAX, cmax_val);
 	}
 
-	if (mpam_has_feature(mpam_feat_cmax_cmin, rprops)) {
-		u32 cmin_val = 0;
-
+	if (mpam_has_feature(mpam_feat_cmax_cmin, rprops) &&
+	    mpam_has_feature(mpam_feat_cmax_cmin, cfg))
 		/* MPAMCFG_CMIN.CMIN[15:0] has the same layout as CMAX[15:0]. */
-		if (mpam_has_feature(mpam_feat_cmax_cmin, cfg))
-			cmin_val = cfg->cmin;
-
-		mpam_write_partsel_reg(msc, CMIN, cmin_val);
-	}
+		mpam_write_partsel_reg(msc, CMIN, cfg->cmin);
 
 	if (mpam_has_feature(mpam_feat_cmax_cassoc, rprops))
 		mpam_write_partsel_reg(msc, CASSOC, MPAMCFG_CASSOC_CASSOC);
@@ -1769,17 +1754,66 @@ static int mpam_save_mbwu_state(void *arg)
 }
 
 /*
+ * Build a default mpam_config for the RIS described by @props. For every
+ * control feature the RIS implements, advertise the feature bit and
+ * populate the architectural default value defined by Arm IHI 0099B.a
+ * (§9.6 partitioning configuration registers).
+ *
+ * The defaults match the post-reset architectural state, so handing the
+ * resulting cfg to mpam_reprogram_ris_partid() restores the RIS without
+ * any special-case "reset" branches inside the write path.
+ */
+static void mpam_init_reset_cfg(struct mpam_config *reset_cfg,
+				const struct mpam_props *props)
+{
+	memset(reset_cfg, 0, sizeof(*reset_cfg));
+
+	if (mpam_has_feature(mpam_feat_cpor_part, props)) {
+		mpam_set_feature(mpam_feat_cpor_part, reset_cfg);
+		reset_cfg->cpbm = GENMASK(props->cpbm_wd - 1, 0);
+	}
+	if (mpam_has_feature(mpam_feat_mbw_part, props)) {
+		mpam_set_feature(mpam_feat_mbw_part, reset_cfg);
+		reset_cfg->mbw_pbm = GENMASK(props->mbw_pbm_bits - 1, 0);
+	}
+	if (mpam_has_feature(mpam_feat_mbw_max, props)) {
+		mpam_set_feature(mpam_feat_mbw_max, reset_cfg);
+		reset_cfg->mbw_max = MPAMCFG_MBW_MAX_MAX;
+		/*
+		 * Soft cap is the architectural default. Advertise hardlim
+		 * with the bit clear so the value is programmed explicitly
+		 * on every reset, matching MAX_LIM == 0b00 behaviour.
+		 */
+		mpam_set_feature(mpam_feat_mbw_hardlim, reset_cfg);
+		reset_cfg->mbw_hardlim = false;
+	}
+	if (mpam_has_feature(mpam_feat_mbw_prop, props))
+		mpam_set_feature(mpam_feat_mbw_prop, reset_cfg);
+	if (mpam_has_feature(mpam_feat_cmax_cmax, props)) {
+		mpam_set_feature(mpam_feat_cmax_cmax, reset_cfg);
+		reset_cfg->cmax = MPAMCFG_CMAX_CMAX;
+		reset_cfg->cmax_softlim = false;
+	}
+	if (mpam_has_feature(mpam_feat_cmax_cmin, props)) {
+		mpam_set_feature(mpam_feat_cmax_cmin, reset_cfg);
+		reset_cfg->cmin = 0;
+	}
+}
+
+/*
  * Called via smp_call_on_cpu() to prevent migration, while still being
  * pre-emptible. Caller must hold mpam_srcu.
  */
 static int mpam_reset_ris(void *arg)
 {
 	u16 partid, partid_max;
-	struct mpam_config reset_cfg = {};
+	struct mpam_config reset_cfg;
 	struct mpam_msc_ris *ris = arg;
 
 	if (ris->in_reset_state)
 		return 0;
+
+	mpam_init_reset_cfg(&reset_cfg, &ris->props);
 
 	spin_lock(&partid_max_lock);
 	partid_max = mpam_partid_max;
@@ -2700,13 +2734,30 @@ static void mpam_reset_component_cfg(struct mpam_component *comp)
 		return;
 
 	for (i = 0; i <= mpam_partid_max; i++) {
-		comp->cfg[i] = (struct mpam_config) {};
-		if (cprops->cpbm_wd)
-			comp->cfg[i].cpbm = GENMASK(cprops->cpbm_wd - 1, 0);
-		if (cprops->mbw_pbm_bits)
-			comp->cfg[i].mbw_pbm = GENMASK(cprops->mbw_pbm_bits - 1, 0);
-		if (cprops->bwa_wd)
-			comp->cfg[i].mbw_max = GENMASK(15, 16 - cprops->bwa_wd);
+		struct mpam_config *cfg = &comp->cfg[i];
+
+		*cfg = (struct mpam_config) {};
+
+		if (cprops->cpbm_wd) {
+			cfg->cpbm = GENMASK(cprops->cpbm_wd - 1, 0);
+			mpam_set_feature(mpam_feat_cpor_part, cfg);
+		}
+		if (cprops->mbw_pbm_bits) {
+			cfg->mbw_pbm = GENMASK(cprops->mbw_pbm_bits - 1, 0);
+			mpam_set_feature(mpam_feat_mbw_part, cfg);
+		}
+		if (cprops->bwa_wd) {
+			cfg->mbw_max = GENMASK(15, 16 - cprops->bwa_wd);
+			mpam_set_feature(mpam_feat_mbw_max, cfg);
+			/* Default to soft cap (HARDLIM=0). */
+			cfg->mbw_hardlim = false;
+			mpam_set_feature(mpam_feat_mbw_hardlim, cfg);
+		}
+		if (cprops->cmax_wd) {
+			cfg->cmax = MPAMCFG_CMAX_CMAX;
+			cfg->cmax_softlim = false;
+			mpam_set_feature(mpam_feat_cmax_cmax, cfg);
+		}
 	}
 }
 
