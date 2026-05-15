@@ -194,6 +194,18 @@ static inline void resctrl_arch_mon_ctx_free(struct rdt_resource *r,
 					     enum resctrl_event_id evtid,
 					     void *ctx) { }
 
+/*
+ * Architectures with hardware counters that can wrap inside the
+ * resctrl_mon overflow window must return true; resctrl will then arm
+ * the per-domain overflow worker. Architectures with counters wide
+ * enough to never wrap (e.g. Arm MPAM's 63-bit MBWU) can return false
+ * to skip the worker entirely.
+ */
+static inline bool resctrl_arch_mon_can_overflow(void)
+{
+	return true;
+}
+
 void resctrl_cpu_detect(struct cpuinfo_x86 *c);
 
 #else

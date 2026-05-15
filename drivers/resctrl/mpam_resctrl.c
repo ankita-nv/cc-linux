@@ -1926,6 +1926,43 @@ void mpam_resctrl_exit(void)
 	resctrl_exit();
 }
 
+/*
+ * Can any exposed MPAM bandwidth counter overflow inside resctrl's
+ * MBM_OVERFLOW_INTERVAL window? Cache-occupancy counters are
+ * point-in-time samples and never need overflow accounting, so they
+ * are skipped. For each MBM event the MPAM class advertises a counter
+ * width (31, 44 or 63 bits); only the 63-bit width is wide enough to
+ * never wrap in practice. If every class has 63-bit counters resctrl
+ * can skip arming the periodic overflow worker entirely.
+ */
+static bool __resctrl_arch_mon_can_overflow(enum resctrl_event_id eventid)
+{
+	struct mpam_class *class = mpam_resctrl_counters[eventid].class;
+	struct mpam_props *cprops;
+
+	if (!class)
+		return false;
+
+	cprops = &class->props;
+	return !mpam_has_feature(mpam_feat_msmon_mbwu_63counter, cprops);
+}
+
+bool resctrl_arch_mon_can_overflow(void)
+{
+	struct mpam_resctrl_mon *mon;
+	enum resctrl_event_id eventid;
+
+	for_each_mpam_resctrl_mon(mon, eventid) {
+		if (eventid == QOS_L3_OCCUP_EVENT_ID)
+			continue;
+		if (__resctrl_arch_mon_can_overflow(eventid))
+			return true;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(resctrl_arch_mon_can_overflow);
+
 static void mpam_resctrl_teardown_mon(struct mpam_resctrl_mon *mon, struct mpam_class *class)
 {
 	u32 num_mbwu_mon = class->props.num_mbwu_mon;
