@@ -11,6 +11,7 @@
 
 #include <linux/acpi.h>
 #include <linux/acpi_iort.h>
+#include <linux/arm_mpam.h>
 #include <linux/bitops.h>
 #include <linux/crash_dump.h>
 #include <linux/delay.h>
@@ -1298,6 +1299,12 @@ void arm_smmu_get_ste_used(const __le64 *ent, __le64 *used_bits)
 
 	if (cfg == STRTAB_STE_0_CFG_BYPASS)
 		used_bits[1] |= cpu_to_le64(STRTAB_STE_1_SHCFG);
+
+	if (ent[1] & cpu_to_le64(STRTAB_STE_1_S1MPAM)) {
+		used_bits[1] |= cpu_to_le64(STRTAB_STE_1_S1MPAM);
+		used_bits[4] |= cpu_to_le64(STRTAB_STE_4_PARTID);
+		used_bits[5] |= cpu_to_le64(STRTAB_STE_5_PMG);
+	}
 }
 EXPORT_SYMBOL_IF_KUNIT(arm_smmu_get_ste_used);
 
@@ -1341,6 +1348,8 @@ void arm_smmu_get_ste_update_safe(const __le64 *cur, const __le64 *target,
 	 *  fault records even when MEV == 0.
 	 */
 	safe_bits[1] |= cpu_to_le64(STRTAB_STE_1_MEV);
+	safe_bits[4] |= cpu_to_le64(STRTAB_STE_4_PARTID);
+	safe_bits[5] |= cpu_to_le64(STRTAB_STE_5_PMG);
 }
 EXPORT_SYMBOL_IF_KUNIT(arm_smmu_get_ste_update_safe);
 
@@ -1829,10 +1838,37 @@ static const struct arm_smmu_entry_writer_ops arm_smmu_ste_writer_ops = {
 	.get_update_safe = arm_smmu_get_ste_update_safe,
 };
 
+/*
+ * Tag every STE on an MPAM-capable SMMU with S1MPAM, PARTID and PMG. Masters
+ * that resctrl has never tagged carry the default partition (PARTID=0, PMG=0),
+ * so unconfigured devices observe MPAM's default partition behaviour rather
+ * than being treated as "MPAM disabled". The set_group_qos_params hook below
+ * updates master->partid / master->pmg and rewrites every owned STE.
+ */
+static void arm_smmu_apply_mpam_ste(struct arm_smmu_master *master,
+				    struct arm_smmu_ste *target)
+{
+	u64 val;
+
+	if (!(master->smmu->features & ARM_SMMU_FEAT_MPAM))
+		return;
+
+	target->data[1] |= cpu_to_le64(STRTAB_STE_1_S1MPAM);
+
+	val = le64_to_cpu(target->data[4]) & ~STRTAB_STE_4_PARTID;
+	val |= FIELD_PREP(STRTAB_STE_4_PARTID, master->partid);
+	target->data[4] = cpu_to_le64(val);
+
+	val = le64_to_cpu(target->data[5]) & ~STRTAB_STE_5_PMG;
+	val |= FIELD_PREP(STRTAB_STE_5_PMG, master->pmg);
+	target->data[5] = cpu_to_le64(val);
+}
+
 static void arm_smmu_write_ste(struct arm_smmu_master *master, u32 sid,
 			       struct arm_smmu_ste *ste,
 			       const struct arm_smmu_ste *target)
 {
+	struct arm_smmu_ste mpam_target;
 	struct arm_smmu_device *smmu = master->smmu;
 	struct arm_smmu_ste_writer ste_writer = {
 		.writer = {
@@ -1841,6 +1877,12 @@ static void arm_smmu_write_ste(struct arm_smmu_master *master, u32 sid,
 		},
 		.sid = sid,
 	};
+
+	if (smmu->features & ARM_SMMU_FEAT_MPAM) {
+		mpam_target = *target;
+		arm_smmu_apply_mpam_ste(master, &mpam_target);
+		target = &mpam_target;
+	}
 
 	arm_smmu_write_entry(&ste_writer.writer, ste->data, target->data);
 
@@ -4374,6 +4416,70 @@ static int arm_smmu_def_domain_type(struct device *dev)
 	return 0;
 }
 
+/*
+ * Per-device MPAM PARTID / PMG programming for SMMUv3.
+ *
+ * The implementation walks the SMMU master directly via
+ * dev_iommu_priv_get(@dev) so it works regardless of whether @dev's
+ * iommu_group is currently bound to a paging domain or to
+ * IOMMU_DOMAIN_IDENTITY (which has no arm_smmu_domain context).
+ * Every Stream ID owned by the master is rewritten through the normal
+ * STE writer so MPAM updates are serialized with attach/detach changes.
+ */
+static int arm_smmu_group_set_mpam(struct device *dev, u16 partid, u8 pmg)
+{
+	int i, j;
+	u32 sid;
+	struct arm_smmu_ste *step;
+	struct arm_smmu_ste target;
+	struct arm_smmu_master *master;
+
+	master = dev_iommu_priv_get(dev);
+	if (!master || !master->smmu)
+		return -ENODEV;
+	if (!(master->smmu->features & ARM_SMMU_FEAT_MPAM))
+		return -EIO;
+
+	master->partid = partid;
+	master->pmg = pmg;
+
+	for (i = 0; i < master->num_streams; i++) {
+		sid = master->streams[i].id;
+
+		/* Bridged PCI devices may end up with duplicated IDs */
+		for (j = 0; j < i; j++)
+			if (master->streams[j].id == sid)
+				break;
+		if (j < i)
+			continue;
+
+		step = arm_smmu_get_step_for_sid(master->smmu, sid);
+		target = *step;
+
+		arm_smmu_write_ste(master, sid, step, &target);
+	}
+
+	return 0;
+}
+
+static int arm_smmu_group_get_mpam(struct device *dev, u16 *partid, u8 *pmg)
+{
+	struct arm_smmu_master *master;
+
+	master = dev_iommu_priv_get(dev);
+	if (!master || !master->smmu)
+		return -ENODEV;
+	if (!(master->smmu->features & ARM_SMMU_FEAT_MPAM))
+		return -EIO;
+
+	if (partid)
+		*partid = master->partid;
+	if (pmg)
+		*pmg = master->pmg;
+
+	return 0;
+}
+
 static const struct iommu_ops arm_smmu_ops = {
 	.identity_domain	= &arm_smmu_identity_domain,
 	.blocked_domain		= &arm_smmu_blocked_domain,
@@ -4387,6 +4493,8 @@ static const struct iommu_ops arm_smmu_ops = {
 	.device_group		= arm_smmu_device_group,
 	.of_xlate		= arm_smmu_of_xlate,
 	.get_resv_regions	= arm_smmu_get_resv_regions,
+	.get_group_qos_params	= arm_smmu_group_get_mpam,
+	.set_group_qos_params	= arm_smmu_group_set_mpam,
 	.page_response		= arm_smmu_page_response,
 	.def_domain_type	= arm_smmu_def_domain_type,
 	.get_viommu_size	= arm_smmu_get_viommu_size,
@@ -5193,6 +5301,8 @@ static int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 		smmu->features |= ARM_SMMU_FEAT_RANGE_INV;
 	if (FIELD_GET(IDR3_FWB, reg))
 		smmu->features |= ARM_SMMU_FEAT_S2FWB;
+	if (FIELD_GET(IDR3_MPAM, reg))
+		smmu->features |= ARM_SMMU_FEAT_MPAM;
 
 	if (FIELD_GET(IDR3_BBM, reg) == 2)
 		smmu->features |= ARM_SMMU_FEAT_BBML2;
@@ -5260,6 +5370,27 @@ static int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 
 	if (arm_smmu_sva_supported(smmu))
 		smmu->features |= ARM_SMMU_FEAT_SVA;
+
+	/*
+	 * Register the SMMU's PARTID / PMG ranges with the MPAM driver if
+	 * the implementation supports MPAM. mpam_register_requestor()
+	 * intersects every requestor's range so the system-wide visible
+	 * range is the minimum supported by all. Drop the feature flag
+	 * on failure so the QoS hooks return -EIO until reboot.
+	 */
+	if (IS_ENABLED(CONFIG_ARM64_MPAM) &&
+	    (smmu->features & ARM_SMMU_FEAT_MPAM)) {
+		u32 mpamidr = readl_relaxed(smmu->base + ARM_SMMU_MPAMIDR);
+
+		if (mpamidr) {
+			u16 partid_max = FIELD_GET(SMMU_MPAMIDR_PARTID_MAX,
+						   mpamidr);
+			u8 pmg_max = FIELD_GET(SMMU_MPAMIDR_PMG_MAX, mpamidr);
+
+			if (mpam_register_requestor(partid_max, pmg_max))
+				smmu->features &= ~ARM_SMMU_FEAT_MPAM;
+		}
+	}
 
 	dev_info(smmu->dev, "oas %lu-bit (features 0x%08x)\n",
 		 smmu->oas, smmu->features);
