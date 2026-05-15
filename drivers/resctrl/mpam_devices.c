@@ -2490,6 +2490,18 @@ static irqreturn_t __mpam_irq_handler(int irq, struct mpam_msc *msc)
 			   msc->id, mpam_errcode_names[errcode], partid, pmg,
 			   ris);
 
+	/*
+	 * Per Arm IHI 0099B.a §7.1 (MPAMF_ESR.ERRCODE), only the
+	 * request-side range errors indicate in-flight traffic carries an
+	 * out-of-range PARTID/PMG. The remaining error codes are
+	 * driver-side configuration mistakes (writing a bad selector into
+	 * an MSC register); they do not corrupt traffic partitioning, so
+	 * just log and return without tearing the MSC down.
+	 */
+	if (errcode != MPAM_ERRCODE_REQ_PARTID_RANGE &&
+	    errcode != MPAM_ERRCODE_REQ_PMG_RANGE)
+		return IRQ_HANDLED;
+
 	/* Disable this interrupt. */
 	mpam_disable_msc_ecr(msc);
 
