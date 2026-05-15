@@ -1477,6 +1477,70 @@ int iommu_group_id(struct iommu_group *group)
 }
 EXPORT_SYMBOL_GPL(iommu_group_id);
 
+/**
+ * iommu_get_group_kset - return a reference to the iommu_groups kset.
+ *
+ * The iommu_groups kset is the sysfs container that backs
+ * /sys/kernel/iommu_groups. Returning a reference here lets callers
+ * (notably resctrl) walk the live list of iommu_groups in sysfs.
+ */
+struct kset *iommu_get_group_kset(void)
+{
+	return kset_get(iommu_group_kset);
+}
+EXPORT_SYMBOL_GPL(iommu_get_group_kset);
+
+/**
+ * iommu_group_get_from_kobj - resolve a kobject pointer into the matching
+ *                             iommu_group.
+ * @group_kobj: kobject taken from the iommu_groups kset.
+ *
+ * Returns an iommu_group reference (via the group's devices_kobj) suitable
+ * for use, and releases the caller-held kobject reference on success.
+ *
+ * Returns %NULL when the kset is not set up yet or when @group_kobj is
+ * %NULL. On the %NULL-return path the caller-held kobject reference is
+ * NOT released; the caller must drop it with kobject_put() if appropriate.
+ */
+struct iommu_group *iommu_group_get_from_kobj(struct kobject *group_kobj)
+{
+	struct iommu_group *group;
+
+	if (!iommu_group_kset || !group_kobj)
+		return NULL;
+
+	group = container_of(group_kobj, struct iommu_group, kobj);
+
+	kobject_get(group->devices_kobj);
+	kobject_put(&group->kobj);
+
+	return group;
+}
+EXPORT_SYMBOL_GPL(iommu_group_get_from_kobj);
+
+/**
+ * iommu_group_get_by_id - look up an iommu_group by its sysfs id.
+ * @id: integer id matching /sys/kernel/iommu_groups/<id>.
+ */
+struct iommu_group *iommu_group_get_by_id(int id)
+{
+	struct kobject *group_kobj;
+	const char *name;
+
+	if (!iommu_group_kset)
+		return NULL;
+
+	name = kasprintf(GFP_KERNEL, "%d", id);
+	if (!name)
+		return NULL;
+
+	group_kobj = kset_find_obj(iommu_group_kset, name);
+	kfree(name);
+
+	return iommu_group_get_from_kobj(group_kobj);
+}
+EXPORT_SYMBOL_GPL(iommu_group_get_by_id);
+
 static struct iommu_group *get_pci_alias_group(struct pci_dev *pdev,
 					       unsigned long *devfns);
 
@@ -4263,3 +4327,83 @@ int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr)
 	return ret;
 }
 #endif /* CONFIG_IRQ_MSI_IOMMU */
+
+/**
+ * iommu_group_set_qos_params() - Set MPAM PARTID / PMG on every device in @group.
+ * @group:        the iommu_group to retag.
+ * @partition:    PARTID to label outbound traffic with.
+ * @perf_mon_grp: PMG to label outbound traffic with.
+ *
+ * Walks @group's devices and dispatches the per-device .set_group_qos_params
+ * iommu_ops hook. Returns 0 on success, -EOPNOTSUPP if the underlying
+ * iommu driver does not implement the hook, -ENODEV when the group has
+ * no devices, or the first negative error returned by the hook.
+ *
+ * The loop stops on the first failing device. Devices in @group that share
+ * the same iommu_ops will succeed or fail uniformly; the only way to end up
+ * with a partially-tagged group is a heterogeneous group whose devices use
+ * different iommu drivers. Callers that need transactional behaviour across
+ * such groups must arrange their own rollback.
+ */
+int iommu_group_set_qos_params(struct iommu_group *group, u16 partition,
+			       u8 perf_mon_grp)
+{
+	const struct iommu_ops *ops;
+	struct group_device *device;
+	int ret = -ENODEV;
+
+	mutex_lock(&group->mutex);
+	for_each_group_device(group, device) {
+		ops = dev_iommu_ops(device->dev);
+		if (!ops->set_group_qos_params) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		ret = ops->set_group_qos_params(device->dev, partition,
+						perf_mon_grp);
+		if (ret < 0)
+			break;
+	}
+	mutex_unlock(&group->mutex);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(iommu_group_set_qos_params);
+
+/**
+ * iommu_group_get_qos_params() - Read MPAM PARTID / PMG from the first
+ *                                device in @group that reports it.
+ * @group:        the iommu_group to query.
+ * @partition:    out parameter for PARTID; may be %NULL.
+ * @perf_mon_grp: out parameter for PMG; may be %NULL.
+ *
+ * Returns 0 once a device's .get_group_qos_params hook reports the values.
+ * If every device reports an error, the LAST error is returned (devices in
+ * a group share an iommu_ops in practice, so the difference is rarely
+ * observable). Returns -EOPNOTSUPP when the first iommu driver lacks the
+ * hook, or -ENODEV when @group has no devices.
+ */
+int iommu_group_get_qos_params(struct iommu_group *group, u16 *partition,
+			       u8 *perf_mon_grp)
+{
+	const struct iommu_ops *ops;
+	struct group_device *device;
+	int ret = -ENODEV;
+
+	mutex_lock(&group->mutex);
+	for_each_group_device(group, device) {
+		ops = dev_iommu_ops(device->dev);
+		if (!ops->get_group_qos_params) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		ret = ops->get_group_qos_params(device->dev, partition,
+						perf_mon_grp);
+		if (!ret)
+			break;
+	}
+	mutex_unlock(&group->mutex);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(iommu_group_get_qos_params);

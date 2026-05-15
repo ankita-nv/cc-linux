@@ -735,6 +735,17 @@ struct iommu_ops {
 			   struct iommu_domain *parent_domain,
 			   const struct iommu_user_data *user_data);
 
+	/*
+	 * Per device MPAM QoS hooks. Both operate on a single device so the
+	 * iommu driver does not need a paging-domain context (lets MPAM
+	 * support IOMMU_DOMAIN_IDENTITY). iommu_group_{set,get}_qos_params()
+	 * walk every device in the group and invoke these hooks per device.
+	 */
+	int (*get_group_qos_params)(struct device *dev, u16 *partition,
+				    u8 *perf_mon_grp);
+	int (*set_group_qos_params)(struct device *dev, u16 partition,
+				    u8 perf_mon_grp);
+
 	const struct iommu_domain_ops *default_domain_ops;
 	struct module *owner;
 	struct iommu_domain *identity_domain;
@@ -942,6 +953,13 @@ extern int iommu_attach_device(struct iommu_domain *domain,
 extern void iommu_detach_device(struct iommu_domain *domain,
 				struct device *dev);
 extern struct iommu_domain *iommu_get_domain_for_dev(struct device *dev);
+struct iommu_group *iommu_group_get_from_kobj(struct kobject *group_kobj);
+struct iommu_group *iommu_group_get_by_id(int id);
+struct kset *iommu_get_group_kset(void);
+int iommu_group_set_qos_params(struct iommu_group *group, u16 partition,
+			       u8 perf_mon_grp);
+int iommu_group_get_qos_params(struct iommu_group *group, u16 *partition,
+			       u8 *perf_mon_grp);
 struct iommu_domain *iommu_driver_get_domain_for_dev(struct device *dev);
 extern struct iommu_domain *iommu_get_dma_domain(struct device *dev);
 extern int iommu_map(struct iommu_domain *domain, unsigned long iova,
@@ -1406,6 +1424,34 @@ static inline void iommu_group_put(struct iommu_group *group)
 }
 
 static inline int iommu_group_id(struct iommu_group *group)
+{
+	return -ENODEV;
+}
+
+static inline struct iommu_group *
+iommu_group_get_from_kobj(struct kobject *group_kobj)
+{
+	return NULL;
+}
+
+static inline struct iommu_group *iommu_group_get_by_id(int id)
+{
+	return NULL;
+}
+
+static inline struct kset *iommu_get_group_kset(void)
+{
+	return NULL;
+}
+
+static inline int iommu_group_set_qos_params(struct iommu_group *group,
+					     u16 partition, u8 perf_mon_grp)
+{
+	return -ENODEV;
+}
+
+static inline int iommu_group_get_qos_params(struct iommu_group *group,
+					     u16 *partition, u8 *perf_mon_grp)
 {
 	return -ENODEV;
 }
