@@ -8,6 +8,8 @@
 #include <linux/pid.h>
 #include <linux/resctrl_types.h>
 
+struct iommu_group;
+
 #ifdef CONFIG_ARCH_HAS_CPU_RESCTRL
 #include <asm/resctrl.h>
 #endif
@@ -723,4 +725,36 @@ static inline int resctrl_arch_measure_cycles_lat_fn(void *_plr) { return 0; }
 static inline int resctrl_arch_measure_l2_residency(void *_plr) { return 0; }
 static inline int resctrl_arch_measure_l3_residency(void *_plr) { return 0; }
 #endif /* CONFIG_RESCTRL_FS_PSEUDO_LOCK */
+
+/*
+ * iommu_group <-> resctrl group binding. When the architecture supports
+ * tagging IOMMU streams with the same CLOSID / RMID as a CPU thread, it
+ * implements these three hooks; resctrl uses them to dispatch
+ * "iommu_group:N" entries written to the per-group tasks file.
+ */
+#ifdef CONFIG_RESCTRL_IOMMU
+int resctrl_arch_set_iommu_closid_rmid(struct iommu_group *group, u32 closid,
+				       u32 rmid);
+bool resctrl_arch_match_iommu_closid(struct iommu_group *group, u32 closid);
+bool resctrl_arch_match_iommu_closid_rmid(struct iommu_group *group, u32 closid,
+					  u32 rmid);
+#else
+static inline int resctrl_arch_set_iommu_closid_rmid(struct iommu_group *group,
+						     u32 closid, u32 rmid)
+{
+	return -EOPNOTSUPP;
+}
+static inline bool resctrl_arch_match_iommu_closid(struct iommu_group *group,
+						   u32 closid)
+{
+	return false;
+}
+static inline bool
+resctrl_arch_match_iommu_closid_rmid(struct iommu_group *group,
+				     u32 closid, u32 rmid)
+{
+	return false;
+}
+#endif /* CONFIG_RESCTRL_IOMMU */
+
 #endif /* _RESCTRL_H */
