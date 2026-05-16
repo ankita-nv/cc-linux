@@ -1696,6 +1696,8 @@ void kvm_destroy_rec(struct kvm_vcpu *vcpu)
 	 * psci_on_pending flag so it isn't wedged in DENIED-for-future-CPU_ON
 	 * state after we destroy the source. The RMM has no spec hook to be
 	 * told the source died; KVM-owned state is the only thing to unwind.
+	 * Must run before rec->run is freed below, since the saved CPU_ON
+	 * arguments live in rec->run->exit.gprs[].
 	 */
 	if (rec->psci_complete_pending) {
 		unsigned long fn = rec->run->exit.gprs[0];
@@ -1710,7 +1712,6 @@ void kvm_destroy_rec(struct kvm_vcpu *vcpu)
 		}
 		rec->psci_complete_pending = false;
 	}
-
 	if (WARN_ON(rmi_rec_destroy(rec->rec_phys, rec->sro)))
 		return;
 
