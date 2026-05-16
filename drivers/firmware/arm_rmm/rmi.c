@@ -189,6 +189,19 @@ static int rmi_sro_donate_contig(struct rmi_sro_state *sro,
 	for (int i = 0; i < sro->addr_count; i++) {
 		unsigned long entry = sro->addr_list[i];
 
+		/*
+		 * Contiguous donation requires the base address to be
+		 * aligned to (unit_size * count) per DEN0137 v2.0-bet3
+		 * §B4.3.2.2 R0103. The fresh-alloc path below honours
+		 * this via alloc_pages_exact(size) where size already
+		 * equals unit_size_bytes * count, but cached entries may
+		 * have come from RMI_OP_MEM_RECLAIM and the RMM is free
+		 * to return them at any alignment. Reusing a misaligned
+		 * entry would trip RMI_ERROR_INPUT and (per the contig
+		 * example in B4.3.2.3) tear down the SRO context, so
+		 * skip such entries and fall through to a fresh
+		 * allocation instead.
+		 */
 		if (RMI_ADDR_RANGE_SIZE(entry) == unit_size &&
 		    RMI_ADDR_RANGE_COUNT(entry) == count &&
 		    RMI_ADDR_RANGE_STATE(entry) == state &&
@@ -355,7 +368,6 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 			else
 				__free_page(phys_to_page(phys + i));
 		}
-
 		/*
 		 * This unit is now fully 'consumed' (either held by the RMM or
 		 * freed)
