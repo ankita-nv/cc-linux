@@ -325,4 +325,19 @@ config NVIDIA_TEGRA410_C2C_PMU
 	  Enable perf support for counters in NVIDIA C2C interface of NVIDIA
 	  Tegra410 SoC.
 
+config RESCTRL_PMU
+	bool "Expose resctrl monitor counters to perf"
+	default y
+	depends on ARM64_MPAM_RESCTRL_FS
+	help
+	  Bridge the cache-occupancy and memory-bandwidth counters that
+	  resctrl already exposes through the resctrl filesystem to perf.
+	  Available on hardware that supports Arm MPAM. When enabled, a
+	  "resctrl_pmu" PMU appears under
+	  /sys/bus/event_source/devices/ and lets perf record the same
+	  events resctrl reports (llc_occupancy, mbm_local_bytes,
+	  mbm_total_bytes).
+
+	  Say Y if unsure.
+
 endmenu

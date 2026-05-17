@@ -20,6 +20,7 @@
 #include <linux/iommu.h>
 #include <linux/kernfs.h>
 #include <linux/once.h>
+#include <linux/platform_device.h>
 #include <linux/resctrl.h>
 #include <linux/seq_buf.h>
 #include <linux/seq_file.h>
@@ -35,6 +36,13 @@
 DEFINE_MUTEX(rdtgroup_mutex);
 
 static struct kernfs_root *rdt_root;
+
+/*
+ * Platform device that drivers/perf/resctrl_pmu.c binds to. Registered
+ * by resctrl_init() once the resctrl filesystem is in place so the PMU
+ * driver only ever runs against initialised resctrl state.
+ */
+static struct platform_device *resctrl_pmu_pdev;
 
 struct rdtgroup rdtgroup_default;
 
@@ -5078,6 +5086,16 @@ int resctrl_init(void)
 	 */
 	debugfs_resctrl = debugfs_create_dir("resctrl", NULL);
 
+	/*
+	 * Spawn a platform device for drivers/perf/resctrl_pmu.c to bind to.
+	 * Failure is non-fatal: resctrl itself stays usable, the PMU bridge
+	 * simply will not appear.
+	 */
+	resctrl_pmu_pdev = platform_device_register_simple("resctrl_pmu",
+							   -1, NULL, 0);
+	if (IS_ERR(resctrl_pmu_pdev))
+		resctrl_pmu_pdev = NULL;
+
 	return 0;
 
 cleanup_mountpoint:
@@ -5127,6 +5145,11 @@ static bool resctrl_online_domains_exist(void)
  */
 void resctrl_exit(void)
 {
+	if (resctrl_pmu_pdev) {
+		platform_device_unregister(resctrl_pmu_pdev);
+		resctrl_pmu_pdev = NULL;
+	}
+
 	cpus_read_lock();
 	WARN_ON_ONCE(resctrl_online_domains_exist());
 

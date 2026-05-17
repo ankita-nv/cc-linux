@@ -67,6 +67,7 @@ struct rdt_resource;
 void *resctrl_arch_mon_ctx_alloc(struct rdt_resource *r, enum resctrl_event_id evtid);
 void resctrl_arch_mon_ctx_free(struct rdt_resource *r, enum resctrl_event_id evtid, void *ctx);
 bool resctrl_arch_mon_can_overflow(void);
+u32 resctrl_arch_mon_count(struct rdt_resource *r, enum resctrl_event_id evtid);
 
 /*
  * The CPU configuration for MPAM is cheap to write, and is only written if it
