@@ -21,6 +21,12 @@ static inline unsigned long rmi_rtt_level_mapsize(int level)
 	return (1UL << ARM64_HW_PGTABLE_LEVEL_SHIFT(level));
 }
 
+static inline unsigned long rmi_rtt_next_addr(unsigned long addr,
+					      unsigned long end, int level)
+{
+	return min(ALIGN(addr + 1, rmi_rtt_level_mapsize(level)), end);
+}
+
 static bool rmi_has_feature(int reg, unsigned long feature)
 {
 	return !!u64_get_bits(rmi_feat_reg(reg), feature);
@@ -481,6 +487,7 @@ static void realm_unmap_shared_range(struct kvm *kvm,
 	for (addr = start; addr < end; addr = next_addr) {
 		long ret;
 
+retry:
 		ret = rmi_rtt_unprot_unmap(rd, addr, end, RMI_ADDR_TYPE_NONE,
 					   0, &next_addr, NULL, NULL);
 		if (WARN_ON(ret < 0))
@@ -488,24 +495,43 @@ static void realm_unmap_shared_range(struct kvm *kvm,
 
 		switch (RMI_RETURN_STATUS(ret)) {
 		case RMI_SUCCESS:
+			/*
+			 * @next_addr is RMM's out_top: the IPA up to
+			 * which the architecture unmapped (page or
+			 * block, picked by RMM transparently per
+			 * DEN0137 v2.0-bet1 §B4.5.70). Advance and
+			 * continue.
+			 */
+			if (WARN_ON(next_addr <= addr || next_addr > end))
+				return;
 			break;
 		case RMI_ERROR_RTT: {
+			unsigned long map_size;
 			int err_level = RMI_RETURN_INDEX(ret);
-			int level = find_map_level(realm, addr, end);
 
-			if (err_level >= level) {
-				/* Nothing present, so skip */
-				next_addr = addr + rmi_rtt_level_mapsize(err_level);
+			/*
+			 * RMM walked [addr, end) and did not find a
+			 * MAPPED_NS entry, or found a live block larger
+			 * than the requested range. Skip a fully covered
+			 * missing entry, otherwise split the block and retry.
+			 */
+			if (WARN_ON(err_level > KVM_PGTABLE_LAST_LEVEL))
+				return;
+
+			map_size = rmi_rtt_level_mapsize(err_level);
+			if (err_level == KVM_PGTABLE_LAST_LEVEL ||
+			    (IS_ALIGNED(addr, map_size) &&
+			     addr + map_size <= end)) {
+				next_addr = rmi_rtt_next_addr(addr, end,
+							     err_level);
 				break;
 			}
 
 			ret = realm_create_rtt_levels(realm, addr, err_level,
-						      level, NULL);
-			if (WARN_ON(ret))
+						      err_level + 1, NULL);
+			if (ret)
 				return;
-			/* Retry with the RTT levels in place */
-			next_addr = addr;
-			break;
+			goto retry;
 		}
 		default:
 			WARN_ON(1);
@@ -645,7 +671,7 @@ static void realm_unmap_private_range(struct kvm *kvm,
 	long ret;
 
 	for (addr = start; addr < end; addr = next_addr) {
-		unsigned long out_range;
+		unsigned long out_range = 0;
 		unsigned long flags = RMI_ADDR_TYPE_SINGLE;
 		/* TODO: Optimise using RMI_ADDR_TYPE_LIST */
 
@@ -655,24 +681,36 @@ retry:
 		if (WARN_ON(ret < 0))
 			return;
 
-		if (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) {
-			phys_addr_t rtt;
-
-			if (next_addr > addr)
-				continue; /* UNASSIGNED */
-
-			rtt = alloc_rtt(NULL);
-			if (WARN_ON(rtt == PHYS_ADDR_MAX))
+		switch (RMI_RETURN_STATUS(ret)) {
+		case RMI_SUCCESS:
+			if (WARN_ON(next_addr <= addr || next_addr > end))
 				return;
-			ret = realm_rtt_create(realm, addr,
-					       RMI_RETURN_INDEX(ret) + 1, rtt);
-			if (WARN_ON(ret)) {
-				free_rtt(rtt);
+			break;
+		case RMI_ERROR_RTT: {
+			unsigned long map_size;
+			int err_level = RMI_RETURN_INDEX(ret);
+
+			if (WARN_ON(err_level > KVM_PGTABLE_LAST_LEVEL))
 				return;
+
+			map_size = rmi_rtt_level_mapsize(err_level);
+			if (err_level == KVM_PGTABLE_LAST_LEVEL ||
+			    (IS_ALIGNED(addr, map_size) &&
+			     addr + map_size <= end)) {
+				next_addr = rmi_rtt_next_addr(addr, end,
+							     err_level);
+				break;
 			}
+
+			ret = realm_create_rtt_levels(realm, addr, err_level,
+						      err_level + 1, NULL);
+			if (ret)
+				return;
 			goto retry;
-		} else if (WARN_ON(ret)) {
-			continue;
+		}
+		default:
+			WARN_ON(1);
+			return;
 		}
 
 		ret = undelegate_range_desc(out_range);
@@ -782,6 +820,96 @@ static unsigned long addr_range_desc(unsigned long phys, unsigned long size,
 	return out;
 }
 
+/*
+ * Delegate a PA range using caller-owned SRO state.
+ *
+ * RMI_GRANULE_RANGE_DELEGATE may make forward progress on only a prefix of
+ * the requested range. Return that delegated prefix to the caller so it can
+ * either consume the granules or undelegate exactly the granules that changed
+ * ownership.
+ */
+static int realm_delegate_range(phys_addr_t phys,
+				unsigned long size,
+				unsigned long *delegated_size)
+{
+	phys_addr_t out_phys = phys;
+	int ret;
+
+	ret = rmi_delegate_range(phys, size, &out_phys);
+	*delegated_size = out_phys - phys;
+	return ret;
+}
+
+static int realm_undelegate_range(phys_addr_t phys,
+				  unsigned long size)
+{
+	return rmi_undelegate_range(phys, size);
+}
+
+static int realm_undelegate_map_range(phys_addr_t phys,
+				      unsigned long size)
+{
+	phys_addr_t addr;
+	phys_addr_t end = phys + size;
+
+	if (!size)
+		return 0;
+
+	if (WARN_ON(realm_undelegate_range(phys, size))) {
+		/* Pages can't be returned to NS world so are lost */
+		for (addr = phys; addr < end; addr += PAGE_SIZE)
+			get_page(phys_to_page(addr));
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+/*
+ * Check why a protected range delegation failed at @ipa.
+ *
+ * Returns 1 when an existing matching protected mapping covers @ipa and the
+ * caller can retry after @next_ipa, -EAGAIN when a child RTT blocks the
+ * current mapping level, 0 when no existing RTTE explains the delegation
+ * failure, or a negative errno for an invalid/conflicting RTTE.
+ */
+static int realm_map_target(unsigned long rd, unsigned long ipa,
+			    phys_addr_t phys, int map_level,
+			    unsigned long ipa_top, unsigned long *next_ipa)
+{
+	struct rtt_entry rtte;
+	unsigned long map_size;
+	phys_addr_t rtte_phys;
+	int ret;
+
+	ret = rmi_rtt_read_entry(rd, ipa, map_level, &rtte);
+	if (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT)
+		return 0;
+	if (ret)
+		return -ENXIO;
+
+	switch (rtte.state) {
+	case RMI_UNASSIGNED:
+		return 0;
+	case RMI_TABLE:
+		if (rtte.walk_level == map_level)
+			return -EAGAIN;
+		return 0;
+	case RMI_ASSIGNED:
+		break;
+	default:
+		return -ENXIO;
+	}
+
+	map_size = rmi_rtt_level_mapsize(rtte.walk_level);
+	rtte_phys = kvm_pte_to_phys(rtte.desc) + (ipa & (map_size - 1));
+	if ((rtte.ripas != RMI_RAM) || (rtte_phys != phys))
+		return -EFAULT;
+
+	*next_ipa = min(ALIGN_DOWN(ipa, map_size) + map_size, ipa_top);
+	return 1;
+}
+
 static int realm_map_protected(struct kvm *kvm,
 			       unsigned long ipa,
 			       kvm_pfn_t pfn,
@@ -789,61 +917,129 @@ static int realm_map_protected(struct kvm *kvm,
 			       struct kvm_mmu_memory_cache *memcache)
 {
 	struct realm *realm = &kvm->arch.realm;
-	phys_addr_t phys = __pfn_to_phys(pfn);
-	phys_addr_t base_phys = phys;
+	phys_addr_t base_phys = __pfn_to_phys(pfn);
+	phys_addr_t phys = base_phys;
 	phys_addr_t rd = virt_to_phys(realm->rd);
-	phys_addr_t delegated_phys;
+	unsigned long start_ipa = ipa;
 	unsigned long base_ipa = ipa;
-	unsigned long ipa_top;
-	long ret = 0;
+	unsigned long ipa_top = ipa + map_size;
+	unsigned long delegate_ipa = ipa;
+	phys_addr_t delegate_phys = phys;
+	unsigned long delegated_size;
+	unsigned long next_ipa;
+	int map_level;
+	int ret = 0;
 
 	if (WARN_ON(!IS_ALIGNED(map_size, PAGE_SIZE) ||
 		    !IS_ALIGNED(ipa, map_size)))
 		return -EINVAL;
 
-	if (rmi_delegate_range(phys, map_size, &delegated_phys)) {
-		if (delegated_phys == phys) {
-			/*
-			 * It's likely we raced with another VCPU on the same
-			 * fault. Assume the other VCPU has handled the fault
-			 * and return to the guest.
-			 */
-			return 0;
-		}
-		/* Partial delegation - map as much as we can */
-		map_size = delegated_phys - phys;
+retry_delegate:
+	delegated_size = 0;
+	ret = realm_delegate_range(delegate_phys,
+				   ipa_top - delegate_ipa, &delegated_size);
+	delegate_ipa += delegated_size;
+	delegate_phys += delegated_size;
+	if (!ret || delegate_ipa == ipa_top)
+		goto map_delegated;
+
+	if (ret < 0)
+		return ret;
+
+	map_level = find_map_level(realm, delegate_ipa, ipa_top);
+retry_check:
+	ret = realm_map_target(rd, delegate_ipa, delegate_phys,
+			       map_level, ipa_top, &next_ipa);
+	if (ret > 0) {
+		/*
+		 * The delegate range stopped on an already mapped granule.
+		 * Skip the matching RTTE and continue delegating the remaining
+		 * suffix.
+		 */
+		if (base_ipa == delegate_ipa)
+			base_ipa = next_ipa;
+		delegate_phys += next_ipa - delegate_ipa;
+		delegate_ipa = next_ipa;
+		if (delegate_ipa == ipa_top)
+			goto map_delegated;
+		goto retry_delegate;
 	}
 
-	ipa_top = ipa + map_size;
+	if (ret == -EAGAIN) {
+		/*
+		 * A child RTT exists at this level; inspect one level down to
+		 * find the mapped target that blocked delegation.
+		 */
+		if (map_level >= KVM_PGTABLE_LAST_LEVEL)
+			goto err_undelegate;
+		map_level++;
+		goto retry_check;
+	}
+
+	goto err_undelegate;
+
+map_delegated:
+	ipa = base_ipa;
+	phys = base_phys + (ipa - start_ipa);
 
 	while (ipa < ipa_top) {
+		unsigned long top = ipa_top;
 		unsigned long flags = RMI_ADDR_TYPE_SINGLE;
-		unsigned long range_desc = addr_range_desc(phys, ipa_top - ipa,
-							   RMI_OP_MEM_DELEGATED);
+		unsigned long range_desc;
 		unsigned long out_top;
 
-		ret = rmi_rtt_data_map(rd, ipa, ipa_top, flags, range_desc,
+retry_map:
+		range_desc = addr_range_desc(phys, top - ipa,
+					     RMI_OP_MEM_DELEGATED);
+		ret = rmi_rtt_data_map(rd, ipa, top, flags, range_desc,
 				       &out_top);
 		if (ret < 0)
 			goto err_undelegate;
 
 		if (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) {
 			/* Create missing RTTs and retry */
+			int map_level = find_map_level(realm, ipa, top);
 			int level = RMI_RETURN_INDEX(ret);
 
-			if (WARN_ON(level >= KVM_PGTABLE_LAST_LEVEL))
-				goto err_undelegate;
-			ret = realm_create_rtt_levels(realm, ipa, level,
-						      level + 1,
-						      memcache);
-			if (ret)
-				goto err_undelegate;
+			ret = realm_map_target(rd, ipa, phys, map_level,
+					       top, &next_ipa);
+			if (ret > 0) {
+				/*
+				 * This target was already mapped before the
+				 * range delegate pass. Skip it and continue with
+				 * the next unmapped target.
+				 */
+				base_ipa = next_ipa;
+				phys += next_ipa - ipa;
+				ipa = next_ipa;
+				continue;
+			}
 
+			if (ret == -EAGAIN) {
+				if (top - ipa <= PAGE_SIZE)
+					goto err_unmap;
+				top = ipa + PAGE_SIZE;
+				goto retry_map;
+			}
+
+			if (ret < 0)
+				goto err_unmap;
+
+			if (WARN_ON(level >= map_level))
+				goto err_unmap;
+
+			ret = realm_create_rtt_levels(realm, ipa, level,
+						      map_level, memcache);
+			if (ret)
+				goto err_unmap;
 			continue;
 		}
 
 		if (WARN_ON(ret))
-			goto err_undelegate;
+			goto err_unmap;
+
+		if (WARN_ON(out_top <= ipa || out_top > top))
+			goto err_unmap;
 
 		phys += out_top - ipa;
 		ipa = out_top;
@@ -852,12 +1048,18 @@ static int realm_map_protected(struct kvm *kvm,
 	return 0;
 
 err_undelegate:
-	realm_unmap_private_range(kvm, base_ipa, ipa, true);
-	if (WARN_ON(rmi_undelegate_range(base_phys, map_size))) {
-		/* Page can't be returned to NS world so is lost */
-		get_page(phys_to_page(base_phys));
-	}
+	if (delegate_ipa > base_ipa)
+		realm_undelegate_map_range(base_phys + (base_ipa - start_ipa),
+					   delegate_ipa - base_ipa);
 	return ret < 0 ? ret : -ENXIO;
+
+err_unmap:
+	if (base_ipa < ipa)
+		realm_unmap_private_range(kvm, base_ipa, ipa, true);
+	if (ipa < ipa_top)
+		realm_undelegate_map_range(phys,
+					   ipa_top - ipa);
+	return -ENXIO;
 }
 
 static int realm_map_non_secure(struct kvm *kvm,
@@ -922,21 +1124,19 @@ static int realm_map_non_secure(struct kvm *kvm,
 				realm_unmap_shared_range(kvm, ipa, ipa_top, true);
 				continue;
 			}
-
 			ret = realm_create_rtt_levels(realm, ipa, level,
 						      req_level,
 						      memcache);
 			if (ret)
 				return ret;
-
-			ret = rmi_rtt_unprot_map(rd, ipa, ipa_top, flags,
-						 range_desc, &out_top);
-			if (ret < 0)
-				return ret;
+			continue;
 		}
 
-		if (ret && RMI_RETURN_STATUS(ret) != RMI_ERROR_RTT)
+		if (ret)
 			return ret;
+
+		if (WARN_ON(out_top <= ipa || out_top > ipa_top))
+			return -ENXIO;
 
 		phys += out_top - ipa;
 		ipa = out_top;

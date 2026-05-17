@@ -228,6 +228,10 @@
 #define RMI_AUX_DESTROYED		4
 #define RMI_ASSIGNED_VSMMU		5
 
+#define RMI_UNASSIGNED			0
+#define RMI_ASSIGNED			1
+#define RMI_TABLE			2
+
 enum rmi_ripas {
 	RMI_EMPTY = 0,
 	RMI_RAM = 1,

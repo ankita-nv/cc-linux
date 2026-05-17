@@ -17,6 +17,39 @@
 		cpu_relax();						\
 } while (RMI_RETURN_STATUS(res.a0) == RMI_BUSY)
 
+struct rtt_entry {
+	unsigned long walk_level;
+	unsigned long desc;
+	int state;
+	int ripas;
+};
+
+static inline int rmi_rtt_read_entry(unsigned long rd, unsigned long ipa,
+				     unsigned long level, struct rtt_entry *rtt)
+{
+	struct arm_smccc_1_2_regs regs = {
+		SMC_RMI_RTT_READ_ENTRY, rd, ipa, level
+	};
+	struct arm_smccc_1_2_regs res;
+	unsigned long status;
+
+	do {
+		arm_smccc_1_2_invoke(&regs, &res);
+		status = RMI_RETURN_STATUS(res.a0);
+		if (status == RMI_BUSY)
+			cpu_relax();
+	} while (status == RMI_BUSY);
+
+	if (res.a0 == RMI_SUCCESS && rtt) {
+		rtt->walk_level = res.a1;
+		rtt->state = res.a2;
+		rtt->desc = res.a3;
+		rtt->ripas = res.a4;
+	}
+
+	return res.a0;
+}
+
 /**
  * rmi_rtt_data_map_init() - Create a protected mapping with data contents
  * @rd: PA of the RD
