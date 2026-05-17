@@ -219,20 +219,32 @@ int resctrl_arch_set_cdp_enabled(enum resctrl_res_level rid, bool enable)
 		l3->mon.num_rmid = resctrl_arch_system_num_rmid_idx();
 
 	/* The mbw_max feature can't hide cdp as it's a per-partid maximum. */
-	if (cdp_enabled && !mpam_resctrl_controls[RDT_RESOURCE_MBA].cdp_enabled)
+	if (cdp_enabled && !mpam_resctrl_controls[RDT_RESOURCE_MBA].cdp_enabled) {
 		mpam_resctrl_controls[RDT_RESOURCE_MBA].resctrl_res.alloc_capable = false;
+		/* HARDLIM lives in the same register, mirror the bookkeeping. */
+		mpam_resctrl_controls[RDT_RESOURCE_MBA_HLIM].resctrl_res.alloc_capable =
+			false;
+	}
 
 	/*
 	 * If resctrl has attempted to enable CDP on MBA, re-enable MBA as two
 	 * configurations will be provided so there is no aliasing problem.
 	 */
 	if (mpam_resctrl_controls[RDT_RESOURCE_MBA].cdp_enabled &&
-	    mpam_resctrl_controls[RDT_RESOURCE_MBA].class)
+	    mpam_resctrl_controls[RDT_RESOURCE_MBA].class) {
 		mpam_resctrl_controls[RDT_RESOURCE_MBA].resctrl_res.alloc_capable = true;
+		if (mpam_resctrl_controls[RDT_RESOURCE_MBA_HLIM].class)
+			mpam_resctrl_controls[RDT_RESOURCE_MBA_HLIM].resctrl_res.alloc_capable =
+				true;
+	}
 
 	/* On unmount when CDP is disabled, re-enable MBA */
-	if (!cdp_enabled && mpam_resctrl_controls[RDT_RESOURCE_MBA].class)
+	if (!cdp_enabled && mpam_resctrl_controls[RDT_RESOURCE_MBA].class) {
 		mpam_resctrl_controls[RDT_RESOURCE_MBA].resctrl_res.alloc_capable = true;
+		if (mpam_resctrl_controls[RDT_RESOURCE_MBA_HLIM].class)
+			mpam_resctrl_controls[RDT_RESOURCE_MBA_HLIM].resctrl_res.alloc_capable =
+				true;
+	}
 
 	if (enable) {
 		if (mpam_partid_max < 1)
@@ -1077,6 +1089,17 @@ static void mpam_resctrl_pick_mba(void)
 			 candidate_class->level);
 		res = &mpam_resctrl_controls[RDT_RESOURCE_MBA];
 		res->class = candidate_class;
+
+		/*
+		 * The HARDLIM bit lives in the same MPAMCFG_MBW_MAX register
+		 * as the MBA percentage. Whenever MBA is available so is the
+		 * HARDLIM selector.
+		 */
+		if (mpam_has_feature(mpam_feat_mbw_hardlim,
+				     &candidate_class->props)) {
+			res = &mpam_resctrl_controls[RDT_RESOURCE_MBA_HLIM];
+			res->class = candidate_class;
+		}
 	}
 }
 
@@ -1293,6 +1316,22 @@ static int mpam_resctrl_control_init(struct mpam_resctrl_res *res)
 		r->name = "MB";
 		r->alloc_capable = true;
 		break;
+	case RDT_RESOURCE_MBA_HLIM:
+		/*
+		 * MB_HLIM exposes MPAMCFG_MBW_MAX.HARDLIM as a 0/1 selector
+		 * alongside the MBA percentage. Both fields live in the same
+		 * MBA control register.
+		 */
+		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->ctrl_scope = RESCTRL_L3_CACHE;
+		r->membw.delay_linear = true;
+		r->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
+		r->membw.min_bw = 0;
+		r->membw.max_bw = 1;
+		r->membw.bw_gran = 1;
+		r->name = "MB_HLIM";
+		r->alloc_capable = true;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -1471,7 +1510,10 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_ctrl_domain *d,
 			configured_by = mpam_feat_mbw_max;
 			break;
 		}
-		fallthrough;
+		return resctrl_get_default_ctrl(r);
+	case RDT_RESOURCE_MBA_HLIM:
+		configured_by = mpam_feat_mbw_hardlim;
+		break;
 	default:
 		return resctrl_get_default_ctrl(r);
 	}
@@ -1485,6 +1527,8 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_ctrl_domain *d,
 		return cfg->cpbm;
 	case mpam_feat_mbw_max:
 		return mbw_max_to_percent(cfg->mbw_max, cprops);
+	case mpam_feat_mbw_hardlim:
+		return cfg->mbw_hardlim ? 1 : 0;
 	default:
 		return resctrl_get_default_ctrl(r);
 	}
@@ -1536,12 +1580,17 @@ int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_ctrl_domain *d,
 		mpam_set_feature(mpam_feat_cpor_part, &cfg);
 		break;
 	case RDT_RESOURCE_MBA:
-		if (mpam_has_feature(mpam_feat_mbw_max, cprops)) {
-			cfg.mbw_max = percent_to_mbw_max(cfg_val, cprops);
-			mpam_set_feature(mpam_feat_mbw_max, &cfg);
-			break;
-		}
-		fallthrough;
+		if (!mpam_has_feature(mpam_feat_mbw_max, cprops))
+			return -EINVAL;
+		cfg.mbw_max = percent_to_mbw_max(cfg_val, cprops);
+		mpam_set_feature(mpam_feat_mbw_max, &cfg);
+		break;
+	case RDT_RESOURCE_MBA_HLIM:
+		if (!mpam_has_feature(mpam_feat_mbw_hardlim, cprops))
+			return -EINVAL;
+		cfg.mbw_hardlim = (cfg_val != 0);
+		mpam_set_feature(mpam_feat_mbw_hardlim, &cfg);
+		break;
 	default:
 		return -EINVAL;
 	}

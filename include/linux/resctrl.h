@@ -56,7 +56,12 @@ enum resctrl_res_level {
 	RDT_RESOURCE_MBA,
 	RDT_RESOURCE_SMBA,
 	RDT_RESOURCE_PERF_PKG,
-	RDT_RESOURCE_LAST = RDT_RESOURCE_PERF_PKG
+	/*
+	 * Sibling of RDT_RESOURCE_MBA: a schema line that toggles the
+	 * HARDLIM selector in the same MBA control register.
+	 */
+	RDT_RESOURCE_MBA_HLIM,
+	RDT_RESOURCE_LAST = RDT_RESOURCE_MBA_HLIM
 };
 
 #define RDT_NUM_RESOURCES (RDT_RESOURCE_LAST + 1)
