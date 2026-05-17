@@ -1930,6 +1930,26 @@ static int mbm_local_bytes_config_show(struct kernfs_open_file *of,
 	return 0;
 }
 
+static int resctrl_schema_format_show(struct kernfs_open_file *of,
+				      struct seq_file *seq, void *v)
+{
+	struct resctrl_schema *s = rdt_kn_parent_priv(of->kn);
+
+	switch (s->res->schema_fmt) {
+	case RESCTRL_SCHEMA_BITMAP:
+		seq_puts(seq, "bitmap\n");
+		break;
+	case RESCTRL_SCHEMA_RANGE:
+		seq_puts(seq, "range\n");
+		break;
+	case RESCTRL_SCHEMA_PERCENT:
+		seq_puts(seq, "percentage\n");
+		break;
+	}
+
+	return 0;
+}
+
 static void mbm_config_write_domain(struct rdt_resource *r,
 				    struct rdt_l3_mon_domain *d, u32 evtid, u32 val)
 {
@@ -2213,6 +2233,20 @@ static struct rftype res_common_files[] = {
 		.fflags		= RFTYPE_CTRL_INFO | RFTYPE_RES_MB,
 	},
 	{
+		.name		= "percent_min",
+		.mode		= 0444,
+		.kf_ops		= &rdtgroup_kf_single_ops,
+		.seq_show	= rdt_min_bw_show,
+		.fflags		= RFTYPE_CTRL_INFO | RFTYPE_SCHEMA_PERCENT,
+	},
+	{
+		.name		= "percent_gran",
+		.mode		= 0444,
+		.kf_ops		= &rdtgroup_kf_single_ops,
+		.seq_show	= rdt_bw_gran_show,
+		.fflags		= RFTYPE_CTRL_INFO | RFTYPE_SCHEMA_PERCENT,
+	},
+	{
 		.name		= "delay_linear",
 		.mode		= 0444,
 		.kf_ops		= &rdtgroup_kf_single_ops,
@@ -2279,6 +2313,13 @@ static struct rftype res_common_files[] = {
 		.kf_ops		= &rdtgroup_kf_single_ops,
 		.seq_show	= mbm_L3_assignments_show,
 		.write		= mbm_L3_assignments_write,
+	},
+	{
+		.name		= "mbm_MB_assignments",
+		.mode		= 0644,
+		.kf_ops		= &rdtgroup_kf_single_ops,
+		.seq_show	= mbm_MB_assignments_show,
+		.write		= mbm_MB_assignments_write,
 	},
 	{
 		.name		= "mbm_assign_mode",
@@ -2362,7 +2403,14 @@ static struct rftype res_common_files[] = {
 		.mode		= 0444,
 		.kf_ops		= &rdtgroup_kf_single_ops,
 		.seq_show	= rdtgroup_closid_show,
-		.fflags		= RFTYPE_CTRL_BASE | RFTYPE_DEBUG,
+		.fflags		= RFTYPE_CTRL_BASE,
+	},
+	{
+		.name		= "schema_format",
+		.mode		= 0444,
+		.kf_ops		= &rdtgroup_kf_single_ops,
+		.seq_show	= resctrl_schema_format_show,
+		.fflags		= RFTYPE_CTRL_INFO,
 	},
 };
 
@@ -2646,8 +2694,6 @@ static unsigned long fflags_from_resource(struct rdt_resource *r)
 	switch (r->rid) {
 	case RDT_RESOURCE_L3:
 	case RDT_RESOURCE_L2:
-	case RDT_RESOURCE_L3_MAX:
-	case RDT_RESOURCE_L2_MAX:
 		return RFTYPE_RES_CACHE;
 	case RDT_RESOURCE_MBA:
 	case RDT_RESOURCE_SMBA:
@@ -2655,6 +2701,29 @@ static unsigned long fflags_from_resource(struct rdt_resource *r)
 		return RFTYPE_RES_MB;
 	case RDT_RESOURCE_PERF_PKG:
 		return RFTYPE_RES_PERF_PKG;
+	case RDT_RESOURCE_L3_MAX:
+	case RDT_RESOURCE_L2_MAX:
+		return 0;
+	}
+
+	return WARN_ON_ONCE(1);
+}
+
+static unsigned long fflags_from_schema(struct resctrl_schema *s)
+{
+	unsigned long fflags;
+
+	fflags = fflags_from_resource(s->res);
+	if (fflags)
+		return fflags;
+
+	switch (s->res->schema_fmt) {
+	case RESCTRL_SCHEMA_BITMAP:
+		return RFTYPE_RES_CACHE;
+	case RESCTRL_SCHEMA_RANGE:
+		return RFTYPE_RES_MB;
+	case RESCTRL_SCHEMA_PERCENT:
+		return RFTYPE_SCHEMA_PERCENT;
 	}
 
 	return WARN_ON_ONCE(1);
@@ -2680,7 +2749,10 @@ static int rdtgroup_create_info_dir(struct kernfs_node *parent_kn)
 	/* loop over enabled controls, these are all alloc_capable */
 	list_for_each_entry(s, &resctrl_schema_all, list) {
 		r = s->res;
-		fflags = fflags_from_resource(r) | RFTYPE_CTRL_INFO;
+		if (r->rid == RDT_RESOURCE_MBA_HLIM)
+			continue;
+
+		fflags = fflags_from_schema(s) | RFTYPE_CTRL_INFO;
 		ret = rdtgroup_mkdir_info_resdir(s, s->name, fflags);
 		if (ret)
 			goto out_destroy;
@@ -3064,6 +3136,7 @@ static int schemata_list_add(struct rdt_resource *r, enum resctrl_conf_type type
 		s->fmt_str = "%d=%x";
 		break;
 	case RESCTRL_SCHEMA_RANGE:
+	case RESCTRL_SCHEMA_PERCENT:
 		s->fmt_str = "%d=%u";
 		break;
 	}
@@ -4734,14 +4807,13 @@ void resctrl_offline_mon_domain(struct rdt_resource *r, struct rdt_domain_hdr *h
 	if (resctrl_mounted && resctrl_arch_mon_capable())
 		rmdir_mondata_subdir_allrdtgrp(r, hdr);
 
-	if (r->rid != RDT_RESOURCE_L3)
-		goto out_unlock;
-
-	if (!domain_header_is_valid(hdr, RESCTRL_MON_DOMAIN, RDT_RESOURCE_L3))
+	if (!domain_header_is_valid(hdr, RESCTRL_MON_DOMAIN, r->rid))
 		goto out_unlock;
 
 	d = container_of(hdr, struct rdt_l3_mon_domain, hdr);
-	if (resctrl_is_mon_event_enabled(QOS_L3_OCCUP_EVENT_ID) && has_busy_rmid(d)) {
+	if (r->rid == RDT_RESOURCE_L3 &&
+	    resctrl_is_mon_event_enabled(QOS_L3_OCCUP_EVENT_ID) &&
+	    has_busy_rmid(d)) {
 		/*
 		 * When a package is going down, forcefully
 		 * decrement rmid->ebusy. There is no way to know
@@ -4784,14 +4856,16 @@ static int domain_setup_l3_mon_state(struct rdt_resource *r, struct rdt_l3_mon_d
 	enum resctrl_event_id eventid;
 	int idx;
 
-	if (resctrl_is_mon_event_enabled(QOS_L3_OCCUP_EVENT_ID)) {
+	if (r->rid == RDT_RESOURCE_L3 &&
+	    resctrl_is_mon_event_enabled(QOS_L3_OCCUP_EVENT_ID)) {
 		d->rmid_busy_llc = bitmap_zalloc(idx_limit, GFP_KERNEL);
 		if (!d->rmid_busy_llc)
 			return -ENOMEM;
 	}
 
 	for_each_mbm_event_id(eventid) {
-		if (!resctrl_is_mon_event_enabled(eventid))
+		if (!resctrl_is_mon_event_enabled(eventid) ||
+		    mon_event_all[eventid].rid != r->rid)
 			continue;
 		idx = MBM_STATE_IDX(eventid);
 		d->mbm_states[idx] = kcalloc(idx_limit, tsize, GFP_KERNEL);
@@ -4824,7 +4898,7 @@ int resctrl_online_ctrl_domain(struct rdt_resource *r, struct rdt_ctrl_domain *d
 	mutex_lock(&rdtgroup_mutex);
 
 	if (supports_mba_mbps() && r->rid == RDT_RESOURCE_MBA) {
-		/* RDT_RESOURCE_MBA is never mon_capable */
+		/* MBA software controller state is tied to control domains. */
 		err = mba_sc_domain_allocate(r, d);
 	}
 
@@ -4840,10 +4914,7 @@ int resctrl_online_mon_domain(struct rdt_resource *r, struct rdt_domain_hdr *hdr
 
 	mutex_lock(&rdtgroup_mutex);
 
-	if (r->rid != RDT_RESOURCE_L3)
-		goto mkdir;
-
-	if (!domain_header_is_valid(hdr, RESCTRL_MON_DOMAIN, RDT_RESOURCE_L3))
+	if (!domain_header_is_valid(hdr, RESCTRL_MON_DOMAIN, r->rid))
 		goto out_unlock;
 
 	d = container_of(hdr, struct rdt_l3_mon_domain, hdr);
@@ -4851,16 +4922,16 @@ int resctrl_online_mon_domain(struct rdt_resource *r, struct rdt_domain_hdr *hdr
 	if (err)
 		goto out_unlock;
 
-	if (resctrl_is_mbm_enabled()) {
+	if (r->rid == RDT_RESOURCE_L3 && resctrl_is_mbm_enabled()) {
 		INIT_DELAYED_WORK(&d->mbm_over, mbm_handle_overflow);
 		mbm_setup_overflow_handler(d, MBM_OVERFLOW_INTERVAL,
 					   RESCTRL_PICK_ANY_CPU);
 	}
 
-	if (resctrl_is_mon_event_enabled(QOS_L3_OCCUP_EVENT_ID))
+	if (r->rid == RDT_RESOURCE_L3 &&
+	    resctrl_is_mon_event_enabled(QOS_L3_OCCUP_EVENT_ID))
 		INIT_DELAYED_WORK(&d->cqm_limbo, cqm_handle_limbo);
 
-mkdir:
 	err = 0;
 	/*
 	 * If the filesystem is not mounted then only the default resource group

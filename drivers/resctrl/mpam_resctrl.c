@@ -46,13 +46,18 @@ static struct mpam_resctrl_res mpam_resctrl_controls[RDT_NUM_RESOURCES];
  * to those supported by MPAM.
  * Class pointer may be NULL.
  */
-#define MPAM_MAX_EVENT QOS_L3_MBM_TOTAL_EVENT_ID
+#define MPAM_MAX_EVENT QOS_L3_MBM_LOCAL_EVENT_ID
 static struct mpam_resctrl_mon mpam_resctrl_counters[MPAM_MAX_EVENT + 1];
 
 #define for_each_mpam_resctrl_mon(mon, eventid)					\
 	for (eventid = QOS_FIRST_EVENT, mon = &mpam_resctrl_counters[eventid];	\
 	     eventid <= MPAM_MAX_EVENT;						\
 	     eventid++, mon = &mpam_resctrl_counters[eventid])
+
+static struct mpam_resctrl_mon *
+mpam_resctrl_mon_from_res(struct mpam_resctrl_res *res);
+static struct mpam_resctrl_res *
+mpam_resctrl_res_from_mon(struct mpam_resctrl_mon *mon);
 
 /* The lock for modifying resctrl's domain lists from cpuhp callbacks. */
 static DEFINE_MUTEX(domain_list_lock);
@@ -91,11 +96,15 @@ bool resctrl_arch_alloc_capable(void)
 
 bool resctrl_arch_mon_capable(void)
 {
-	struct mpam_resctrl_res *res = &mpam_resctrl_controls[RDT_RESOURCE_L3];
-	struct rdt_resource *l3 = &res->resctrl_res;
+	struct mpam_resctrl_res *res;
+	enum resctrl_res_level rid;
 
-	/* All monitors are presented as being on the L3 cache */
-	return l3->mon_capable;
+	for_each_mpam_resctrl_control(res, rid) {
+		if (res->resctrl_res.mon_capable)
+			return true;
+	}
+
+	return false;
 }
 
 bool resctrl_arch_is_evt_configurable(enum resctrl_event_id evt)
@@ -122,7 +131,15 @@ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d
 
 bool resctrl_arch_mbm_cntr_assign_enabled(struct rdt_resource *r)
 {
-	return (r == &mpam_resctrl_controls[RDT_RESOURCE_L3].resctrl_res);
+	struct mpam_resctrl_res *res;
+	struct mpam_resctrl_mon *mon;
+
+	res = container_of(r, struct mpam_resctrl_res, resctrl_res);
+	mon = mpam_resctrl_mon_from_res(res);
+	if (!mon)
+		return false;
+
+	return mon->assigned_counters ? true : false;
 }
 
 int resctrl_arch_mbm_cntr_assign_set(struct rdt_resource *r, bool enable)
@@ -167,24 +184,94 @@ static void resctrl_reset_task_closids(void)
 	read_unlock(&tasklist_lock);
 }
 
-static void mpam_resctrl_monitor_sync_abmc_vals(struct rdt_resource *l3)
+static struct mpam_resctrl_mon *
+mpam_resctrl_mon_from_res(struct mpam_resctrl_res *res)
 {
-	struct mpam_resctrl_mon *mon = &mpam_resctrl_counters[QOS_L3_MBM_TOTAL_EVENT_ID];
+	struct mpam_resctrl_mon *first = NULL;
+	struct mpam_resctrl_mon *mon;
+	enum resctrl_event_id eventid;
+
+	if (!res->class)
+		return NULL;
+
+	for_each_mpam_resctrl_mon(mon, eventid) {
+		if (mon->class != res->class)
+			continue;
+		if (resctrl_is_mbm_event(eventid) && mon->assigned_counters)
+			return mon;
+		if (!first)
+			first = mon;
+	}
+
+	return first;
+}
+
+static struct mpam_resctrl_res *
+mpam_resctrl_res_from_mon(struct mpam_resctrl_mon *mon)
+{
+	struct mpam_resctrl_res *res;
+	enum resctrl_res_level rid;
 
 	if (!mon->class)
+		return NULL;
+
+	for_each_mpam_resctrl_control(res, rid) {
+		if (res->class == mon->class)
+			return res;
+	}
+
+	return NULL;
+}
+
+static void mpam_resctrl_monitor_sync_abmc_vals(struct rdt_resource *r)
+{
+	struct mpam_resctrl_res *res;
+	struct mpam_resctrl_mon *mon;
+
+	res = container_of(r, struct mpam_resctrl_res, resctrl_res);
+	mon = mpam_resctrl_mon_from_res(res);
+	if (!mon || !mon->assigned_counters)
 		return;
 
-	if (!mon->assigned_counters)
-		return;
-
-	l3->mon.num_mbm_cntrs = mon->class->props.num_mbwu_mon;
+	r->mon.num_mbm_cntrs = mon->class->props.num_mbwu_mon;
 	if (cdp_enabled)
-		l3->mon.num_mbm_cntrs /= 2;
+		r->mon.num_mbm_cntrs /= 2;
 
 	/*
 	 * Continue as normal even if enabling cdp causes there to be
 	 * zero counters. This avoids giving resctrl mixed messages.
 	 */
+	r->mon.mbm_cntr_assignable = true;
+	r->mon.mbm_assign_on_mkdir = true;
+	r->mon.mbm_cntr_configurable = false;
+	r->mon.mbm_cntr_assign_fixed = true;
+}
+
+static int mpam_resctrl_monitor_alloc_abmc_state(struct rdt_resource *r)
+{
+	struct rdt_l3_mon_domain *d;
+
+	lockdep_assert_cpus_held();
+
+	if (!r->mon.mbm_cntr_assignable || !r->mon.num_mbm_cntrs)
+		return 0;
+
+	/*
+	 * A monitor domain can come online before the monitor class providing
+	 * assignable MBWU counters has been matched to this resctrl resource.
+	 * Backfill the per-domain counter assignment state for those domains.
+	 */
+	list_for_each_entry(d, &r->mon_domains, hdr.list) {
+		if (d->cntr_cfg)
+			continue;
+
+		d->cntr_cfg = kcalloc(r->mon.num_mbm_cntrs,
+				      sizeof(*d->cntr_cfg), GFP_KERNEL);
+		if (!d->cntr_cfg)
+			return -ENOMEM;
+	}
+
+	return 0;
 }
 
 int resctrl_arch_set_cdp_enabled(enum resctrl_res_level rid, bool enable)
@@ -192,6 +279,7 @@ int resctrl_arch_set_cdp_enabled(enum resctrl_res_level rid, bool enable)
 	u32 partid_i = RESCTRL_RESERVED_CLOSID, partid_d = RESCTRL_RESERVED_CLOSID;
 	struct mpam_resctrl_res *res = &mpam_resctrl_controls[RDT_RESOURCE_L3];
 	struct rdt_resource *l3 = &res->resctrl_res;
+	struct rdt_resource *mb;
 	int cpu;
 
 	if (!IS_ENABLED(CONFIG_EXPERT) && enable) {
@@ -213,10 +301,15 @@ int resctrl_arch_set_cdp_enabled(enum resctrl_res_level rid, bool enable)
 	cdp_enabled = enable;
 	mpam_resctrl_controls[rid].cdp_enabled = enable;
 
-	if (enable)
+	mb = &mpam_resctrl_controls[RDT_RESOURCE_MBA].resctrl_res;
+
+	if (enable) {
 		l3->mon.num_rmid = resctrl_arch_system_num_rmid_idx() / 2;
-	else
+		mb->mon.num_rmid = resctrl_arch_system_num_rmid_idx() / 2;
+	} else {
 		l3->mon.num_rmid = resctrl_arch_system_num_rmid_idx();
+		mb->mon.num_rmid = resctrl_arch_system_num_rmid_idx();
+	}
 
 	/* The mbw_max feature can't hide cdp as it's a per-partid maximum. */
 	if (cdp_enabled && !mpam_resctrl_controls[RDT_RESOURCE_MBA].cdp_enabled) {
@@ -259,6 +352,8 @@ int resctrl_arch_set_cdp_enabled(enum resctrl_res_level rid, bool enable)
 
 	resctrl_reset_task_closids();
 	mpam_resctrl_monitor_sync_abmc_vals(l3);
+	if (mb->mon_capable)
+		mpam_resctrl_monitor_sync_abmc_vals(mb);
 
 	for_each_possible_cpu(cpu)
 		mpam_set_cpu_defaults(cpu, partid_d, partid_i, 0, 0);
@@ -530,11 +625,6 @@ static int __read_mon(struct mpam_resctrl_mon *mon, struct mpam_component *mon_c
 			return -ENOENT;
 	}
 
-	if (irqs_disabled()) {
-		/* Check if we can access this domain without an IPI */
-		return -EIO;
-	}
-
 	cfg = (struct mon_cfg) {
 		.mon = mon_idx,
 		.match_pmg = true,
@@ -571,7 +661,6 @@ static int read_mon_cdp_safe(struct mpam_resctrl_mon *mon, struct mpam_component
 			  CDP_NONE, closid, rmid, val);
 }
 
-/* MBWU when not in ABMC mode (not supported), and CSU counters. */
 int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
 			   u32 closid, u32 rmid, enum resctrl_event_id eventid,
 			   void *arch_priv, u64 *val, void *arch_mon_ctx)
@@ -593,10 +682,17 @@ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
 	l3_dom = container_of(hdr, struct mpam_resctrl_dom, resctrl_mon_dom.hdr);
 	mon_comp = l3_dom->mon_comp[eventid];
 
-	if (eventid != QOS_L3_OCCUP_EVENT_ID)
+	switch (eventid) {
+	case QOS_L3_OCCUP_EVENT_ID:
+		mon_type = mpam_feat_msmon_csu;
+		break;
+	case QOS_L3_MBM_LOCAL_EVENT_ID:
+	case QOS_L3_MBM_TOTAL_EVENT_ID:
+		mon_type = mpam_feat_msmon_mbwu;
+		break;
+	default:
 		return -EINVAL;
-
-	mon_type = mpam_feat_msmon_csu;
+	}
 
 	return read_mon_cdp_safe(mon, mon_comp, mon_type, mon_idx,
 				 closid, rmid, val);
@@ -1252,21 +1348,28 @@ static void mpam_resctrl_pick_counters(void)
 		}
 
 		if (class_has_usable_mbwu(class) &&
-		    topology_matches_l3(class) &&
-		    traffic_matches_l3(class)) {
+		    (class->type == MPAM_CLASS_MEMORY ||
+		     (topology_matches_l3(class) && traffic_matches_l3(class)))) {
 			pr_debug("class %u has usable MBWU, and matches L3 topology and traffic\n",
 				 class->level);
 
 			/*
-			 * An MSC measures bandwidth for a path determined by
-			 * its location in hardware. We can't distinguish
-			 * traffic by destination so we don't know if it's
-			 * staying on the same NUMA node. Hence, we can't
-			 * calculate mbm_local except when we only have one L3
-			 * and it's equivalent to mbm_total and so always use
-			 * mbm_total.
+			 * Cache-side counters are local to the cache. Counters
+			 * on memory-side MSCs count bandwidth at the memory
+			 * target and are exported as total memory bandwidth.
 			 */
-			counter_update_class(QOS_L3_MBM_TOTAL_EVENT_ID, class);
+			switch (class->type) {
+			case MPAM_CLASS_CACHE:
+				counter_update_class(QOS_L3_MBM_LOCAL_EVENT_ID,
+						     class);
+				break;
+			case MPAM_CLASS_MEMORY:
+				counter_update_class(QOS_L3_MBM_TOTAL_EVENT_ID,
+						     class);
+				break;
+			default:
+				break;
+			}
 		}
 	}
 }
@@ -1278,6 +1381,9 @@ static void __config_cntr(struct mpam_resctrl_mon *mon, u32 cntr_id,
 	/* Same CDP index remap as closid; maps cntr_id to assigned_counters[]. */
 	u32 mbwu_idx, mon_idx = resctrl_get_config_index(cntr_id, cdp_type);
 
+	if (WARN_ON_ONCE(!mon->class ||
+			 mon_idx >= mon->class->props.num_mbwu_mon))
+		return;
 	closid = resctrl_get_config_index(closid, cdp_type);
 	mbwu_idx = resctrl_arch_rmid_idx_encode(closid, rmid);
 
@@ -1349,7 +1455,7 @@ static int mpam_resctrl_control_init(struct mpam_resctrl_res *res)
 		r->alloc_capable = true;
 		break;
 	case RDT_RESOURCE_MBA:
-		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->schema_fmt = RESCTRL_SCHEMA_PERCENT;
 		r->ctrl_scope = RESCTRL_L3_CACHE;
 
 		r->membw.delay_linear = true;
@@ -1367,7 +1473,7 @@ static int mpam_resctrl_control_init(struct mpam_resctrl_res *res)
 		 * alongside the MBA percentage. Both fields live in the same
 		 * MBA control register.
 		 */
-		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->schema_fmt = RESCTRL_SCHEMA_PERCENT;
 		r->ctrl_scope = RESCTRL_L3_CACHE;
 		r->membw.delay_linear = true;
 		r->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
@@ -1381,11 +1487,11 @@ static int mpam_resctrl_control_init(struct mpam_resctrl_res *res)
 	case RDT_RESOURCE_L3_MAX:
 		/*
 		 * Cache-capacity controls (MPAM CMAX/CMIN) are exposed as a
-		 * percentage. Use the same RESCTRL_SCHEMA_RANGE format as MBA
+		 * percentage. Use the percentage schema format
 		 * with min/granularity derived from the architectural
 		 * cmax_wd width.
 		 */
-		r->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		r->schema_fmt = RESCTRL_SCHEMA_PERCENT;
 		r->membw.delay_linear = true;
 		r->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
 		r->membw.min_bw = max(MAX_MBA_BW / (1 << cprops->cmax_wd), 1);
@@ -1444,14 +1550,20 @@ static int mpam_resctrl_pick_domain_id(int cpu, struct mpam_component *comp)
  */
 static int mpam_resctrl_monitor_init_abmc(struct mpam_resctrl_mon *mon)
 {
-	struct mpam_resctrl_res *res = &mpam_resctrl_controls[RDT_RESOURCE_L3];
-	size_t num_rmid = resctrl_arch_system_num_rmid_idx();
-	struct rdt_resource *l3 = &res->resctrl_res;
+	struct mpam_resctrl_res *res = mpam_resctrl_res_from_mon(mon);
+	struct rdt_resource *r;
 	struct mpam_class *class = mon->class;
 	u16 num_mbwu_mon;
+	size_t num_rmid = resctrl_arch_system_num_rmid_idx();
+	int *rmid_array __free(kvfree) = NULL;
 	int *cntrs;
+	int err;
 
-	int *rmid_array __free(kvfree) = kvmalloc_objs(*rmid_array, num_rmid);
+	if (WARN_ON_ONCE(!res))
+		return -EINVAL;
+	r = &res->resctrl_res;
+
+	rmid_array = kvmalloc_objs(*rmid_array, num_rmid);
 	if (!rmid_array) {
 		pr_debug("Failed to allocate RMID array\n");
 		return -ENOMEM;
@@ -1465,12 +1577,17 @@ static int mpam_resctrl_monitor_init_abmc(struct mpam_resctrl_mon *mon)
 	mon->assigned_counters = cntrs;
 	mon->mbwu_idx_to_mon = no_free_ptr(rmid_array);
 
-	l3->mon.mbm_cntr_assignable = true;
-	l3->mon.mbm_assign_on_mkdir = true;
-	l3->mon.mbm_cntr_configurable = false;
-	l3->mon.mbm_cntr_assign_fixed = true;
+	mpam_resctrl_monitor_sync_abmc_vals(r);
 
-	mpam_resctrl_monitor_sync_abmc_vals(l3);
+	err = mpam_resctrl_monitor_alloc_abmc_state(r);
+	if (err) {
+		__free_mbwu_mon(class, mon->assigned_counters, num_mbwu_mon);
+		kvfree(mon->assigned_counters);
+		mon->assigned_counters = NULL;
+		kvfree(mon->mbwu_idx_to_mon);
+		mon->mbwu_idx_to_mon = NULL;
+		return err;
+	}
 
 	return 0;
 }
@@ -1478,8 +1595,15 @@ static int mpam_resctrl_monitor_init_abmc(struct mpam_resctrl_mon *mon)
 static int mpam_resctrl_monitor_init(struct mpam_resctrl_mon *mon,
 				     enum resctrl_event_id type)
 {
-	struct mpam_resctrl_res *res = &mpam_resctrl_controls[RDT_RESOURCE_L3];
-	struct rdt_resource *l3 = &res->resctrl_res;
+	struct mpam_resctrl_res *res;
+	struct rdt_resource *r;
+
+	if (mon->class->type == MPAM_CLASS_MEMORY && mon->class->level > 3)
+		res = &mpam_resctrl_controls[RDT_RESOURCE_MBA];
+	else
+		res = &mpam_resctrl_controls[RDT_RESOURCE_L3];
+
+	r = &res->resctrl_res;
 
 	lockdep_assert_cpus_held();
 
@@ -1492,12 +1616,12 @@ static int mpam_resctrl_monitor_init(struct mpam_resctrl_mon *mon,
 		return 0;
 
 	/*
-	 * If there are no MPAM resources on L3, force it into existence.
-	 * topology_matches_l3() already ensures this looks like the L3.
-	 * The domain-ids will be fixed up by mpam_resctrl_domain_hdr_init().
+	 * If there are no controls for the monitor resource, force the
+	 * resource into existence so its monitor domains can be registered.
+	 * The domain IDs will be fixed up by mpam_resctrl_domain_hdr_init().
 	 */
 	if (!res->class) {
-		pr_warn_once("Faking L3 MSC to enable counters.\n");
+		pr_warn_once("Faking monitor MSC to enable counters.\n");
 		res->class = mpam_resctrl_counters[type].class;
 	}
 
@@ -1506,8 +1630,8 @@ static int mpam_resctrl_monitor_init(struct mpam_resctrl_mon *mon,
 	 * monitoring class.
 	 * Setting name is necessary on monitor only platforms.
 	 */
-	l3->name = "L3";
-	l3->mon_scope = RESCTRL_L3_CACHE;
+	r->name = (res == &mpam_resctrl_controls[RDT_RESOURCE_MBA]) ? "MB" : "L3";
+	r->mon_scope = RESCTRL_L3_CACHE;
 
 	/*
 	 * num-rmid is the upper bound for the number of monitoring groups that
@@ -1517,9 +1641,10 @@ static int mpam_resctrl_monitor_init(struct mpam_resctrl_mon *mon,
 	 * this does mean userspace needs to know the architecture to correctly
 	 * interpret this value.
 	 */
-	l3->mon.num_rmid = resctrl_arch_system_num_rmid_idx();
+	r->mon.num_rmid = resctrl_arch_system_num_rmid_idx();
 
-	if (type == QOS_L3_MBM_TOTAL_EVENT_ID) {
+	if (type == QOS_L3_MBM_TOTAL_EVENT_ID ||
+	    type == QOS_L3_MBM_LOCAL_EVENT_ID) {
 		int err;
 
 		err = mpam_resctrl_monitor_init_abmc(mon);
@@ -1527,13 +1652,13 @@ static int mpam_resctrl_monitor_init(struct mpam_resctrl_mon *mon,
 			return err;
 
 		static_assert(MAX_EVT_CONFIG_BITS == 0x7f);
-		l3->mon.mbm_cfg_mask = MAX_EVT_CONFIG_BITS;
+		r->mon.mbm_cfg_mask = MAX_EVT_CONFIG_BITS;
 	}
 
 	if (!resctrl_enable_mon_event(type, false, 0, NULL))
 		return -EINVAL;
 
-	l3->mon_capable = true;
+	r->mon_capable = true;
 
 	return 0;
 }
@@ -2192,7 +2317,51 @@ bool resctrl_arch_mon_can_overflow(void)
 }
 EXPORT_SYMBOL_GPL(resctrl_arch_mon_can_overflow);
 
-static void mpam_resctrl_teardown_mon(struct mpam_resctrl_mon *mon, struct mpam_class *class)
+/*
+ * Look up a control/monitor domain on @domain_list by its numeric id.
+ * Used by drivers that index resctrl domains via /sys/fs/resctrl/info
+ * domain ids (e.g. the resctrl PMU bridge in drivers/perf/).
+ */
+struct rdt_domain_hdr *resctrl_arch_find_domain(struct list_head *domain_list,
+						int id)
+{
+	struct rdt_domain_hdr *hdr;
+
+	lockdep_assert_cpus_held();
+
+	list_for_each_entry(hdr, domain_list, list) {
+		if (hdr->id == id)
+			return hdr;
+	}
+
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(resctrl_arch_find_domain);
+
+/*
+ * Total number of hardware monitor counters of @evtid on @r. Used by
+ * external drivers (e.g. the resctrl PMU bridge) to validate a
+ * caller-supplied counter index before invoking resctrl_arch_*_read().
+ */
+u32 resctrl_arch_mon_count(struct rdt_resource *r, enum resctrl_event_id evtid)
+{
+	struct mpam_resctrl_mon *mon;
+
+	if (!r || evtid < QOS_FIRST_EVENT || evtid > MPAM_MAX_EVENT)
+		return 0;
+
+	mon = &mpam_resctrl_counters[evtid];
+	if (!mon->class)
+		return 0;
+
+	return (evtid == QOS_L3_OCCUP_EVENT_ID) ?
+		mon->class->props.num_csu_mon :
+		mon->class->props.num_mbwu_mon;
+}
+EXPORT_SYMBOL_GPL(resctrl_arch_mon_count);
+
+static void mpam_resctrl_teardown_mon(struct mpam_resctrl_mon *mon,
+				      struct mpam_class *class)
 {
 	u32 num_mbwu_mon = class->props.num_mbwu_mon;
 

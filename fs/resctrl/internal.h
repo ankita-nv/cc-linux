@@ -261,6 +261,8 @@ struct rdtgroup {
 
 #define RFTYPE_RES_PERF_PKG		BIT(12)
 
+#define RFTYPE_SCHEMA_PERCENT		BIT(13)
+
 #define RFTYPE_CTRL_INFO		(RFTYPE_INFO | RFTYPE_CTRL)
 
 #define RFTYPE_MON_INFO			(RFTYPE_INFO | RFTYPE_MON)
@@ -452,6 +454,11 @@ ssize_t resctrl_mbm_assign_on_mkdir_write(struct kernfs_open_file *of, char *buf
 int mbm_L3_assignments_show(struct kernfs_open_file *of, struct seq_file *s, void *v);
 
 ssize_t mbm_L3_assignments_write(struct kernfs_open_file *of, char *buf, size_t nbytes,
+				  loff_t off);
+
+int mbm_MB_assignments_show(struct kernfs_open_file *of, struct seq_file *s, void *v);
+
+ssize_t mbm_MB_assignments_write(struct kernfs_open_file *of, char *buf, size_t nbytes,
 				 loff_t off);
 int resctrl_io_alloc_show(struct kernfs_open_file *of, struct seq_file *seq, void *v);
 

@@ -294,10 +294,12 @@ enum resctrl_scope {
  * enum resctrl_schema_fmt - The format user-space provides for a schema.
  * @RESCTRL_SCHEMA_BITMAP:	The schema is a bitmap in hex.
  * @RESCTRL_SCHEMA_RANGE:	The schema is a decimal number.
+ * @RESCTRL_SCHEMA_PERCENT:	The schema is a percentage.
  */
 enum resctrl_schema_fmt {
 	RESCTRL_SCHEMA_BITMAP,
 	RESCTRL_SCHEMA_RANGE,
+	RESCTRL_SCHEMA_PERCENT,
 };
 
 /**
@@ -423,6 +425,7 @@ static inline u32 resctrl_get_default_ctrl(struct rdt_resource *r)
 	case RESCTRL_SCHEMA_BITMAP:
 		return BIT_MASK(r->cache.cbm_len) - 1;
 	case RESCTRL_SCHEMA_RANGE:
+	case RESCTRL_SCHEMA_PERCENT:
 		return r->membw.max_bw;
 	}
 

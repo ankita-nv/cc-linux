@@ -238,6 +238,7 @@ static int parse_line(char *line, struct resctrl_schema *s,
 		parse_ctrlval = &parse_cbm;
 		break;
 	case RESCTRL_SCHEMA_RANGE:
+	case RESCTRL_SCHEMA_PERCENT:
 		parse_ctrlval = &parse_bw;
 		break;
 	}

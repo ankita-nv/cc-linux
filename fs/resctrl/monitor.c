@@ -801,11 +801,15 @@ static void mbm_update(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
 	 * This is protected from concurrent reads from user as both
 	 * the user and overflow handler hold the global mutex.
 	 */
-	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_TOTAL_EVENT_ID))
-		mbm_update_one_event(r, d, rdtgrp, QOS_L3_MBM_TOTAL_EVENT_ID);
+	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_TOTAL_EVENT_ID) &&
+	    mon_event_all[QOS_L3_MBM_TOTAL_EVENT_ID].rid == r->rid)
+		mbm_update_one_event(r, d, rdtgrp,
+				     QOS_L3_MBM_TOTAL_EVENT_ID);
 
-	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_LOCAL_EVENT_ID))
-		mbm_update_one_event(r, d, rdtgrp, QOS_L3_MBM_LOCAL_EVENT_ID);
+	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_LOCAL_EVENT_ID) &&
+	    mon_event_all[QOS_L3_MBM_LOCAL_EVENT_ID].rid == r->rid)
+		mbm_update_one_event(r, d, rdtgrp,
+				     QOS_L3_MBM_LOCAL_EVENT_ID);
 }
 
 /*
@@ -1036,7 +1040,7 @@ void free_rmid_lru_list(void)
  */
 struct mon_evt mon_event_all[QOS_NUM_EVENTS] = {
 	MON_EVENT(QOS_L3_OCCUP_EVENT_ID,		"llc_occupancy",	RDT_RESOURCE_L3,	false),
-	MON_EVENT(QOS_L3_MBM_TOTAL_EVENT_ID,		"mbm_total_bytes",	RDT_RESOURCE_L3,	false),
+	MON_EVENT(QOS_L3_MBM_TOTAL_EVENT_ID,		"mbm_total_bytes",	RDT_RESOURCE_MBA,	false),
 	MON_EVENT(QOS_L3_MBM_LOCAL_EVENT_ID,		"mbm_local_bytes",	RDT_RESOURCE_L3,	false),
 	MON_EVENT(PMT_EVENT_ENERGY,			"core_energy",		RDT_RESOURCE_PERF_PKG,	true),
 	MON_EVENT(PMT_EVENT_ACTIVITY,			"activity",		RDT_RESOURCE_PERF_PKG,	true),
@@ -1315,21 +1319,29 @@ static int rdtgroup_assign_cntr_event(struct rdt_l3_mon_domain *d, struct rdtgro
  * and thus no failure is returned. Users have the option to modify the
  * counter assignments after the group has been created.
  */
-void rdtgroup_assign_cntrs(struct rdtgroup *rdtgrp)
+static void rdtgroup_assign_cntrs_resource(struct rdt_resource *r,
+					   struct rdtgroup *rdtgrp)
 {
-	struct rdt_resource *r = resctrl_arch_get_resource(RDT_RESOURCE_L3);
+	struct mon_evt *mevt;
 
 	if (!r->mon_capable || !resctrl_arch_mbm_cntr_assign_enabled(r) ||
 	    !r->mon.mbm_assign_on_mkdir)
 		return;
 
-	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_TOTAL_EVENT_ID))
-		rdtgroup_assign_cntr_event(NULL, rdtgrp,
-					   &mon_event_all[QOS_L3_MBM_TOTAL_EVENT_ID]);
+	for_each_mon_event(mevt) {
+		if (mevt->rid != r->rid || !mevt->enabled ||
+		    !resctrl_is_mbm_event(mevt->evtid))
+			continue;
+		rdtgroup_assign_cntr_event(NULL, rdtgrp, mevt);
+	}
+}
 
-	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_LOCAL_EVENT_ID))
-		rdtgroup_assign_cntr_event(NULL, rdtgrp,
-					   &mon_event_all[QOS_L3_MBM_LOCAL_EVENT_ID]);
+void rdtgroup_assign_cntrs(struct rdtgroup *rdtgrp)
+{
+	rdtgroup_assign_cntrs_resource(resctrl_arch_get_resource(RDT_RESOURCE_L3),
+				       rdtgrp);
+	rdtgroup_assign_cntrs_resource(resctrl_arch_get_resource(RDT_RESOURCE_MBA),
+				       rdtgrp);
 }
 
 /*
@@ -1374,20 +1386,28 @@ static void rdtgroup_unassign_cntr_event(struct rdt_l3_mon_domain *d, struct rdt
  * rdtgroup_unassign_cntrs() - Unassign the counters associated with MBM events.
  *			       Called when a group is deleted.
  */
-void rdtgroup_unassign_cntrs(struct rdtgroup *rdtgrp)
+static void rdtgroup_unassign_cntrs_resource(struct rdt_resource *r,
+					     struct rdtgroup *rdtgrp)
 {
-	struct rdt_resource *r = resctrl_arch_get_resource(RDT_RESOURCE_L3);
+	struct mon_evt *mevt;
 
 	if (!r->mon_capable || !resctrl_arch_mbm_cntr_assign_enabled(r))
 		return;
 
-	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_TOTAL_EVENT_ID))
-		rdtgroup_unassign_cntr_event(NULL, rdtgrp,
-					     &mon_event_all[QOS_L3_MBM_TOTAL_EVENT_ID]);
+	for_each_mon_event(mevt) {
+		if (mevt->rid != r->rid || !mevt->enabled ||
+		    !resctrl_is_mbm_event(mevt->evtid))
+			continue;
+		rdtgroup_unassign_cntr_event(NULL, rdtgrp, mevt);
+	}
+}
 
-	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_LOCAL_EVENT_ID))
-		rdtgroup_unassign_cntr_event(NULL, rdtgrp,
-					     &mon_event_all[QOS_L3_MBM_LOCAL_EVENT_ID]);
+void rdtgroup_unassign_cntrs(struct rdtgroup *rdtgrp)
+{
+	rdtgroup_unassign_cntrs_resource(resctrl_arch_get_resource(RDT_RESOURCE_L3),
+					 rdtgrp);
+	rdtgroup_unassign_cntrs_resource(resctrl_arch_get_resource(RDT_RESOURCE_MBA),
+					 rdtgrp);
 }
 
 static int resctrl_parse_mem_transactions(char *tok, u32 *val)
@@ -1687,9 +1707,10 @@ out_unlock:
 	return ret;
 }
 
-int mbm_L3_assignments_show(struct kernfs_open_file *of, struct seq_file *s, void *v)
+static int mbm_assignments_show(struct kernfs_open_file *of,
+				struct seq_file *s, void *v,
+				struct rdt_resource *r)
 {
-	struct rdt_resource *r = resctrl_arch_get_resource(RDT_RESOURCE_L3);
 	struct rdt_l3_mon_domain *d;
 	struct rdtgroup *rdtgrp;
 	struct mon_evt *mevt;
@@ -1732,6 +1753,18 @@ out_unlock:
 	rdtgroup_kn_unlock(of->kn);
 
 	return ret;
+}
+
+int mbm_L3_assignments_show(struct kernfs_open_file *of, struct seq_file *s, void *v)
+{
+	return mbm_assignments_show(of, s, v,
+				    resctrl_arch_get_resource(RDT_RESOURCE_L3));
+}
+
+int mbm_MB_assignments_show(struct kernfs_open_file *of, struct seq_file *s, void *v)
+{
+	return mbm_assignments_show(of, s, v,
+				    resctrl_arch_get_resource(RDT_RESOURCE_MBA));
 }
 
 /*
@@ -1828,10 +1861,10 @@ next:
 	return -EINVAL;
 }
 
-ssize_t mbm_L3_assignments_write(struct kernfs_open_file *of, char *buf,
-				 size_t nbytes, loff_t off)
+static ssize_t mbm_assignments_write(struct kernfs_open_file *of, char *buf,
+				     size_t nbytes, loff_t off,
+				     struct rdt_resource *r)
 {
-	struct rdt_resource *r = resctrl_arch_get_resource(RDT_RESOURCE_L3);
 	struct rdtgroup *rdtgrp;
 	char *token, *event;
 	int ret = 0;
@@ -1876,6 +1909,20 @@ out_unlock:
 	return ret ?: nbytes;
 }
 
+ssize_t mbm_L3_assignments_write(struct kernfs_open_file *of, char *buf,
+				 size_t nbytes, loff_t off)
+{
+	return mbm_assignments_write(of, buf, nbytes, off,
+				     resctrl_arch_get_resource(RDT_RESOURCE_L3));
+}
+
+ssize_t mbm_MB_assignments_write(struct kernfs_open_file *of, char *buf,
+				 size_t nbytes, loff_t off)
+{
+	return mbm_assignments_write(of, buf, nbytes, off,
+				     resctrl_arch_get_resource(RDT_RESOURCE_MBA));
+}
+
 static int closid_num_dirty_rmid_alloc(struct rdt_resource *r)
 {
 	if (IS_ENABLED(CONFIG_RESCTRL_RMID_DEPENDS_ON_CLOSID)) {
@@ -1915,6 +1962,60 @@ static void closid_num_dirty_rmid_free(void)
 	}
 }
 
+static void resctrl_mon_resource_init(struct rdt_resource *r)
+{
+	unsigned long fflags;
+
+	fflags = r->rid == RDT_RESOURCE_MBA ? RFTYPE_RES_MB : RFTYPE_RES_CACHE;
+	if (mon_event_all[QOS_L3_MBM_TOTAL_EVENT_ID].rid == r->rid &&
+	    resctrl_arch_is_evt_configurable(QOS_L3_MBM_TOTAL_EVENT_ID)) {
+		mon_event_all[QOS_L3_MBM_TOTAL_EVENT_ID].configurable = true;
+		resctrl_file_fflags_init("mbm_total_bytes_config",
+					 RFTYPE_MON_INFO | fflags);
+	}
+	if (mon_event_all[QOS_L3_MBM_LOCAL_EVENT_ID].rid == r->rid &&
+	    resctrl_arch_is_evt_configurable(QOS_L3_MBM_LOCAL_EVENT_ID)) {
+		mon_event_all[QOS_L3_MBM_LOCAL_EVENT_ID].configurable = true;
+		resctrl_file_fflags_init("mbm_local_bytes_config",
+					 RFTYPE_MON_INFO | fflags);
+	}
+
+	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_LOCAL_EVENT_ID))
+		mba_mbps_default_event = QOS_L3_MBM_LOCAL_EVENT_ID;
+	else if (resctrl_is_mon_event_enabled(QOS_L3_MBM_TOTAL_EVENT_ID))
+		mba_mbps_default_event = QOS_L3_MBM_TOTAL_EVENT_ID;
+
+	if (r->mon.mbm_cntr_assignable) {
+		if (mon_event_all[QOS_L3_MBM_TOTAL_EVENT_ID].rid == r->rid &&
+		    resctrl_is_mon_event_enabled(QOS_L3_MBM_TOTAL_EVENT_ID))
+			mon_event_all[QOS_L3_MBM_TOTAL_EVENT_ID].evt_cfg = r->mon.mbm_cfg_mask;
+		if (mon_event_all[QOS_L3_MBM_LOCAL_EVENT_ID].rid == r->rid &&
+		    resctrl_is_mon_event_enabled(QOS_L3_MBM_LOCAL_EVENT_ID))
+			mon_event_all[QOS_L3_MBM_LOCAL_EVENT_ID].evt_cfg = r->mon.mbm_cfg_mask &
+									   (READS_TO_LOCAL_MEM |
+									    READS_TO_LOCAL_S_MEM |
+									    NON_TEMP_WRITE_TO_LOCAL_MEM);
+		r->mon.mbm_assign_on_mkdir = true;
+		resctrl_file_fflags_init("num_mbm_cntrs",
+					 RFTYPE_MON_INFO | fflags);
+		resctrl_file_fflags_init("available_mbm_cntrs",
+					 RFTYPE_MON_INFO | fflags);
+		resctrl_file_fflags_init("event_filter", RFTYPE_ASSIGN_CONFIG);
+		if (r->mon.mbm_cntr_configurable)
+			resctrl_file_mode_init("event_filter", 0644);
+		resctrl_file_fflags_init("mbm_assign_on_mkdir", RFTYPE_MON_INFO |
+					 fflags);
+		if (r->rid == RDT_RESOURCE_MBA)
+			resctrl_file_fflags_init("mbm_MB_assignments",
+						 RFTYPE_MON_BASE);
+		else
+			resctrl_file_fflags_init("mbm_L3_assignments",
+						 RFTYPE_MON_BASE);
+		resctrl_file_fflags_init("mbm_assign_mode", RFTYPE_MON_INFO |
+					 fflags);
+	}
+}
+
 /**
  * resctrl_l3_mon_resource_init() - Initialise global monitoring structures.
  *
@@ -1933,58 +2034,26 @@ int resctrl_l3_mon_resource_init(void)
 	struct rdt_resource *r = resctrl_arch_get_resource(RDT_RESOURCE_L3);
 	int ret;
 
-	if (!r->mon_capable)
+	if (!resctrl_arch_mon_capable())
 		return 0;
 
 	ret = closid_num_dirty_rmid_alloc(r);
 	if (ret)
 		return ret;
 
-	if (resctrl_arch_is_evt_configurable(QOS_L3_MBM_TOTAL_EVENT_ID)) {
-		mon_event_all[QOS_L3_MBM_TOTAL_EVENT_ID].configurable = true;
-		resctrl_file_fflags_init("mbm_total_bytes_config",
-					 RFTYPE_MON_INFO | RFTYPE_RES_CACHE);
-	}
-	if (resctrl_arch_is_evt_configurable(QOS_L3_MBM_LOCAL_EVENT_ID)) {
-		mon_event_all[QOS_L3_MBM_LOCAL_EVENT_ID].configurable = true;
-		resctrl_file_fflags_init("mbm_local_bytes_config",
-					 RFTYPE_MON_INFO | RFTYPE_RES_CACHE);
-	}
+	if (r->mon_capable)
+		resctrl_mon_resource_init(r);
 
-	if (resctrl_is_mon_event_enabled(QOS_L3_MBM_LOCAL_EVENT_ID))
-		mba_mbps_default_event = QOS_L3_MBM_LOCAL_EVENT_ID;
-	else if (resctrl_is_mon_event_enabled(QOS_L3_MBM_TOTAL_EVENT_ID))
-		mba_mbps_default_event = QOS_L3_MBM_TOTAL_EVENT_ID;
-
-	if (r->mon.mbm_cntr_assignable) {
-		if (resctrl_is_mon_event_enabled(QOS_L3_MBM_TOTAL_EVENT_ID))
-			mon_event_all[QOS_L3_MBM_TOTAL_EVENT_ID].evt_cfg = r->mon.mbm_cfg_mask;
-		if (resctrl_is_mon_event_enabled(QOS_L3_MBM_LOCAL_EVENT_ID))
-			mon_event_all[QOS_L3_MBM_LOCAL_EVENT_ID].evt_cfg = r->mon.mbm_cfg_mask &
-									   (READS_TO_LOCAL_MEM |
-									    READS_TO_LOCAL_S_MEM |
-									    NON_TEMP_WRITE_TO_LOCAL_MEM);
-		r->mon.mbm_assign_on_mkdir = true;
-		resctrl_file_fflags_init("num_mbm_cntrs",
-					 RFTYPE_MON_INFO | RFTYPE_RES_CACHE);
-		resctrl_file_fflags_init("available_mbm_cntrs",
-					 RFTYPE_MON_INFO | RFTYPE_RES_CACHE);
-		resctrl_file_fflags_init("event_filter", RFTYPE_ASSIGN_CONFIG);
-		if (r->mon.mbm_cntr_configurable)
-			resctrl_file_mode_init("event_filter", 0644);
-		resctrl_file_fflags_init("mbm_assign_on_mkdir", RFTYPE_MON_INFO |
-					 RFTYPE_RES_CACHE);
-		resctrl_file_fflags_init("mbm_L3_assignments", RFTYPE_MON_BASE);
-	}
+	r = resctrl_arch_get_resource(RDT_RESOURCE_MBA);
+	if (r && r->mon_capable)
+		resctrl_mon_resource_init(r);
 
 	return 0;
 }
 
 void resctrl_l3_mon_resource_exit(void)
 {
-	struct rdt_resource *r = resctrl_arch_get_resource(RDT_RESOURCE_L3);
-
-	if (!r->mon_capable)
+	if (!resctrl_arch_mon_capable())
 		return;
 
 	closid_num_dirty_rmid_free();

@@ -11,6 +11,7 @@
 #include <linux/cacheinfo.h>
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/gfp.h>
@@ -1367,32 +1368,34 @@ static void __ris_msmon_read(void *arg)
 
 static int _msmon_read(struct mpam_component *comp, struct mon_read *arg)
 {
-	int err, any_err = 0;
+	int any_err = 0;
 	struct mpam_vmsc *vmsc;
 
 	guard(srcu)(&mpam_srcu);
 	list_for_each_entry_srcu(vmsc, &comp->vmsc, comp_list,
 				 srcu_read_lock_held(&mpam_srcu)) {
-		struct mpam_msc *msc = vmsc->msc;
 		struct mpam_msc_ris *ris;
 
 		list_for_each_entry_srcu(ris, &vmsc->ris, vmsc_list,
 					 srcu_read_lock_held(&mpam_srcu)) {
 			arg->ris = ris;
+			arg->err = 0;
 
-			err = smp_call_function_any(&msc->accessibility,
-						    __ris_msmon_read, arg,
-						    true);
-			if (!err && arg->err)
-				err = arg->err;
+			/*
+			 * Per Arm DDI0598C_b, MSC counter registers are
+			 * memory-mapped and readable from any CPU, so the
+			 * monitor read can run inline regardless of
+			 * msc->accessibility or calling context.
+			 */
+			__ris_msmon_read(arg);
 
 			/*
 			 * Save one error to be returned to the caller, but
-			 * keep reading counters so that get reprogrammed. On
-			 * platforms with NRDY this lets us wait once.
+			 * keep reading counters so they get reprogrammed.
+			 * On platforms with NRDY this lets us wait once.
 			 */
-			if (err)
-				any_err = err;
+			if (arg->err)
+				any_err = arg->err;
 		}
 	}
 
@@ -1414,13 +1417,10 @@ static enum mpam_device_features mpam_msmon_choose_counter(struct mpam_class *cl
 int mpam_msmon_read(struct mpam_component *comp, struct mon_cfg *ctx,
 		    enum mpam_device_features type, u64 *val)
 {
-	int err;
-	struct mon_read arg;
-	u64 wait_jiffies = 0;
 	struct mpam_class *class = comp->class;
 	struct mpam_props *cprops = &class->props;
-
-	might_sleep();
+	struct mon_read arg;
+	int err;
 
 	if (!mpam_is_enabled())
 		return -EIO;
@@ -1439,21 +1439,29 @@ int mpam_msmon_read(struct mpam_component *comp, struct mon_cfg *ctx,
 	*val = 0;
 
 	err = _msmon_read(comp, &arg);
-	if (err == -EBUSY && class->nrdy_usec)
-		wait_jiffies = usecs_to_jiffies(class->nrdy_usec);
 
-	while (wait_jiffies)
-		wait_jiffies = schedule_timeout_uninterruptible(wait_jiffies);
+	/*
+	 * NRDY: counter was not ready on the first read. Wait the
+	 * firmware-advertised "arm,not-ready-us" (typically a few
+	 * microseconds) and try once more. The wait primitive is picked
+	 * by context:
+	 *
+	 *   - resctrl seq_show, debugfs, etc. run in process context with
+	 *     IRQs enabled; usleep_range() yields the CPU so we don't
+	 *     burn cycles spinning.
+	 *   - perf's cross-CPU .read() lands here via
+	 *     smp_call_function_single(), i.e. with IRQs disabled. A
+	 *     scheduler call would BUG, so fall back to a bounded
+	 *     udelay() busy-wait.
+	 */
+	if (err == -EBUSY && class->nrdy_usec) {
+		if (preemptible())
+			usleep_range(class->nrdy_usec, 2 * class->nrdy_usec);
+		else
+			udelay(class->nrdy_usec);
 
-	if (err == -EBUSY) {
-		arg = (struct mon_read) {
-			.ctx = ctx,
-			.type = type,
-			.val = val,
-			.waited_timeout = true,
-		};
+		arg.waited_timeout = true;
 		*val = 0;
-
 		err = _msmon_read(comp, &arg);
 	}
 
