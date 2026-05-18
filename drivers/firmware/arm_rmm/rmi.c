@@ -107,19 +107,6 @@ long rmi_undelegate_range(phys_addr_t phys, unsigned long size,
 }
 EXPORT_SYMBOL_GPL(rmi_undelegate_range);
 
-int free_delegated_page(phys_addr_t phys)
-{
-	if (WARN_ON(rmi_undelegate_page(phys))) {
-		/* Undelegate failed: leak the page */
-		return -EBUSY;
-	}
-
-	free_page((unsigned long)phys_to_virt(phys));
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(free_delegated_page);
-
 /*
  * Free an allocation after range delegation failed. The delegated prefix must
  * be undelegated before it can be returned to the page allocator; if that

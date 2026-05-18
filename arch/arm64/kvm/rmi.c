@@ -14,6 +14,8 @@
 #include <asm/rmi_cmds.h>
 #include <asm/virt.h>
 
+#define RMM_RTT_MAX_LEVEL	KVM_PGTABLE_LAST_LEVEL
+
 static inline unsigned long rmi_rtt_level_mapsize(int level)
 {
 	if (WARN_ON(level > KVM_PGTABLE_LAST_LEVEL))
@@ -167,6 +169,51 @@ static int realm_alloc_sro(struct realm *realm)
 	return 0;
 }
 
+/*
+ * Delegate a PA range using caller-owned SRO state.
+ *
+ * RMI_GRANULE_RANGE_DELEGATE may make forward progress on only a prefix of
+ * the requested range. Return that delegated prefix to the caller so it can
+ * either consume the granules or undelegate exactly the granules that changed
+ * ownership.
+ */
+static int realm_delegate_range(phys_addr_t phys,
+				unsigned long size,
+				unsigned long *delegated_size)
+{
+	return rmi_delegate_range(phys, size, delegated_size);
+}
+
+static int realm_undelegate_range(phys_addr_t phys,
+				  unsigned long size,
+				  unsigned long *undelegated_size)
+{
+	return rmi_undelegate_range(phys, size, undelegated_size);
+}
+
+static int realm_undelegate_map_range(phys_addr_t phys,
+				      unsigned long size)
+{
+	phys_addr_t addr;
+	phys_addr_t end = phys + size;
+	unsigned long undelegated_size = 0;
+	int ret;
+
+	if (!size)
+		return 0;
+
+	ret = realm_undelegate_range(phys, size, &undelegated_size);
+	if (WARN_ON(ret != RMI_SUCCESS)) {
+		/* Pages can't be returned to NS world so are lost */
+		for (addr = phys + undelegated_size; addr < end;
+		     addr += PAGE_SIZE)
+			get_page(phys_to_page(addr));
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
 static int undelegate_range_desc(unsigned long desc)
 {
 	unsigned long size;
@@ -180,7 +227,7 @@ static int undelegate_range_desc(unsigned long desc)
 	if (!size)
 		return 0;
 
-	return rmi_undelegate_range(addr, size, NULL);
+	return realm_undelegate_range(addr, size, NULL);
 }
 
 static int rmi_addr_range_desc_cmp(const void *a, const void *b)
@@ -225,8 +272,8 @@ static int undelegate_range_descs(unsigned long *descs, unsigned long count)
 		}
 
 		if (have_run) {
-			ret = rmi_undelegate_range(run_start,
-						   run_end - run_start, NULL);
+			ret = realm_undelegate_range(run_start,
+						     run_end - run_start, NULL);
 			if (ret)
 				return ret;
 		}
@@ -239,7 +286,7 @@ static int undelegate_range_descs(unsigned long *descs, unsigned long count)
 	if (!have_run)
 		return 0;
 
-	return rmi_undelegate_range(run_start, run_end - run_start, NULL);
+	return realm_undelegate_range(run_start, run_end - run_start, NULL);
 }
 
 static void realm_alloc_unmap_desc_buf(struct realm *realm)
@@ -287,12 +334,23 @@ static phys_addr_t alloc_delegated_granule(struct kvm_mmu_memory_cache *mc)
 		return PHYS_ADDR_MAX;
 
 	phys = virt_to_phys(virt);
-	if (rmi_delegate_page(phys)) {
+	if (realm_delegate_range(phys, PAGE_SIZE, NULL)) {
 		free_page((unsigned long)virt);
 		return PHYS_ADDR_MAX;
 	}
 
 	return phys;
+}
+
+static int realm_free_delegated_page(phys_addr_t phys)
+{
+	if (WARN_ON(realm_undelegate_range(phys, PAGE_SIZE, NULL))) {
+		/* Undelegate failed: leak the page */
+		return -EBUSY;
+	}
+
+	free_page((unsigned long)phys_to_virt(phys));
+	return 0;
 }
 
 static phys_addr_t alloc_rtt(struct kvm_mmu_memory_cache *mc)
@@ -307,7 +365,7 @@ static phys_addr_t alloc_rtt(struct kvm_mmu_memory_cache *mc)
 
 static void free_rtt(phys_addr_t phys)
 {
-	if (free_delegated_page(phys))
+	if (realm_free_delegated_page(phys))
 		return;
 
 	kvm_account_pgtable_pages(phys_to_virt(phys), -1);
@@ -511,59 +569,73 @@ static int realm_tear_down_rtt_range(struct realm *realm,
 }
 
 /*
- * Returns 0 on successful fold, a negative value on error, a positive value if
- * we were not able to fold all tables at this level.
+ * DEN0137 v2.0-bet3 defines RMI_RTT_FOLD as a one-entry operation; there is no
+ * counted or LIST form to fold a range. The unmap output descriptors report
+ * PA ranges, not the level of the removed RTTE, so probe L3 after any command
+ * that removed a mapping. A successful fold makes the enclosing RTT a
+ * candidate. On RMI_ERROR_RTT, an error at the target level means the target
+ * RTT is non-homogeneous and stops the upward probe. A lower error level leaves
+ * the enclosing RTT as a possible candidate, so continue upward.
  */
-static int realm_fold_rtt_level(struct realm *realm, int level,
-				unsigned long start, unsigned long end)
+static bool realm_fold_rtt_level(struct kvm *kvm, int level,
+				 unsigned long start, unsigned long end)
 {
-	int not_folded = 0;
-	ssize_t map_size;
-	unsigned long addr, next_addr;
+	struct realm *realm = &kvm->arch.realm;
+	unsigned long map_size;
+	unsigned long addr;
+	bool probe_parent = false;
 
-	if (WARN_ON(level > KVM_PGTABLE_LAST_LEVEL))
-		return -EINVAL;
+	/*
+	 * Final teardown does not need homogeneous RTTs. RMI_RTT_DESTROY can
+	 * reclaim any non-live RTT and its @top output skips RTTs which do not
+	 * exist. Avoid speculative bottom-up folds while the complete stage-2 is
+	 * being removed: a 1 GiB block mapping has no L3 RTT, but probing from L3
+	 * would still issue 512 failing RMI_RTT_FOLD calls before reaching L2.
+	 *
+	 * Keep folding for partial unmaps of a live Realm, where reclaiming an
+	 * empty RTT allows a larger block mapping to be installed later.
+	 */
+	if (kvm_realm_state(kvm) == REALM_STATE_DYING)
+		return false;
+
+	if (WARN_ON(level > RMM_RTT_MAX_LEVEL))
+		return false;
+	if (start >= end || level <= get_start_level(realm))
+		return false;
 
 	map_size = rmi_rtt_level_mapsize(level - 1);
+	start = ALIGN_DOWN(start, map_size);
+	end = ALIGN(end, map_size);
 
-	for (addr = start; addr < end; addr = next_addr) {
+	if (start >= end)
+		return false;
+
+	for (addr = start; addr < end; addr += map_size) {
 		phys_addr_t rtt_granule;
 		int ret;
-		unsigned long align_addr = ALIGN(addr, map_size);
 
-		next_addr = ALIGN(addr + 1, map_size);
-
-		ret = realm_rtt_fold(realm, align_addr, level, &rtt_granule);
+		ret = realm_rtt_fold(realm, addr, level, &rtt_granule);
 
 		switch (RMI_RETURN_STATUS(ret)) {
 		case RMI_SUCCESS:
 			free_rtt(rtt_granule);
+			probe_parent = true;
 			break;
 		case RMI_ERROR_RTT:
-			if (level == KVM_PGTABLE_LAST_LEVEL ||
-			    RMI_RETURN_INDEX(ret) < level) {
-				not_folded++;
-				break;
-			}
-			/* Recurse a level deeper */
-			ret = realm_fold_rtt_level(realm,
-						   level + 1,
-						   addr,
-						   next_addr);
-			if (ret < 0) {
-				return ret;
-			} else if (ret == 0) {
-				/* Try again at this level */
-				next_addr = addr;
-			}
+			if (RMI_RETURN_INDEX(ret) < level)
+				probe_parent = true;
 			break;
 		default:
 			WARN_ON(1);
-			return -ENXIO;
+			return false;
 		}
 	}
 
-	return not_folded;
+	/* RMI_RTT_FOLD cannot target the Realm's starting-level root RTT. */
+	if (probe_parent && level > (get_start_level(realm) + 1))
+		realm_fold_rtt_level(kvm, level - 1, start, end);
+
+	return probe_parent;
 }
 
 void kvm_realm_destroy_rtts(struct kvm *kvm)
@@ -584,40 +656,41 @@ static void realm_unmap_shared_range(struct kvm *kvm,
 	unsigned long next_addr, addr;
 	unsigned long shared_bit = BIT(realm->ia_bits - 1);
 
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
 	start |= shared_bit;
 	end |= shared_bit;
 
 	for (addr = start; addr < end; addr = next_addr) {
+		unsigned long out_range = 0;
 		int ret;
 
 retry:
 		ret = rmi_rtt_unprot_unmap(rd, addr, end,
 					   RMI_ADDR_TYPE_SINGLE, 0,
-					   &next_addr, NULL, NULL);
+					   &next_addr, &out_range, NULL);
 		if (WARN_ON(ret < 0))
 			return;
 		switch (RMI_RETURN_STATUS(ret)) {
-		case RMI_SUCCESS:
+		case RMI_SUCCESS: {
+			unsigned long count = RMI_ADDR_RANGE_COUNT(out_range);
+
 			/*
-			 * @next_addr is RMM's out_top: the IPA up to
-			 * which the architecture unmapped (page or
-			 * block, picked by RMM transparently per
-			 * DEN0137 v2.0-bet3 §B4.5.70). Advance and
-			 * continue.
+			 * @next_addr is RMM's out_top: the IPA up to which the
+			 * architecture unmapped (page or block, picked by RMM
+			 * transparently per DEN0137 v2.0-bet3 §B4.5.70).
 			 */
 			if (WARN_ON(next_addr <= addr || next_addr > end))
 				return;
+			if (count)
+				realm_fold_rtt_level(kvm, RMM_RTT_MAX_LEVEL,
+						     addr, next_addr);
 			break;
+		}
 		case RMI_ERROR_RTT: {
 			unsigned long map_size;
 			int err_level = RMI_RETURN_INDEX(ret);
 
-			/*
-			 * RMM walked [addr, end) and did not find a
-			 * MAPPED_NS entry, or found a live block larger
-			 * than the requested range. Skip a fully covered
-			 * missing entry, otherwise split the block and retry.
-			 */
 			if (WARN_ON(err_level > KVM_PGTABLE_LAST_LEVEL))
 				return;
 
@@ -630,7 +703,8 @@ retry:
 				break;
 			}
 
-			ret = realm_create_rtt_levels(realm, addr, err_level,
+			ret = realm_create_rtt_levels(realm,
+						      addr, err_level,
 						      err_level + 1, NULL);
 			if (ret)
 				return;
@@ -644,9 +718,6 @@ retry:
 		if (may_block)
 			cond_resched_rwlock_write(&kvm->mmu_lock);
 	}
-
-	realm_fold_rtt_level(realm, get_start_level(realm) + 1,
-			     start, end);
 }
 
 static int realm_init_sve_param(struct kvm *kvm, struct realm_params *params)
@@ -687,8 +758,9 @@ static int realm_create_rd(struct kvm *kvm)
 	struct realm *realm = &kvm->arch.realm;
 	struct realm_params *params __free(free_page) = NULL;
 	void *rd = NULL;
-	phys_addr_t rd_phys, params_phys, top_delegated;
+	phys_addr_t rd_phys, params_phys;
 	size_t pgd_size = kvm_pgtable_stage2_pgd_size(kvm->arch.mmu.vtcr);
+	unsigned long pgd_delegated_size = 0;
 	u64 dfr0 = kvm_read_vm_id_reg(kvm, SYS_ID_AA64DFR0_EL1);
 	long rmi_ret;
 	int r;
@@ -707,13 +779,13 @@ static int realm_create_rd(struct kvm *kvm)
 		return -ENOMEM;
 
 	rd_phys = virt_to_phys(rd);
-	if (rmi_delegate_page(rd_phys)) {
+	if (realm_delegate_range(rd_phys, PAGE_SIZE, NULL)) {
 		r = -ENXIO;
 		goto free_rd;
 	}
 
-	if (rmi_delegate_range(kvm->arch.mmu.pgd_phys, pgd_size,
-			       &top_delegated)) {
+	if (realm_delegate_range(kvm->arch.mmu.pgd_phys,
+				 pgd_size, &pgd_delegated_size)) {
 		r = -ENXIO;
 		goto out_undelegate_tables;
 	}
@@ -750,13 +822,13 @@ static int realm_create_rd(struct kvm *kvm)
 	return 0;
 
 out_undelegate_tables:
-	if (WARN_ON(rmi_undelegate_range(kvm->arch.mmu.pgd_phys,
-					 top_delegated - kvm->arch.mmu.pgd_phys,
-					 NULL))) {
+	if (pgd_delegated_size &&
+	    WARN_ON(realm_undelegate_range(kvm->arch.mmu.pgd_phys,
+					   pgd_delegated_size, NULL))) {
 		/* Leak the pages if they cannot be returned */
 		kvm->arch.mmu.pgt = NULL;
 	}
-	if (WARN_ON(rmi_undelegate_page(rd_phys))) {
+	if (WARN_ON(realm_undelegate_range(rd_phys, PAGE_SIZE, NULL))) {
 		/* Leak the page if it isn't returned */
 		return r;
 	}
@@ -775,6 +847,8 @@ static void realm_unmap_private_range_single(struct kvm *kvm,
 	unsigned long next_addr, addr;
 	int ret;
 
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
 	for (addr = start; addr < end; addr = next_addr) {
 		unsigned long out_range = 0;
 		unsigned long flags = RMI_ADDR_TYPE_SINGLE;
@@ -789,6 +863,9 @@ retry:
 		case RMI_SUCCESS:
 			if (WARN_ON(next_addr <= addr || next_addr > end))
 				return;
+			if (RMI_ADDR_RANGE_COUNT(out_range))
+				realm_fold_rtt_level(kvm, RMM_RTT_MAX_LEVEL,
+						     addr, next_addr);
 			break;
 		case RMI_ERROR_RTT: {
 			unsigned long map_size;
@@ -806,7 +883,8 @@ retry:
 				break;
 			}
 
-			ret = realm_create_rtt_levels(realm, addr, err_level,
+			ret = realm_create_rtt_levels(realm,
+						      addr, err_level,
 						      err_level + 1, NULL);
 			if (ret)
 				return;
@@ -816,7 +894,6 @@ retry:
 			WARN_ON(1);
 			return;
 		}
-
 		ret = undelegate_range_desc(out_range);
 		if (WARN_ON(ret))
 			break;
@@ -824,9 +901,6 @@ retry:
 		if (may_block)
 			cond_resched_rwlock_write(&kvm->mmu_lock);
 	}
-
-	realm_fold_rtt_level(realm, get_start_level(realm) + 1,
-			     start, end);
 }
 
 static void realm_unmap_private_range(struct kvm *kvm,
@@ -871,7 +945,7 @@ retry:
 			if (WARN_ON(out_count > realm->unmap_desc_cap))
 				return;
 			if (out_count)
-				realm_fold_rtt_level(realm, RMM_RTT_MAX_LEVEL,
+				realm_fold_rtt_level(kvm, RMM_RTT_MAX_LEVEL,
 						     addr, next_addr);
 			break;
 		case RMI_ERROR_RTT: {
@@ -890,7 +964,8 @@ retry:
 				break;
 			}
 
-			ret = realm_create_rtt_levels(realm, addr, err_level,
+			ret = realm_create_rtt_levels(realm,
+						      addr, err_level,
 						      err_level + 1, NULL);
 			if (ret)
 				return;
@@ -910,9 +985,6 @@ retry:
 		if (may_block)
 			cond_resched_rwlock_write(&kvm->mmu_lock);
 	}
-
-	realm_fold_rtt_level(realm, get_start_level(realm) + 1,
-			     start, end);
 }
 
 void kvm_realm_unmap_range(struct kvm *kvm, unsigned long start,
@@ -944,7 +1016,7 @@ static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
 	dst_phys = __pfn_to_phys(dst_pfn);
 	src_phys = __pfn_to_phys(src_pfn);
 
-	if (rmi_delegate_page(dst_phys))
+	if (realm_delegate_range(dst_phys, PAGE_SIZE, NULL))
 		return -ENXIO;
 
 	ret = rmi_rtt_data_map_init(rd, dst_phys, ipa, src_phys, flags);
@@ -962,12 +1034,8 @@ static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
 		}
 	}
 
-	if (ret) {
-		if (WARN_ON(rmi_undelegate_page(dst_phys))) {
-			/* Undelegate failed, so we leak the page */
-			get_page(pfn_to_page(dst_pfn));
-		}
-	}
+	if (ret)
+		realm_undelegate_map_range(dst_phys, PAGE_SIZE);
 
 	return ret;
 }
@@ -1011,46 +1079,6 @@ static unsigned long addr_range_desc(unsigned long phys, int level,
 	WARN_ON(phys & (size - 1));
 
 	return RMI_ADDR_RANGE_DESC(phys, addr_range_size(level), count, state);
-}
-
-/*
- * Delegate a PA range using caller-owned SRO state.
- *
- * RMI_GRANULE_RANGE_DELEGATE may make forward progress on only a prefix of
- * the requested range. Return that delegated prefix to the caller so it can
- * either consume the granules or undelegate exactly the granules that changed
- * ownership.
- */
-static int realm_delegate_range(phys_addr_t phys,
-				unsigned long size,
-				unsigned long *delegated_size)
-{
-	return rmi_delegate_range(phys, size, delegated_size);
-}
-
-static int realm_undelegate_range(phys_addr_t phys,
-				  unsigned long size)
-{
-	return rmi_undelegate_range(phys, size, NULL);
-}
-
-static int realm_undelegate_map_range(phys_addr_t phys,
-				      unsigned long size)
-{
-	phys_addr_t addr;
-	phys_addr_t end = phys + size;
-
-	if (!size)
-		return 0;
-
-	if (WARN_ON(realm_undelegate_range(phys, size))) {
-		/* Pages can't be returned to NS world so are lost */
-		for (addr = phys; addr < end; addr += PAGE_SIZE)
-			get_page(phys_to_page(addr));
-		return -ENXIO;
-	}
-
-	return 0;
 }
 
 /*
@@ -1227,8 +1255,10 @@ retry_chunk:
 			int level = RMI_RETURN_INDEX(ret);
 
 			if (level < map_level) {
-				ret = realm_create_rtt_levels(realm, ipa, level,
-							      map_level, memcache);
+				ret = realm_create_rtt_levels(realm,
+							      ipa, level,
+							      map_level,
+							      memcache);
 				if (ret)
 					return ret;
 				continue;
@@ -1400,8 +1430,10 @@ retry_chunk:
 			int level = RMI_RETURN_INDEX(ret);
 
 			if (level < map_level) {
-				ret = realm_create_rtt_levels(realm, ipa, level,
-							      map_level, memcache);
+				ret = realm_create_rtt_levels(realm,
+							      ipa, level,
+							      map_level,
+							      memcache);
 				if (ret)
 					return ret;
 				continue;
@@ -1904,7 +1936,7 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	rec_page_phys = virt_to_phys(rec->rec_page);
 	rec->rec_phys = rec_page_phys;
 
-	if (rmi_delegate_page(rec_page_phys)) {
+	if (realm_delegate_range(rec_page_phys, PAGE_SIZE, NULL)) {
 		r = -ENXIO;
 		goto out_free_pages;
 	}
@@ -1923,7 +1955,7 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	return 0;
 
 out_undelegate_rmm_rec:
-	if (WARN_ON(rmi_undelegate_page(rec_page_phys)))
+	if (WARN_ON(realm_undelegate_range(rec_page_phys, PAGE_SIZE, NULL)))
 		rec->rec_page = NULL;
 out_free_pages:
 	free_page((unsigned long)rec->run);
@@ -1982,12 +2014,12 @@ void kvm_destroy_rec(struct kvm_vcpu *vcpu)
 	rec->run = NULL;
 	rec->run_phys = 0;
 
-	kfree(rec->sro);
-	rec->sro = NULL;
-
-	free_delegated_page(rec_page_phys);
+	realm_free_delegated_page(rec_page_phys);
 	rec->rec_page = NULL;
 	rec->rec_phys = 0;
+
+	kfree(rec->sro);
+	rec->sro = NULL;
 }
 
 int kvm_activate_realm(struct kvm *kvm)
@@ -2063,12 +2095,12 @@ void kvm_destroy_realm(struct kvm *kvm)
 
 		if (WARN_ON(rmi_realm_destroy(rd_phys, realm->sro)))
 			return;
-		free_delegated_page(rd_phys);
+		realm_free_delegated_page(rd_phys);
 		realm->rd = NULL;
 	}
 
-	if (WARN_ON(rmi_undelegate_range(kvm->arch.mmu.pgd_phys,
-					 pgd_size, NULL)))
+	if (WARN_ON(realm_undelegate_range(kvm->arch.mmu.pgd_phys,
+					   pgd_size, NULL)))
 		return;
 
 	kvm_set_realm_state(kvm, REALM_STATE_DEAD);

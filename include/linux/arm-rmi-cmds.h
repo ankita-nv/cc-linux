@@ -27,8 +27,6 @@ long rmi_delegate_range(phys_addr_t phys, unsigned long size,
 			unsigned long *delegated_size);
 long rmi_undelegate_range(phys_addr_t phys, unsigned long size,
 			  unsigned long *undelegated_size);
-int free_delegated_page(phys_addr_t phys);
-
 static inline long rmi_delegate_page(phys_addr_t phys)
 {
 	return rmi_delegate_range(phys, PAGE_SIZE, NULL);
