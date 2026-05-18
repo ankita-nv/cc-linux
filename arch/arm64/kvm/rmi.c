@@ -665,8 +665,17 @@ static void realm_unmap_shared_range(struct kvm *kvm,
 
 	lockdep_assert_held_write(&kvm->mmu_lock);
 
-	start |= shared_bit;
-	end |= shared_bit;
+	if (start >= end)
+		return;
+
+	/*
+	 * Convert the private IPA interval to its shared alias. Use addition
+	 * rather than setting the shared bit so a full private range ending at
+	 * @shared_bit maps to the open end of the shared half, not to an empty
+	 * range.
+	 */
+	start += shared_bit;
+	end += shared_bit;
 
 	for (addr = start; addr < end; addr = next_addr) {
 		unsigned long out_range = 0;
@@ -1205,6 +1214,44 @@ struct realm_map_run {
 	unsigned long top;
 	phys_addr_t phys;
 };
+
+/*
+ * Check whether an Unprotected IPA already has the requested mapping.
+ * RMI_RTT_READ_ENTRY returns the architectural stage-2 descriptor, so compare
+ * the PA, MemAttr and direct permissions before accepting an existing entry.
+ * Unprotected mappings must also be execute-never per DEN0137 §A5.6.11.3.
+ */
+static int realm_check_unprotected_mapping(unsigned long rd,
+					   unsigned long ipa,
+					   phys_addr_t phys, int map_level,
+					   unsigned long ipa_top,
+					   unsigned long attr,
+					   unsigned long *next_ipa)
+{
+	enum kvm_pgtable_prot prot;
+	struct rtt_entry rtte;
+	unsigned long map_size;
+	phys_addr_t rtte_phys;
+	int ret;
+
+	ret = realm_read_rtte(rd, ipa, map_level, ipa_top, &rtte, next_ipa);
+	if (ret)
+		return ret;
+
+	if (rtte.state == RMI_UNASSIGNED)
+		return 0;
+
+	map_size = rmi_rtt_level_mapsize(rtte.walk_level);
+	rtte_phys = kvm_pte_to_phys(rtte.desc) + (ipa & (map_size - 1));
+	prot = kvm_pgtable_stage2_pte_prot(rtte.desc);
+
+	if (rtte.ripas != RMI_EMPTY || rtte_phys != phys ||
+	    FIELD_GET(KVM_PTE_LEAF_ATTR_LO_S2_MEMATTR, rtte.desc) != attr ||
+	    (prot & KVM_PGTABLE_PROT_RWX) != KVM_PGTABLE_PROT_RW)
+		return -EFAULT;
+
+	return 1;
+}
 
 /*
  * Delegate the next contiguous run of backing memory that still needs a
@@ -1758,8 +1805,48 @@ retry_chunk:
 
 		if ((ret >= 0) &&
 		    (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT)) {
-			/* Create missing RTTs and retry */
+			unsigned long next_ipa;
 			int level = RMI_RETURN_INDEX(ret);
+			int state;
+
+			if (WARN_ON(level > KVM_PGTABLE_LAST_LEVEL))
+				return -ENXIO;
+
+			/*
+			 * RMI_ERROR_RTT also reports an incompatible mapping. Read
+			 * the entry before assuming that an RTT is missing.
+			 */
+			state = realm_check_unprotected_mapping(rd, ipa, phys, level,
+								      ipa_top, attr,
+								      &next_ipa);
+			if (state > 0) {
+				phys += next_ipa - ipa;
+				ipa = next_ipa;
+				continue;
+			}
+
+			/* Retry the fault after a blocked RTTE read. */
+			if (state == -EBUSY)
+				return -EAGAIN;
+
+			if (state == -EAGAIN) {
+				/*
+				 * A table appeared at the level reported by the failed
+				 * command. Retry if the target is below it; otherwise
+				 * descend into it.
+				 */
+				if (level < map_level)
+					goto retry_chunk;
+				if (map_level < KVM_PGTABLE_LAST_LEVEL) {
+					map_level++;
+					goto retry_lower_level;
+				}
+				return -ENXIO;
+			}
+
+			/* Propagate a conflicting or malformed RTTE. */
+			if (state < 0)
+				return state;
 
 			if (level < map_level) {
 				/* The walk stopped above the target; create its RTTs. */

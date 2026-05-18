@@ -2269,10 +2269,15 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
 	enum kvm_pgtable_walk_flags flags = KVM_PGTABLE_WALK_SHARED;
 	bool writable = prot & KVM_PGTABLE_PROT_W;
 	struct kvm *kvm = s2fd->vcpu->kvm;
+	bool realm_shared = false;
 	struct kvm_pgtable *pgt;
 	long perm_fault_granule;
 	long mapping_size;
+	phys_addr_t map_ipa;
+	kvm_pfn_t fault_pfn;
 	kvm_pfn_t pfn;
+	gfn_t dirty_gfn;
+	gfn_t fault_gfn;
 	gfn_t gfn;
 	int ret;
 
@@ -2287,6 +2292,13 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
 	mapping_size = s2vi->vma_pagesize;
 	pfn = s2vi->pfn;
 	gfn = s2vi->gfn;
+	fault_pfn = pfn;
+	fault_gfn = gfn;
+	dirty_gfn = get_canonical_gfn(s2fd, s2vi);
+	map_ipa = s2fd->fault_ipa;
+	if (kvm_is_realm(kvm))
+		realm_shared = kvm_gpa_from_fault(kvm, s2fd->fault_ipa) !=
+			       s2fd->fault_ipa;
 
 	/*
 	 * If we are not forced to use page mapping, check if we are
@@ -2304,6 +2316,44 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
 				ret = mapping_size;
 				goto out_unlock;
 			}
+		}
+	}
+
+	/*
+	 * Shared Realm mappings use a separate IPA alias. Only install a block
+	 * mapping if the whole target range is shared; otherwise keep the fault
+	 * at PAGE_SIZE so private and shared pages are not coalesced.
+	 */
+	if (realm_shared && (mapping_size > PAGE_SIZE)) {
+		unsigned long nr_pages = mapping_size >> PAGE_SHIFT;
+
+		if (!kvm_range_has_vm_memory_attributes(kvm, gfn,
+							gfn + nr_pages,
+							KVM_MEMORY_ATTRIBUTE_PRIVATE,
+							0)) {
+			unsigned long hva_offset;
+			unsigned long ipa_offset;
+
+			/*
+			 * Hugetlb faults pin the aligned block base. Preserve the
+			 * faulting subpage when a mixed shared/private range forces
+			 * this Realm mapping back to PAGE_SIZE. Use the original VMA
+			 * size because the fault tuple is saved before any THP upgrade.
+			 */
+			hva_offset = (s2fd->hva & (s2vi->vma_pagesize - 1)) >>
+				     PAGE_SHIFT;
+			ipa_offset = (kvm_gpa_from_fault(kvm, s2fd->fault_ipa) &
+				      (s2vi->vma_pagesize - 1)) >> PAGE_SHIFT;
+			fault_pfn += hva_offset;
+			fault_gfn += ipa_offset;
+			dirty_gfn += hva_offset;
+
+			mapping_size = PAGE_SIZE;
+			pfn = fault_pfn;
+			gfn = fault_gfn;
+		} else {
+			map_ipa = gfn_to_gpa(gfn) |
+				  BIT(kvm->arch.realm.ia_bits - 1);
 		}
 	}
 
@@ -2343,7 +2393,8 @@ out_unlock:
 	 * been updated (via a THP upgrade, for example).
 	 */
 	if (writable && !ret) {
-		phys_addr_t ipa = gfn_to_gpa(get_canonical_gfn(s2fd, s2vi));
+		phys_addr_t ipa = gfn_to_gpa(dirty_gfn);
+
 		ipa &= ~(mapping_size - 1);
 		mark_page_dirty_in_slot(kvm, s2fd->memslot, gpa_to_gfn(ipa));
 	}
