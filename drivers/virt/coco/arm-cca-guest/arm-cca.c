@@ -14,6 +14,10 @@
 #include <linux/tsm.h>
 #include <linux/types.h>
 
+#ifdef CONFIG_PCI_TSM
+#include "rsi-da.h"
+#endif
+
 /**
  * struct arm_cca_token_info - a descriptor for the token buffer.
  * @granule:		PA of the granule to which the token will be written
@@ -167,6 +171,53 @@ static void unregister_cca_tsm_report(void *data)
 	tsm_report_unregister(&arm_cca_tsm_report_ops);
 }
 
+#ifdef CONFIG_PCI_TSM
+static struct pci_tsm *cca_tsm_lock(struct tsm_dev *tsm_dev, struct pci_dev *pdev)
+{
+	int ret;
+
+	struct cca_guest_dsc *cca_dsc __free(kfree) =
+		kzalloc_obj(struct cca_guest_dsc);
+	if (!cca_dsc)
+		return ERR_PTR(-ENOMEM);
+
+	ret = pci_tsm_devsec_constructor(pdev, &cca_dsc->pci, tsm_dev);
+	if (ret)
+		return ERR_PTR(ret);
+
+	/* For now always return an error */
+	return ERR_PTR(-EIO);
+}
+
+static void cca_tsm_unlock(struct pci_tsm *tsm)
+{
+	struct cca_guest_dsc *cca_dsc = to_cca_guest_dsc(tsm->pdev);
+
+	kfree(cca_dsc);
+}
+
+static struct pci_tsm_ops cca_devsec_pci_ops = {
+	.lock = cca_tsm_lock,
+	.unlock = cca_tsm_unlock,
+};
+
+static void cca_devsec_tsm_remove(void *tsm_dev)
+{
+	tsm_unregister(tsm_dev);
+}
+
+static int cca_devsec_tsm_register(struct arm_smccc_device *sdev)
+{
+	struct tsm_dev *tsm_dev;
+
+	tsm_dev = tsm_register(&sdev->dev, &cca_devsec_pci_ops);
+	if (IS_ERR(tsm_dev))
+		return PTR_ERR(tsm_dev);
+
+	return devm_add_action_or_reset(&sdev->dev, cca_devsec_tsm_remove, tsm_dev);
+}
+#endif /* CONFIG_PCI_TSM */
+
 static int cca_tsm_probe(struct arm_smccc_device *sdev)
 {
 	int ret;
@@ -187,6 +238,12 @@ static int cca_tsm_probe(struct arm_smccc_device *sdev)
 		return ret;
 	}
 
+#ifdef CONFIG_PCI_TSM
+	/* Allow tsm report even if tsm_register fails */
+	if (rsi_has_da_feature())
+		cca_devsec_tsm_register(sdev);
+#endif
+
 	return 0;
 }
 
@@ -203,5 +260,6 @@ static struct arm_smccc_driver cca_tsm_driver = {
 };
 module_arm_smccc_driver(cca_tsm_driver);
 MODULE_AUTHOR("Sami Mujawar <sami.mujawar@arm.com>");
+MODULE_AUTHOR("Aneesh Kumar <aneesh.kumar@kernel.org>");
 MODULE_DESCRIPTION("Arm CCA Guest TSM Driver");
 MODULE_LICENSE("GPL");
