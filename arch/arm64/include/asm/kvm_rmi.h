@@ -58,6 +58,7 @@ enum realm_state {
  * @state: The lifetime state machine for the realm
  * @ia_bits: Number of valid Input Address bits in the IPA
  * @stage2_unmapped: The Realm stage-2 mappings have been removed
+ * @stage2_unmap_failed: An unmap could not be completed (retry required)
  * @rtts_destroyed: The non-root RTTs have been torn down
  * @unmap_desc_buf: Output address list used by range unmap commands
  * @unmap_desc_pa: Physical address of @unmap_desc_buf
@@ -76,6 +77,7 @@ struct realm {
 	enum realm_state state;
 	unsigned int ia_bits;
 	bool stage2_unmapped;
+	bool stage2_unmap_failed;
 	bool rtts_destroyed;
 	unsigned long *unmap_desc_buf;
 	phys_addr_t unmap_desc_pa;

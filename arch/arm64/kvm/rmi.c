@@ -645,12 +645,60 @@ static bool realm_fold_rtt_level(struct kvm *kvm, int level,
 	return probe_parent;
 }
 
-void kvm_realm_destroy_rtts(struct kvm *kvm)
+static int realm_destroy_rtts(struct kvm *kvm)
 {
 	struct realm *realm = &kvm->arch.realm;
 	unsigned int ia_bits = realm->ia_bits;
+	int ret;
 
-	realm_tear_down_rtt_range(realm, 0, (1UL << ia_bits));
+	lockdep_assert_held(&kvm->arch.config_lock);
+
+	if (realm->rtts_destroyed)
+		return 0;
+
+	ret = realm_tear_down_rtt_range(realm, 0, (1UL << ia_bits));
+	if (ret)
+		return ret;
+
+	realm->rtts_destroyed = true;
+	return 0;
+}
+
+static void realm_unmap_stage2(struct kvm *kvm)
+{
+	struct realm *realm = &kvm->arch.realm;
+
+	lockdep_assert_held(&kvm->arch.config_lock);
+
+	if (realm->stage2_unmapped)
+		return;
+
+	realm->stage2_unmap_failed = false;
+
+	write_lock(&kvm->mmu_lock);
+	kvm_stage2_unmap_range(&kvm->arch.mmu, 0,
+			       BIT(realm->ia_bits - 1), true);
+	write_unlock(&kvm->mmu_lock);
+
+	/*
+	 * Only record the stage-2 as unmapped if every range was actually
+	 * removed. A swallowed unmap failure (e.g. RTT split under memory
+	 * pressure) must stay retryable, otherwise realm_destroy_rtts() would
+	 * later trip over live RTTEs and leak granules.
+	 */
+	if (realm->stage2_unmap_failed)
+		return;
+
+	realm->stage2_unmapped = true;
+	realm_free_unmap_desc_buf(realm);
+}
+
+int kvm_realm_teardown_stage2(struct kvm *kvm)
+{
+	lockdep_assert_held(&kvm->arch.config_lock);
+
+	realm_unmap_stage2(kvm);
+	return realm_destroy_rtts(kvm);
 }
 
 static void realm_unmap_shared_range(struct kvm *kvm,
@@ -722,12 +770,18 @@ retry:
 			ret = realm_create_rtt_levels(realm,
 						      addr, err_level,
 						      err_level + 1, NULL);
-			if (ret)
+			if (ret) {
+				WARN_ONCE(1,
+					  "RMI: RTT split failed unmapping %#lx: %d\n",
+					  addr, ret);
+				realm->stage2_unmap_failed = true;
 				return;
+			}
 			goto retry;
 		}
 		default:
 			WARN_ON(1);
+			realm->stage2_unmap_failed = true;
 			return;
 		}
 
@@ -902,12 +956,18 @@ retry:
 			ret = realm_create_rtt_levels(realm,
 						      addr, err_level,
 						      err_level + 1, NULL);
-			if (ret)
+			if (ret) {
+				WARN_ONCE(1,
+					  "RMI: RTT split failed unmapping %#lx: %d\n",
+					  addr, ret);
+				realm->stage2_unmap_failed = true;
 				return;
+			}
 			goto retry;
 		}
 		default:
 			WARN_ON(1);
+			realm->stage2_unmap_failed = true;
 			return;
 		}
 		ret = undelegate_range_desc(out_range);
@@ -983,12 +1043,18 @@ retry:
 			ret = realm_create_rtt_levels(realm,
 						      addr, err_level,
 						      err_level + 1, NULL);
-			if (ret)
+			if (ret) {
+				WARN_ONCE(1,
+					  "RMI: RTT split failed unmapping %#lx: %d\n",
+					  addr, ret);
+				realm->stage2_unmap_failed = true;
 				return;
+			}
 			goto retry;
 		}
 		default:
 			WARN_ON(1);
+			realm->stage2_unmap_failed = true;
 			return;
 		}
 
@@ -2513,6 +2579,8 @@ void kvm_destroy_realm(struct kvm *kvm)
 	struct realm *realm = &kvm->arch.realm;
 	size_t pgd_size = kvm_pgtable_stage2_pgd_size(kvm->arch.mmu.vtcr);
 
+	guard(mutex)(&kvm->arch.config_lock);
+
 	if (!kvm_realm_is_created(kvm)) {
 		realm_free_unmap_desc_buf(realm);
 		realm_free_sro(realm);
@@ -2521,33 +2589,39 @@ void kvm_destroy_realm(struct kvm *kvm)
 
 	kvm_set_realm_state(kvm, REALM_STATE_DYING);
 
-	write_lock(&kvm->mmu_lock);
-	kvm_stage2_unmap_range(&kvm->arch.mmu, 0,
-			       BIT(realm->ia_bits - 1), true);
-	write_unlock(&kvm->mmu_lock);
+	realm_unmap_stage2(kvm);
 
 	if (realm->rd) {
 		phys_addr_t rd_phys = virt_to_phys(realm->rd);
 
 		if (WARN_ON(rmi_realm_terminate(rd_phys)))
-			return;
+			goto out_free_host;
 
-		kvm_realm_destroy_rtts(kvm);
+		if (WARN_ON(realm_destroy_rtts(kvm)))
+			goto out_free_host;
 
 		if (WARN_ON(rmi_realm_destroy(rd_phys, realm->sro)))
-			return;
+			goto out_free_host;
 		realm_free_delegated_page(rd_phys);
 		realm->rd = NULL;
 	}
 
 	if (WARN_ON(realm_undelegate_range(kvm->arch.mmu.pgd_phys,
 					   pgd_size, NULL)))
-		return;
+		goto out_free_host;
 
 	kvm_set_realm_state(kvm, REALM_STATE_DEAD);
 
 	/* Now that the Realm is destroyed, free the entry level RTTs */
 	kvm_free_stage2_pgd(&kvm->arch.mmu);
+
+out_free_host:
+	/*
+	 * The SRO context and the LIST-unmap scratch buffer are host-owned
+	 * (never delegated), so release them even when the RMM-state teardown
+	 * above bailed out and intentionally leaked the Realm-owned (delegated)
+	 * granules. realm_free_unmap_desc_buf() is idempotent.
+	 */
 	realm_free_unmap_desc_buf(realm);
 	realm_free_sro(realm);
 }
