@@ -455,33 +455,35 @@ free_cca_dsc:
 
 static void cca_tsm_unlock(struct pci_tsm *tsm)
 {
-	long ret;
 	struct pci_dev *pdev = tsm->pdev;
 	struct cca_guest_dsc *cca_dsc = to_cca_guest_dsc(pdev);
 
 	/* Stop device DMA before its mappings are invalidated. */
 	if (cca_dsc->pci.mmio && cca_device_disable_dma(pdev)) {
 		pci_err(pdev, "failed to disable DMA from the device\n");
-		goto err_out;
+		/* As below: the device may still access its mappings. */
+		goto free_cca_dsc;
 	}
 
 	/* invalidate dev mapping based on interface report */
-	ret = cca_unmap_evidence_report_range(tsm->pdev);
-	if (ret) {
-		pci_err(tsm->pdev, "failed to invalidate the interface report\n");
-		goto err_out;
+	if (cca_unmap_evidence_report_range(pdev)) {
+		pci_err(pdev, "failed to invalidate the interface report\n");
+		/*
+		 * Leave the device locked and leak the MMIO descriptor:
+		 * resources cannot be freed while still validated.
+		 */
+		goto free_cca_dsc;
 	}
 
-	cca_device_unlock(tsm->pdev);
-	if (cca_dsc->pci.mmio)
-		pci_tsm_mmio_teardown(cca_dsc->pci.mmio);
+	if (cca_device_unlock(pdev))
+		pci_err(pdev, "failed to unlock the device\n");
 
-err_out:
-	/*
-	 * No error handling from this function. Leave the device locked
-	 */
-	if (cca_dsc->pci.mmio)
-		pci_tsm_mmio_free(tsm->pdev, cca_dsc->pci.mmio);
+	if (cca_dsc->pci.mmio) {
+		pci_tsm_mmio_teardown(cca_dsc->pci.mmio);
+		pci_tsm_mmio_free(pdev, cca_dsc->pci.mmio);
+	}
+
+free_cca_dsc:
 	kfree(cca_dsc);
 }
 

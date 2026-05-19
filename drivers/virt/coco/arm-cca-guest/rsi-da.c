@@ -237,9 +237,10 @@ int cca_unmap_evidence_report_range(struct pci_dev *pdev)
 	struct cca_guest_dsc *dsc = to_cca_guest_dsc(pdev);
 	struct pci_tsm_mmio *tsm_mmio = dsc->pci.mmio;
 
-	if (tsm_mmio)
-		return cca_apply_evidence_report_range(pdev, tsm_mmio, false);
-	return 0;
+	if (!tsm_mmio)
+		return 0;
+
+	return cca_apply_evidence_report_range(pdev, tsm_mmio, false);
 }
 
 int cca_verify_digest(u64 hash_algo, uint8_t *report,
@@ -390,6 +391,9 @@ int cca_device_accept(struct pci_dev *pdev, unsigned long lock_seq)
 	if (ret)
 		return ret;
 
+	if (dsc->pci.mmio)
+		return -EBUSY;
+
 	/* Allocation private mmio range based on interface report. */
 	tsm_mmio = pci_tsm_mmio_alloc(pdev);
 	if (!tsm_mmio) {
@@ -406,29 +410,41 @@ int cca_device_accept(struct pci_dev *pdev, unsigned long lock_seq)
 		pci_err(pdev, "Protected mmio setup failure\n");
 		goto err_mmio_setup;
 	}
+	/*
+	 * Past this point any failure must unwind via the err_* labels so
+	 * iomem and RSI mapping state are reverted before returning.
+	 */
+	dsc->pci.mmio = tsm_mmio;
 
-	ret = cca_map_evidence_report_range(pdev, tsm_mmio);
+	ret = cca_map_evidence_report_range(pdev, dsc->pci.mmio);
 	if (ret) {
 		pci_err(pdev, "failed to validate the interface report\n");
-		goto err_evidence_report_map;
+		goto err_teardown;
 	}
 
 	ret = rhi_vdev_set_tdi_state(pdev, RHI_DA_TDI_CONFIG_RUN);
 	if (ret) {
 		pci_err(pdev, "failed to switch the device (%u) to RUN state\n", ret);
-		goto err_tdi_config_run;
+		goto err_unmap;
 	}
 
-	if (rsi_vdev_enable_dma(vdev_id, &dsc->dev_info))
+	if (rsi_vdev_enable_dma(vdev_id, &dsc->dev_info)) {
 		pci_err(pdev, "failed to enable DMA from the device\n");
+		ret = -EIO;
+		goto err_run;
+	}
 
-	dsc->pci.mmio = no_free_ptr(tsm_mmio);
 	return 0;
 
-err_tdi_config_run:
-	cca_unmap_evidence_report_range(pdev);
-err_evidence_report_map:
+err_run:
+	if (rhi_vdev_set_tdi_state(pdev, RHI_DA_TDI_CONFIG_LOCKED))
+		pci_err(pdev, "failed to revert the device to LOCKED state\n");
+err_unmap:
+	if (cca_unmap_evidence_report_range(pdev))
+		pci_err(pdev, "failed to invalidate the interface report\n");
+err_teardown:
 	pci_tsm_mmio_teardown(tsm_mmio);
+	dsc->pci.mmio = NULL;
 err_mmio_setup:
 	pci_tsm_mmio_free(pdev, tsm_mmio);
 	return ret;
