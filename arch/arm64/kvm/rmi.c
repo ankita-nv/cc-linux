@@ -1019,9 +1019,6 @@ static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
 	dst_phys = __pfn_to_phys(dst_pfn);
 	src_phys = __pfn_to_phys(src_pfn);
 
-	if (realm_delegate_range(dst_phys, PAGE_SIZE, NULL))
-		return -ENXIO;
-
 	ret = rmi_rtt_data_map_init(rd, dst_phys, ipa, src_phys, flags);
 	if (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) {
 		/* Create missing RTTs and retry */
@@ -1031,16 +1028,17 @@ static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
 
 		ret = realm_create_rtt_levels(realm, ipa, level,
 					      KVM_PGTABLE_LAST_LEVEL, NULL);
-		if (!ret) {
-			ret = rmi_rtt_data_map_init(rd, dst_phys, ipa, src_phys,
-						    flags);
-		}
+		if (ret)
+			return ret;
+
+		ret = rmi_rtt_data_map_init(rd, dst_phys, ipa, src_phys,
+					    flags);
 	}
 
 	if (ret)
-		realm_undelegate_map_range(dst_phys, PAGE_SIZE);
+		return -ENXIO;
 
-	return ret;
+	return 0;
 }
 
 static unsigned long addr_range_size(int level)
@@ -1495,14 +1493,39 @@ int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
 static int populate_region_cb(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,
 			      struct page *src_page, void *opaque)
 {
-	unsigned long data_flags = *(unsigned long *)opaque;
+	unsigned long *data_flags = opaque;
+	unsigned long delegated_size = 0;
+	phys_addr_t phys = __pfn_to_phys(pfn);
 	phys_addr_t ipa = gfn_to_gpa(gfn);
+	int ret;
 
 	if (!src_page)
 		return -EOPNOTSUPP;
 
-	return realm_data_map_init(kvm, ipa, pfn, page_to_pfn(src_page),
-				   data_flags);
+	/*
+	 * kvm_gmem_populate() protects only the folio containing this page for
+	 * the duration of this callback. Do not leave later folio pages
+	 * delegated across callbacks, as a concurrent hole punch may remove
+	 * those pages before their DATA_INIT mappings are installed.
+	 */
+	ret = realm_delegate_range(phys, PAGE_SIZE, &delegated_size);
+	if (ret) {
+		if (delegated_size)
+			realm_undelegate_map_range(phys, delegated_size);
+		return ret > 0 ? -ENXIO : ret;
+	}
+
+	if (WARN_ON(delegated_size != PAGE_SIZE)) {
+		realm_undelegate_map_range(phys, delegated_size);
+		return -ENXIO;
+	}
+
+	ret = realm_data_map_init(kvm, ipa, pfn, page_to_pfn(src_page),
+				  *data_flags);
+	if (ret)
+		realm_undelegate_map_range(phys, PAGE_SIZE);
+
+	return ret;
 }
 
 static long populate_region(struct kvm *kvm,
@@ -1516,8 +1539,11 @@ static long populate_region(struct kvm *kvm,
 	lockdep_assert_held(&kvm->slots_lock);
 	lockdep_assert_held(&kvm->arch.config_lock);
 
-	ret = kvm_gmem_populate(kvm, base_gfn, u64_to_user_ptr(uaddr), pages,
-				false, populate_region_cb, &data_flags);
+	if (!pages)
+		return -EINVAL;
+
+	ret = kvm_gmem_populate(kvm, base_gfn, u64_to_user_ptr(uaddr),
+				pages, false, populate_region_cb, &data_flags);
 
 	return ret;
 }
