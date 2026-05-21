@@ -5,6 +5,7 @@
 
 #include <uapi/linux/psci.h>
 #include <linux/kvm_host.h>
+#include <linux/overflow.h>
 
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_hyp.h>
@@ -93,28 +94,49 @@ static int find_map_level(struct realm *realm,
 	return level;
 }
 
-static unsigned long rmi_range_entry_size(int rmi_size)
+static int rmi_addr_range_desc_decode(unsigned long desc,
+				      unsigned long expected_state,
+				      phys_addr_t *addr, unsigned long *size)
 {
-	if (WARN_ON(rmi_size > KVM_PGTABLE_LAST_LEVEL))
-		return 0;
+	unsigned long block_size;
+	unsigned long count = RMI_ADDR_RANGE_COUNT(desc);
+	phys_addr_t base = RMI_ADDR_RANGE_ADDR(desc);
+	phys_addr_t end;
 
-	return kvm_granule_size(KVM_PGTABLE_LAST_LEVEL - rmi_size);
+	if (!count) {
+		if (desc)
+			return -EPROTO;
+		*addr = 0;
+		*size = 0;
+		return 0;
+	}
+
+	block_size = RMI_ADDR_BSIZE_BYTES(RMI_ADDR_RANGE_SIZE(desc));
+	if ((desc & RMI_ADDR_RANGE_RESERVED_MASK) ||
+	    RMI_ADDR_RANGE_STATE(desc) != expected_state ||
+	    !IS_ALIGNED(base, block_size) ||
+	    check_mul_overflow(block_size, count, size) ||
+	    check_add_overflow(base, *size, &end))
+		return -EPROTO;
+
+	*addr = base;
+	return 0;
 }
 
 static int undelegate_range_desc(unsigned long desc)
 {
-	unsigned long size = rmi_range_entry_size(RMI_ADDR_RANGE_SIZE(desc));
-	unsigned long count = RMI_ADDR_RANGE_COUNT(desc);
-	unsigned long addr = RMI_ADDR_RANGE_ADDR(desc);
-	unsigned long state = RMI_ADDR_RANGE_STATE(desc);
+	unsigned long size;
+	phys_addr_t addr;
+	int ret;
 
-	if (state == RMI_OP_MEM_UNDELEGATED)
+	ret = rmi_addr_range_desc_decode(desc, RMI_OP_MEM_DELEGATED,
+					 &addr, &size);
+	if (ret)
+		return ret;
+	if (!size)
 		return 0;
 
-	if (size * count == 0)
-		return 0;
-
-	return rmi_undelegate_range(addr, size * count);
+	return rmi_undelegate_range(addr, size, NULL);
 }
 
 static phys_addr_t alloc_delegated_granule(struct kvm_mmu_memory_cache *mc)
@@ -490,8 +512,9 @@ static void realm_unmap_shared_range(struct kvm *kvm,
 		long ret;
 
 retry:
-		ret = rmi_rtt_unprot_unmap(rd, addr, end, RMI_ADDR_TYPE_NONE,
-					   0, &next_addr, NULL, NULL);
+		ret = rmi_rtt_unprot_unmap(rd, addr, end,
+					   RMI_ADDR_TYPE_SINGLE, 0,
+					   &next_addr, NULL, NULL);
 		if (WARN_ON(ret < 0))
 			return;
 
@@ -649,7 +672,8 @@ static int realm_create_rd(struct kvm *kvm)
 
 out_undelegate_tables:
 	if (WARN_ON(rmi_undelegate_range(kvm->arch.mmu.pgd_phys,
-					 top_delegated - kvm->arch.mmu.pgd_phys))) {
+					 top_delegated - kvm->arch.mmu.pgd_phys,
+					 NULL))) {
 		/* Leak the pages if they cannot be returned */
 		kvm->arch.mmu.pgt = NULL;
 	}
@@ -784,42 +808,14 @@ retry:
 	return ret <= 0 ? ret : -ENXIO;
 }
 
-static unsigned long addr_range_desc(unsigned long phys, unsigned long size,
-				     unsigned long state)
+static unsigned long addr_range_desc(unsigned long phys, unsigned long size)
 {
-	unsigned long count = 1;
-	unsigned long out;
-	int rmi_size;
-
-	for (rmi_size = KVM_PGTABLE_LAST_LEVEL; rmi_size >= 0; rmi_size--) {
-		unsigned long entry_size = rmi_range_entry_size(rmi_size);
-
-		if (size == entry_size)
-			break;
-		if (size > entry_size) {
-			rmi_size = -1;
-			break;
-		}
-	}
-
-	if (rmi_size < 0) {
-		/*
-		 * Only support mapping at the page level granularity when
-		 * it's an unusual length. This should get us back onto a larger
-		 * block size for the subsequent mappings.
-		 */
-		rmi_size = 0;
-		count = MIN(size >> PAGE_SHIFT, PTRS_PER_PTE - 1);
-	}
+	unsigned long count = MIN(size >> PAGE_SHIFT,
+				  FIELD_MAX(RMI_ADDR_RANGE_COUNT_MASK));
 
 	WARN_ON(phys & ~PAGE_MASK);
 
-	out = FIELD_PREP(RMI_ADDR_RANGE_SIZE_MASK, rmi_size) |
-	      FIELD_PREP(RMI_ADDR_RANGE_COUNT_MASK, count) |
-	      FIELD_PREP(RMI_ADDR_RANGE_STATE_MASK, state);
-	out |= phys & PAGE_MASK;
-
-	return out;
+	return RMI_ADDR_RANGE_DESC(phys, count);
 }
 
 /*
@@ -834,18 +830,13 @@ static int realm_delegate_range(phys_addr_t phys,
 				unsigned long size,
 				unsigned long *delegated_size)
 {
-	phys_addr_t out_phys = phys;
-	int ret;
-
-	ret = rmi_delegate_range(phys, size, &out_phys);
-	*delegated_size = out_phys - phys;
-	return ret;
+	return rmi_delegate_range(phys, size, delegated_size);
 }
 
 static int realm_undelegate_range(phys_addr_t phys,
 				  unsigned long size)
 {
-	return rmi_undelegate_range(phys, size);
+	return rmi_undelegate_range(phys, size, NULL);
 }
 
 static int realm_undelegate_map_range(phys_addr_t phys,
@@ -991,8 +982,7 @@ map_delegated:
 		unsigned long out_top;
 
 retry_map:
-		range_desc = addr_range_desc(phys, top - ipa,
-					     RMI_OP_MEM_DELEGATED);
+		range_desc = addr_range_desc(phys, top - ipa);
 		ret = rmi_rtt_data_map(rd, ipa, top, flags, range_desc,
 				       &out_top);
 		if (ret < 0)
@@ -1094,18 +1084,23 @@ static int realm_map_non_secure(struct kvm *kvm,
 		attr = MT_S2_FWB_NORMAL;
 	}
 
-	flags |= FIELD_PREP(RMI_RTT_UNPROT_MAP_FLAGS_MEMATTR, attr);
+	flags |= FIELD_PREP(RMI_RTT_UNPROT_MAP_FLAGS_MEMATTR_MASK, attr);
 
-	if (prot & KVM_PGTABLE_PROT_R)
-		flags |= FIELD_PREP(RMI_RTT_UNPROT_MAP_FLAGS_S2AP, RMI_S2AP_DIRECT_READ);
-	if (prot & KVM_PGTABLE_PROT_W)
-		flags |= FIELD_PREP(RMI_RTT_UNPROT_MAP_FLAGS_S2AP, RMI_S2AP_DIRECT_WRITE);
+	if ((prot & (KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W)) ==
+	    (KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W))
+		flags |= FIELD_PREP(RMI_RTT_UNPROT_MAP_FLAGS_S2AP_MASK,
+				    RMI_S2AP_RW);
+	else if (prot & KVM_PGTABLE_PROT_R)
+		flags |= FIELD_PREP(RMI_RTT_UNPROT_MAP_FLAGS_S2AP_MASK,
+				    RMI_S2AP_RO);
+	else if (prot & KVM_PGTABLE_PROT_W)
+		flags |= FIELD_PREP(RMI_RTT_UNPROT_MAP_FLAGS_S2AP_MASK,
+				    RMI_S2AP_WO);
 
 	flags |= RMI_ADDR_TYPE_SINGLE;
 
 	while (ipa < ipa_top) {
-		unsigned long range_desc = addr_range_desc(phys, ipa_top - ipa,
-							   RMI_OP_MEM_UNDELEGATED);
+		unsigned long range_desc = addr_range_desc(phys, ipa_top - ipa);
 		unsigned long out_top;
 
 		ret = rmi_rtt_unprot_map(rd, ipa, ipa_top, flags, range_desc,
@@ -1814,7 +1809,7 @@ void kvm_destroy_realm(struct kvm *kvm)
 	}
 
 	if (WARN_ON(rmi_undelegate_range(kvm->arch.mmu.pgd_phys,
-					 pgd_size)))
+					 pgd_size, NULL)))
 		return;
 
 	kvm_set_realm_state(kvm, REALM_STATE_DEAD);

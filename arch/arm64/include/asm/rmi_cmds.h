@@ -71,7 +71,7 @@ static inline long rmi_rtt_data_map_init(unsigned long rd, unsigned long data,
 		SMC_RMI_RTT_DATA_MAP_INIT, rd, data, ipa, src, flags
 	};
 
-	return rmi_sro_execute(&regs);
+	return rmi_sro_execute_no_xfer(&regs);
 }
 
 /**
@@ -97,7 +97,7 @@ static inline long rmi_rtt_data_map(unsigned long rd,
 	};
 	long ret;
 
-	ret = rmi_sro_execute(&regs);
+	ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
@@ -134,7 +134,7 @@ static inline long rmi_rtt_data_unmap(unsigned long rd,
 	};
 	long ret;
 
-	ret = rmi_sro_execute(&regs);
+	ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS) {
 		if (out_top)
@@ -256,7 +256,7 @@ static inline long rmi_rec_create(unsigned long rd,
 	*sro = (struct rmi_sro_state){.regs = {
 		SMC_RMI_REC_CREATE, rd, rec, params
 	}};
-	ret = rmi_sro_memxfer_execute(sro, GFP_KERNEL);
+	ret = rmi_sro_execute(sro, GFP_KERNEL);
 	rmi_sro_free(sro);
 
 	return ret;
@@ -314,7 +314,7 @@ static inline long rmi_rtt_create(unsigned long rd, unsigned long rtt,
 		SMC_RMI_RTT_CREATE, rd, rtt, ipa, level
 	};
 
-	return rmi_sro_execute(&regs);
+	return rmi_sro_execute_no_xfer(&regs);
 }
 
 /**
@@ -340,7 +340,7 @@ static inline long rmi_rtt_destroy(unsigned long rd,
 	struct arm_smccc_1_2_regs regs = {
 		SMC_RMI_RTT_DESTROY, rd, ipa, level
 	};
-	long ret = rmi_sro_execute(&regs);
+	long ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS) {
 		if (out_rtt)
@@ -370,7 +370,7 @@ static inline long rmi_rtt_fold(unsigned long rd, unsigned long ipa,
 	struct arm_smccc_1_2_regs regs = {
 		SMC_RMI_RTT_FOLD, rd, ipa, level
 	};
-	long ret = rmi_sro_execute(&regs);
+	long ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS && out_rtt)
 		*out_rtt = regs.a1;
@@ -395,7 +395,7 @@ static inline long rmi_rtt_init_ripas(unsigned long rd, unsigned long base,
 	struct arm_smccc_1_2_regs regs = {
 		SMC_RMI_RTT_INIT_RIPAS, rd, base, top
 	};
-	long ret = rmi_sro_execute(&regs);
+	long ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
@@ -426,7 +426,7 @@ static inline long rmi_rtt_unprot_map(unsigned long rd,
 	struct arm_smccc_1_2_regs regs = {
 		SMC_RMI_RTT_UNPROT_MAP, rd, base, top, flags, oaddr
 	};
-	long ret = rmi_sro_execute(&regs);
+	long ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
@@ -454,7 +454,7 @@ static inline long rmi_rtt_set_ripas(unsigned long rd, unsigned long rec,
 	struct arm_smccc_1_2_regs regs = {
 		SMC_RMI_RTT_SET_RIPAS, rd, rec, base, top
 	};
-	long ret = rmi_sro_execute(&regs);
+	long ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
@@ -489,7 +489,7 @@ static inline long rmi_rtt_unprot_unmap(unsigned long rd,
 	struct arm_smccc_1_2_regs regs = {
 		SMC_RMI_RTT_UNPROT_UNMAP, rd, base, top, flags, oaddr
 	};
-	long ret = rmi_sro_execute(&regs);
+	long ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS) {
 		if (out_top)

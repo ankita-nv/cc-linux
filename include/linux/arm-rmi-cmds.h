@@ -18,36 +18,43 @@ struct rmi_sro_state {
 	struct arm_smccc_1_2_regs regs;
 	unsigned long addr_count;
 	unsigned long addr_list[RMI_MAX_ADDR_LIST];
+	unsigned long addr_flags[RMI_MAX_ADDR_LIST];
 };
 
 unsigned long rmi_feat_reg(unsigned long id);
 
-int rmi_delegate_range(phys_addr_t phys, unsigned long size,
-		       phys_addr_t *out_phys);
-int rmi_undelegate_range(phys_addr_t phys, unsigned long size);
+long rmi_delegate_range(phys_addr_t phys, unsigned long size,
+			unsigned long *delegated_size);
+long rmi_undelegate_range(phys_addr_t phys, unsigned long size,
+			  unsigned long *undelegated_size);
 int free_delegated_page(phys_addr_t phys);
 
-static inline int rmi_delegate_page(phys_addr_t phys)
+static inline long rmi_delegate_page(phys_addr_t phys)
 {
 	return rmi_delegate_range(phys, PAGE_SIZE, NULL);
 }
 
-static inline int rmi_undelegate_page(phys_addr_t phys)
+static inline long rmi_undelegate_page(phys_addr_t phys)
 {
-	return rmi_undelegate_range(phys, PAGE_SIZE);
+	return rmi_undelegate_range(phys, PAGE_SIZE, NULL);
 }
 
 bool is_rmi_available(void);
 
-long rmi_sro_memxfer_execute(struct rmi_sro_state *sro, gfp_t gfp);
+unsigned long rmi_sro_execute(struct rmi_sro_state *sro, gfp_t gfp);
+unsigned long rmi_sro_execute_cmd(struct rmi_sro_state *sro,
+				  const struct arm_smccc_1_2_regs *regs,
+				  gfp_t gfp,
+				  struct arm_smccc_1_2_regs *out_regs);
+unsigned long rmi_sro_execute_cmd_alloc(const struct arm_smccc_1_2_regs *regs,
+					gfp_t gfp,
+					struct arm_smccc_1_2_regs *out_regs);
+unsigned long rmi_sro_execute_no_xfer(struct arm_smccc_1_2_regs *regs);
 void rmi_sro_free(struct rmi_sro_state *sro);
-long rmi_sro_execute(struct arm_smccc_1_2_regs *regs);
 
 #define rmi_sro_memxfer_cmd(sro, gfp, ...) ({				\
-	struct rmi_sro_state *__sro = (sro);				\
-	*__sro = (struct rmi_sro_state){ .regs = {__VA_ARGS__} };	\
-	long __ret = rmi_sro_memxfer_execute(__sro, gfp);		\
-	rmi_sro_free(__sro);						\
+	struct arm_smccc_1_2_regs __regs = { __VA_ARGS__ };		\
+	long __ret = rmi_sro_execute_cmd((sro), &__regs, (gfp), NULL);	\
 	__ret;								\
 })
 
@@ -190,7 +197,7 @@ static inline long rmi_granule_range_delegate(unsigned long base,
 	struct arm_smccc_1_2_regs regs = {
 		SMC_RMI_GRANULE_RANGE_DELEGATE, base, top
 	};
-	long ret = rmi_sro_execute(&regs);
+	long ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
@@ -216,7 +223,7 @@ static inline long rmi_granule_range_undelegate(unsigned long base,
 	struct arm_smccc_1_2_regs regs = {
 		SMC_RMI_GRANULE_RANGE_UNDELEGATE, base, top
 	};
-	long ret = rmi_sro_execute(&regs);
+	long ret = rmi_sro_execute_no_xfer(&regs);
 
 	if (ret == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
