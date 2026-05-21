@@ -59,6 +59,9 @@ enum realm_state {
  * @ia_bits: Number of valid Input Address bits in the IPA
  * @stage2_unmapped: The Realm stage-2 mappings have been removed
  * @rtts_destroyed: The non-root RTTs have been torn down
+ * @unmap_desc_buf: Output address list used by range unmap commands
+ * @unmap_desc_pa: Physical address of @unmap_desc_buf
+ * @unmap_desc_cap: Maximum number of descriptors in @unmap_desc_buf
  */
 struct realm {
 	void *rd;
@@ -74,6 +77,9 @@ struct realm {
 	unsigned int ia_bits;
 	bool stage2_unmapped;
 	bool rtts_destroyed;
+	unsigned long *unmap_desc_buf;
+	phys_addr_t unmap_desc_pa;
+	unsigned long unmap_desc_cap;
 };
 
 /**

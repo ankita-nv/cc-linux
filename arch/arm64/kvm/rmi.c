@@ -6,6 +6,7 @@
 #include <uapi/linux/psci.h>
 #include <linux/kvm_host.h>
 #include <linux/overflow.h>
+#include <linux/sort.h>
 
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_mmu.h>
@@ -180,6 +181,94 @@ static int undelegate_range_desc(unsigned long desc)
 		return 0;
 
 	return rmi_undelegate_range(addr, size, NULL);
+}
+
+static int rmi_addr_range_desc_cmp(const void *a, const void *b)
+{
+	unsigned long addr_a = RMI_ADDR_RANGE_ADDR(*(const unsigned long *)a);
+	unsigned long addr_b = RMI_ADDR_RANGE_ADDR(*(const unsigned long *)b);
+
+	if (addr_a < addr_b)
+		return -1;
+	if (addr_a > addr_b)
+		return 1;
+	return 0;
+}
+
+static int undelegate_range_descs(unsigned long *descs, unsigned long count)
+{
+	unsigned long run_start = 0, run_end = 0;
+	bool have_run = false;
+	unsigned long i;
+	int ret;
+
+	if (!count)
+		return 0;
+
+	sort(descs, count, sizeof(*descs), rmi_addr_range_desc_cmp, NULL);
+
+	for (i = 0; i < count; i++) {
+		unsigned long size;
+		phys_addr_t addr;
+
+		ret = rmi_addr_range_desc_decode(descs[i],
+						 RMI_OP_MEM_DELEGATED,
+						 &addr, &size);
+		if (ret)
+			return ret;
+		if (!size)
+			return -EPROTO;
+
+		if (have_run && addr == run_end) {
+			run_end += size;
+			continue;
+		}
+
+		if (have_run) {
+			ret = rmi_undelegate_range(run_start,
+						   run_end - run_start, NULL);
+			if (ret)
+				return ret;
+		}
+
+		run_start = addr;
+		run_end = addr + size;
+		have_run = true;
+	}
+
+	if (!have_run)
+		return 0;
+
+	return rmi_undelegate_range(run_start, run_end - run_start, NULL);
+}
+
+static void realm_alloc_unmap_desc_buf(struct realm *realm)
+{
+	unsigned long *buf;
+
+	if (WARN_ON(realm->unmap_desc_buf))
+		return;
+
+	buf = (unsigned long *)__get_free_page(GFP_KERNEL_ACCOUNT);
+	if (!buf)
+		return;
+
+	realm->unmap_desc_buf = buf;
+	realm->unmap_desc_pa = virt_to_phys(buf);
+	realm->unmap_desc_cap = min_t(unsigned long,
+				      PAGE_SIZE / sizeof(*buf),
+				      FIELD_MAX(RMI_RTT_UNMAP_FLAGS_LIST_COUNT_MASK));
+}
+
+static void realm_free_unmap_desc_buf(struct realm *realm)
+{
+	if (!realm->unmap_desc_buf)
+		return;
+
+	free_page((unsigned long)realm->unmap_desc_buf);
+	realm->unmap_desc_buf = NULL;
+	realm->unmap_desc_pa = 0;
+	realm->unmap_desc_cap = 0;
 }
 
 static phys_addr_t alloc_delegated_granule(struct kvm_mmu_memory_cache *mc)
@@ -655,6 +744,7 @@ static int realm_create_rd(struct kvm *kvm)
 	}
 
 	realm->rd = rd;
+	realm_alloc_unmap_desc_buf(realm);
 	kvm_set_realm_state(kvm, REALM_STATE_NEW);
 
 	return 0;
@@ -675,10 +765,10 @@ free_rd:
 	return r;
 }
 
-static void realm_unmap_private_range(struct kvm *kvm,
-				      unsigned long start,
-				      unsigned long end,
-				      bool may_block)
+static void realm_unmap_private_range_single(struct kvm *kvm,
+					     unsigned long start,
+					     unsigned long end,
+					     bool may_block)
 {
 	struct realm *realm = &kvm->arch.realm;
 	unsigned long rd = virt_to_phys(realm->rd);
@@ -688,7 +778,6 @@ static void realm_unmap_private_range(struct kvm *kvm,
 	for (addr = start; addr < end; addr = next_addr) {
 		unsigned long out_range = 0;
 		unsigned long flags = RMI_ADDR_TYPE_SINGLE;
-		/* TODO: Optimise using RMI_ADDR_TYPE_LIST */
 
 retry:
 		ret = rmi_rtt_data_unmap(rd, addr, end, flags, 0,
@@ -730,6 +819,92 @@ retry:
 
 		ret = undelegate_range_desc(out_range);
 		if (WARN_ON(ret))
+			break;
+
+		if (may_block)
+			cond_resched_rwlock_write(&kvm->mmu_lock);
+	}
+
+	realm_fold_rtt_level(realm, get_start_level(realm) + 1,
+			     start, end);
+}
+
+static void realm_unmap_private_range(struct kvm *kvm,
+				      unsigned long start,
+				      unsigned long end,
+				      bool may_block)
+{
+	struct realm *realm = &kvm->arch.realm;
+	unsigned long rd = virt_to_phys(realm->rd);
+	unsigned long next_addr, addr;
+	unsigned long flags;
+	int ret;
+
+	/*
+	 * Protected unmaps need the PA output set for undelegation. Use a
+	 * Realm-wide LIST buffer to batch the RMM output; mmu_lock serializes
+	 * users of the buffer.
+	 */
+	if (!realm->unmap_desc_buf) {
+		realm_unmap_private_range_single(kvm, start, end, may_block);
+		return;
+	}
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	flags = RMI_ADDR_TYPE_LIST |
+		FIELD_PREP(RMI_RTT_UNMAP_FLAGS_LIST_COUNT_MASK,
+			   realm->unmap_desc_cap);
+
+	for (addr = start; addr < end; addr = next_addr) {
+		unsigned long out_count = 0;
+
+retry:
+		ret = rmi_rtt_data_unmap(rd, addr, end, flags,
+					 realm->unmap_desc_pa, &next_addr,
+					 NULL, &out_count);
+
+		switch (RMI_RETURN_STATUS(ret)) {
+		case RMI_SUCCESS:
+			if (WARN_ON(next_addr <= addr || next_addr > end))
+				return;
+			if (WARN_ON(out_count > realm->unmap_desc_cap))
+				return;
+			if (out_count)
+				realm_fold_rtt_level(realm, RMM_RTT_MAX_LEVEL,
+						     addr, next_addr);
+			break;
+		case RMI_ERROR_RTT: {
+			unsigned long map_size;
+			int err_level = RMI_RETURN_INDEX(ret);
+
+			if (WARN_ON(err_level > KVM_PGTABLE_LAST_LEVEL))
+				return;
+
+			map_size = rmi_rtt_level_mapsize(err_level);
+			if (err_level == KVM_PGTABLE_LAST_LEVEL ||
+			    (IS_ALIGNED(addr, map_size) &&
+			     addr + map_size <= end)) {
+				next_addr = rmi_rtt_next_addr(addr, end,
+							     err_level);
+				break;
+			}
+
+			ret = realm_create_rtt_levels(realm, addr, err_level,
+						      err_level + 1, NULL);
+			if (ret)
+				return;
+			goto retry;
+		}
+		default:
+			WARN_ON(1);
+			return;
+		}
+
+		ret = undelegate_range_descs(realm->unmap_desc_buf, out_count);
+		if (WARN_ONCE(ret,
+			      "RMI: descriptor list undelegate failed: %d\n",
+			      ret))
 			break;
 
 		if (may_block)
@@ -1866,6 +2041,7 @@ void kvm_destroy_realm(struct kvm *kvm)
 	size_t pgd_size = kvm_pgtable_stage2_pgd_size(kvm->arch.mmu.vtcr);
 
 	if (!kvm_realm_is_created(kvm)) {
+		realm_free_unmap_desc_buf(realm);
 		realm_free_sro(realm);
 		return;
 	}
@@ -1899,6 +2075,7 @@ void kvm_destroy_realm(struct kvm *kvm)
 
 	/* Now that the Realm is destroyed, free the entry level RTTs */
 	kvm_free_stage2_pgd(&kvm->arch.mmu);
+	realm_free_unmap_desc_buf(realm);
 	realm_free_sro(realm);
 }
 
