@@ -85,6 +85,9 @@ struct realm {
  * @run: Kernel VA of the RmiRecRun structure shared with the RMM
  * @run_phys: Physical address of @run
  * @sro: A preallocated SRO state context
+ * @psci_complete_pending: Calling REC has a pending RMI_PSCI_COMPLETE
+ * @psci_on_pending: Target REC waits for host to complete CPU_ON
+ * @psci_on_source: Source vCPU whose CPU_ON reserved this target REC
  */
 struct realm_rec {
 	unsigned long mpidr;
@@ -93,6 +96,9 @@ struct realm_rec {
 	struct rec_run *run;
 	phys_addr_t run_phys;
 	struct rmi_sro_state *sro;
+	bool psci_complete_pending;
+	bool psci_on_pending;
+	struct kvm_vcpu *psci_on_source;
 };
 
 void kvm_init_rmi(void);

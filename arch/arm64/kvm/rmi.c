@@ -162,6 +162,22 @@ int realm_psci_complete(struct kvm_vcpu *source, unsigned long status)
 	return 0;
 }
 
+static int kvm_mpidr_to_rmi_rec_mpidr(unsigned long mpidr,
+				      unsigned long *rec_mpidr)
+{
+	unsigned long aff0 = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+
+	if (aff0 & ~0xfUL)
+		return -EINVAL;
+
+	*rec_mpidr = aff0 |
+		     (MPIDR_AFFINITY_LEVEL(mpidr, 1) << 8) |
+		     (MPIDR_AFFINITY_LEVEL(mpidr, 2) << 16) |
+		     (MPIDR_AFFINITY_LEVEL(mpidr, 3) << 24);
+
+	return 0;
+}
+
 static long realm_rtt_create(struct realm *realm,
 			     unsigned long addr,
 			     int level,
@@ -1227,31 +1243,88 @@ static int kvm_complete_ripas_change(struct kvm_vcpu *vcpu)
 static int kvm_rec_complete_psci(struct kvm_vcpu *vcpu)
 {
 	struct rec_run *run = vcpu->arch.rec.run;
-	unsigned long status = PSCI_RET_DENIED;
-	unsigned long ret = vcpu_get_reg(vcpu, 0);
-	int r;
+	struct kvm_vcpu *target = NULL;
+	unsigned long status;
+	unsigned long psci_ret = vcpu_get_reg(vcpu, 0);
+	unsigned long rmi_ret;
+	bool owner = false;
 
 	switch (run->exit.gprs[0]) {
-	case PSCI_0_2_FN64_CPU_ON: {
-		if (ret != PSCI_RET_SUCCESS &&
-		    ret != PSCI_RET_ALREADY_ON)
-			status = PSCI_RET_DENIED;
-		else
-			status = PSCI_RET_SUCCESS;
+	/*
+	 * DEN0137 v2.0-bet3 only requires RMI_PSCI_COMPLETE after
+	 * PSCI_CPU_ON. Other PSCI exits are notifications or RMM-handled
+	 * commands; rec_exit_hvc() only flags psci_complete_pending for
+	 * CPU_ON so this switch can never see anything else.
+	 */
+	case PSCI_0_2_FN_CPU_ON:
+	case PSCI_0_2_FN64_CPU_ON:
+		target = kvm_mpidr_to_vcpu(vcpu->kvm, run->exit.gprs[1]);
+		status = (psci_ret == PSCI_RET_SUCCESS ||
+			  psci_ret == PSCI_RET_ALREADY_ON) ?
+				 PSCI_RET_SUCCESS : PSCI_RET_DENIED;
 		break;
-	}
 	default:
-		return 1;
+		return 0;
 	}
 
-	r = realm_psci_complete(vcpu, status);
-	return r ?: 1;
+	/*
+	 * Concurrent CPU_ON requests to the same target all take a PSCI exit
+	 * and reach this path, but only the source recorded in psci_on_source
+	 * actually reserved the target. A source whose CPU_ON was denied must
+	 * not clear the winner's reservation, otherwise a third caller could
+	 * overwrite the target's reset state before the winner completes.
+	 *
+	 * DEN0137 v2.0-bet3 also forbids a DENIED completion once the target
+	 * REC is runnable, so a denied source that raced the winner reports
+	 * SUCCESS (PSCI ALREADY_ON) instead of DENIED.
+	 */
+	if (target) {
+		spin_lock(&target->arch.mp_state_lock);
+		owner = target->arch.rec.psci_on_source == vcpu;
+		if (!owner)
+			status = kvm_arm_vcpu_stopped(target) ?
+					 PSCI_RET_DENIED : PSCI_RET_SUCCESS;
+		spin_unlock(&target->arch.mp_state_lock);
+	}
+
+	rmi_ret = realm_psci_complete(vcpu, status);
+	if (rmi_ret) {
+		WARN_RATELIMIT(1,
+			       "RMI_PSCI_COMPLETE: vcpu=%u psci=%#lx rmi=%#lx\n",
+			       vcpu->vcpu_id, status, rmi_ret);
+		/*
+		 * KVM_REQ_RMI was already consumed by the caller. Re-arm it so
+		 * a later KVM_RUN retries the completion instead of re-entering
+		 * the REC with the PSCI request still outstanding.
+		 */
+		kvm_make_request(KVM_REQ_RMI, vcpu);
+		return -EINVAL;
+	}
+
+	vcpu->arch.rec.psci_complete_pending = false;
+
+	if (owner) {
+		if (status == PSCI_RET_SUCCESS)
+			kvm_psci_vcpu_on_complete(target);
+		else
+			kvm_psci_vcpu_on_abort(target);
+	}
+
+	return 0;
 }
 
 int kvm_rec_handle_request(struct kvm_vcpu *vcpu)
 {
 	struct realm_rec *rec = &vcpu->arch.rec;
 	u64 esr;
+
+	/*
+	 * REC exit state may still describe the previous PSCI exit after a
+	 * retryable REC_ENTER failure. Drive RMI_PSCI_COMPLETE from KVM-owned
+	 * state so the host completes each PSCI request exactly once.
+	 */
+	if (rec->psci_complete_pending)
+		return kvm_rec_complete_psci(vcpu) ?: 1;
 
 	switch (rec->run->exit.exit_reason) {
 	case RMI_EXIT_SYNC:
@@ -1267,7 +1340,7 @@ int kvm_rec_handle_request(struct kvm_vcpu *vcpu)
 		}
 		break;
 	case RMI_EXIT_PSCI:
-		return kvm_rec_complete_psci(vcpu);
+		break;
 	case RMI_EXIT_RIPAS_CHANGE:
 		return kvm_complete_ripas_change(vcpu);
 	case RMI_EXIT_HOST_CALL:
@@ -1315,6 +1388,7 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 {
 	struct user_pt_regs *vcpu_regs = vcpu_gp_regs(vcpu);
 	unsigned long mpidr = kvm_vcpu_get_mpidr_aff(vcpu);
+	unsigned long rec_mpidr;
 	struct realm *realm = &vcpu->kvm->arch.realm;
 	struct realm_rec *rec = &vcpu->arch.rec;
 	struct rec_params *params;
@@ -1330,6 +1404,10 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	 */
 	if (!vcpu_has_feature(vcpu, KVM_ARM_VCPU_PSCI_0_2))
 		return -EINVAL;
+
+	r = kvm_mpidr_to_rmi_rec_mpidr(mpidr, &rec_mpidr);
+	if (r)
+		return r;
 
 	BUILD_BUG_ON(sizeof(*params) > PAGE_SIZE);
 	BUILD_BUG_ON(sizeof(*rec->run) > PAGE_SIZE);
@@ -1359,7 +1437,7 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 		goto out_free_pages;
 	}
 
-	params->mpidr = mpidr;
+	params->mpidr = rec_mpidr;
 
 	rmi_ret = rmi_rec_create(virt_to_phys(realm->rd), rec->rec_phys,
 				 virt_to_phys(params), rec->sro);
@@ -1399,6 +1477,26 @@ void kvm_destroy_rec(struct kvm_vcpu *vcpu)
 	if (!rec->run) {
 		/* Nothing to do if the VCPU hasn't been finalized */
 		return;
+	}
+
+	/*
+	 * If a CPU_ON completion was pending on this REC, release the target's
+	 * psci_on_pending flag so it isn't wedged in DENIED-for-future-CPU_ON
+	 * state after we destroy the source. The RMM has no spec hook to be
+	 * told the source died; KVM-owned state is the only thing to unwind.
+	 */
+	if (rec->psci_complete_pending) {
+		unsigned long fn = rec->run->exit.gprs[0];
+
+		if (fn == PSCI_0_2_FN_CPU_ON || fn == PSCI_0_2_FN64_CPU_ON) {
+			struct kvm_vcpu *target =
+				kvm_mpidr_to_vcpu(vcpu->kvm,
+						  rec->run->exit.gprs[1]);
+
+			if (target)
+				kvm_psci_vcpu_on_abort(target);
+		}
+		rec->psci_complete_pending = false;
 	}
 
 	if (WARN_ON(rmi_rec_destroy(rec->rec_phys, rec->sro)))

@@ -4,6 +4,7 @@
  */
 
 #include <linux/kvm_host.h>
+#include <uapi/linux/psci.h>
 
 #include <linux/arm-smccc-rmi.h>
 #include <asm/kvm_emulate.h>
@@ -53,13 +54,18 @@ static void rec_exit_sync(struct kvm_vcpu *vcpu)
 static void rec_exit_hvc(struct kvm_vcpu *vcpu)
 {
 	struct realm_rec *rec = &vcpu->arch.rec;
+	unsigned long psci_fn = rec->run->exit.gprs[0];
 	int i;
 
 	for (i = 0; i < REC_RUN_GPRS; i++)
 		vcpu_set_reg(vcpu, i, rec->run->exit.gprs[i]);
-
 	vcpu->arch.fault.esr_el2 = (ESR_ELx_EC_HVC64 << ESR_ELx_EC_SHIFT) |
 				     ESR_ELx_IL;
+
+	if (rec->run->exit.exit_reason == RMI_EXIT_PSCI &&
+	    (psci_fn == PSCI_0_2_FN_CPU_ON ||
+	     psci_fn == PSCI_0_2_FN64_CPU_ON))
+		rec->psci_complete_pending = true;
 }
 
 bool kvm_rec_handle_hvc(struct kvm_vcpu *vcpu, int *ret)

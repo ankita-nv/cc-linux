@@ -41,6 +41,43 @@ static unsigned long kvm_psci_vcpu_suspend(struct kvm_vcpu *vcpu)
 	return PSCI_RET_SUCCESS;
 }
 
+void kvm_psci_vcpu_on_complete(struct kvm_vcpu *vcpu)
+{
+	spin_lock(&vcpu->arch.mp_state_lock);
+	vcpu->arch.rec.psci_on_pending = false;
+	vcpu->arch.rec.psci_on_source = NULL;
+	/*
+	 * Make sure the reset request is observed if the RUNNABLE mp_state is
+	 * observed.
+	 */
+	smp_wmb();
+
+	WRITE_ONCE(vcpu->arch.mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
+	kvm_vcpu_wake_up(vcpu);
+	spin_unlock(&vcpu->arch.mp_state_lock);
+}
+
+/*
+ * Release an accepted-but-not-completed CPU_ON request on @vcpu.
+ *
+ * Used when the RMM declines the CPU_ON via RMI_PSCI_COMPLETE (status !=
+ * SUCCESS), or when the source REC is torn down before issuing the
+ * completion. Without this, target->arch.rec.psci_on_pending would stay
+ * true forever and every future CPU_ON to the same vCPU would be denied.
+ *
+ * Unlike kvm_psci_vcpu_on_complete(), this does NOT flip mp_state to
+ * RUNNABLE: the target stays in its current (typically stopped) state
+ * and the pending-reset request remains queued, to be cancelled by the
+ * normal reset-cancel path if appropriate.
+ */
+void kvm_psci_vcpu_on_abort(struct kvm_vcpu *vcpu)
+{
+	spin_lock(&vcpu->arch.mp_state_lock);
+	vcpu->arch.rec.psci_on_pending = false;
+	vcpu->arch.rec.psci_on_source = NULL;
+	spin_unlock(&vcpu->arch.mp_state_lock);
+}
+
 static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 {
 	struct vcpu_reset_state *reset_state;
@@ -72,6 +109,11 @@ static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 		goto out_unlock;
 	}
 
+	if (vcpu_is_rec(source_vcpu) && vcpu->arch.rec.psci_on_pending) {
+		ret = PSCI_RET_DENIED;
+		goto out_unlock;
+	}
+
 	reset_state = &vcpu->arch.reset_state;
 
 	reset_state->pc = smccc_get_arg2(source_vcpu);
@@ -87,6 +129,20 @@ static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
 
 	reset_state->reset = true;
 	kvm_make_request(KVM_REQ_VCPU_RESET, vcpu);
+
+	if (vcpu_is_rec(source_vcpu)) {
+		/*
+		 * DEN0137 v2.0-bet3 requires RMI_PSCI_COMPLETE to make the target
+		 * REC runnable. Keep the KVM vCPU stopped until the RMM accepts
+		 * the completion, but remember the accepted CPU_ON so another
+		 * caller cannot queue a duplicate request. Remember the
+		 * accepting source so only its RMI_PSCI_COMPLETE may drive
+		 * this target's runnable state.
+		 */
+		vcpu->arch.rec.psci_on_pending = true;
+		vcpu->arch.rec.psci_on_source = source_vcpu;
+		goto out_unlock;
+	}
 
 	/*
 	 * Make sure the reset request is observed if the RUNNABLE mp_state is
