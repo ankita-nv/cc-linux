@@ -763,6 +763,41 @@ static bool realm_fold_rtt_level(struct kvm *kvm, int level,
 	return probe_parent;
 }
 
+static bool realm_unmap_output_is_dense_pages(unsigned long start,
+					      unsigned long end,
+					      unsigned long out_range)
+{
+	unsigned long count;
+
+	if (RMI_ADDR_RANGE_SIZE(out_range) != RMI_ADDR_RANGE_SIZE_PAGE)
+		return false;
+
+	count = RMI_ADDR_RANGE_COUNT(out_range);
+	if (!count)
+		return false;
+
+	return end - start == count * PAGE_SIZE;
+}
+
+static bool realm_unmap_outputs_are_dense_pages(unsigned long start,
+						unsigned long end,
+						unsigned long *descs,
+						unsigned long out_count)
+{
+	unsigned long i, count = 0;
+
+	if (!out_count)
+		return false;
+
+	for (i = 0; i < out_count; i++) {
+		if (RMI_ADDR_RANGE_SIZE(descs[i]) != RMI_ADDR_RANGE_SIZE_PAGE)
+			return false;
+		count += RMI_ADDR_RANGE_COUNT(descs[i]);
+	}
+
+	return count && end - start == count * PAGE_SIZE;
+}
+
 static int realm_destroy_rtts(struct kvm *kvm)
 {
 	struct realm *realm = &kvm->arch.realm;
@@ -1067,7 +1102,8 @@ retry:
 		case RMI_SUCCESS:
 			if (WARN_ON(next_addr <= addr || next_addr > end))
 				return -EPROTO;
-			if (RMI_ADDR_RANGE_COUNT(out_range))
+			if (realm_unmap_output_is_dense_pages(addr, next_addr,
+							      out_range))
 				realm_fold_rtt_level(kvm, RMM_RTT_MAX_LEVEL,
 						     addr, next_addr);
 			break;
@@ -1154,7 +1190,9 @@ retry:
 				return -EPROTO;
 			if (WARN_ON(out_count > realm->unmap_desc_cap))
 				return -EPROTO;
-			if (out_count)
+			if (realm_unmap_outputs_are_dense_pages(addr, next_addr,
+								realm->unmap_desc_buf,
+								out_count))
 				realm_fold_rtt_level(kvm, RMM_RTT_MAX_LEVEL,
 						     addr, next_addr);
 			break;
