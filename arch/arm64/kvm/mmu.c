@@ -2404,12 +2404,22 @@ out_unlock:
 	return 0;
 }
 
+static bool shared_ipa_fault(struct kvm *kvm, phys_addr_t fault_ipa)
+{
+	gpa_t gpa = kvm_gpa_from_fault(kvm, fault_ipa);
+
+	return (gpa != fault_ipa);
+}
+
 static int user_mem_abort(const struct kvm_s2_fault_desc *s2fd)
 {
+	struct kvm *kvm = s2fd->vcpu->kvm;
 	bool perm_fault = kvm_vcpu_trap_is_permission_fault(s2fd->vcpu);
+	bool realm_shared_fault = false;
 	struct kvm_s2_fault_vma_info s2vi = {};
 	enum kvm_pgtable_prot prot;
 	void *memcache;
+	gpa_t gpa = s2fd->fault_ipa;
 	int ret;
 
 	/*
@@ -2429,21 +2439,45 @@ static int user_mem_abort(const struct kvm_s2_fault_desc *s2fd)
 			return ret;
 	}
 
+	if (kvm_is_realm(kvm)) {
+		realm_shared_fault = shared_ipa_fault(kvm, s2fd->fault_ipa);
+		gpa = kvm_gpa_from_fault(kvm, s2fd->fault_ipa);
+	}
+
 	/*
 	 * Let's check if we will get back a huge page backed by hugetlbfs, or
 	 * get block mapping for device MMIO region.
 	 */
 	ret = kvm_s2_fault_pin_pfn(s2fd, &s2vi);
-	if (ret != 1)
+	if (ret != 1) {
+		if (ret == -EFAULT && realm_shared_fault)
+			kvm_prepare_memory_fault_exit(s2fd->vcpu, gpa, PAGE_SIZE,
+						      kvm_is_write_fault(s2fd->vcpu),
+						      kvm_vcpu_trap_is_exec_fault(s2fd->vcpu),
+						      false);
 		return ret;
+	}
 
 	ret = kvm_s2_fault_compute_prot(s2fd, &s2vi, &prot);
 	if (ret) {
 		kvm_release_page_unused(s2vi.page);
+		if (ret == -EFAULT && realm_shared_fault &&
+		    s2fd->vcpu->run->exit_reason != KVM_EXIT_MEMORY_FAULT)
+			kvm_prepare_memory_fault_exit(s2fd->vcpu, gpa, PAGE_SIZE,
+						      kvm_is_write_fault(s2fd->vcpu),
+						      kvm_vcpu_trap_is_exec_fault(s2fd->vcpu),
+						      false);
 		return ret;
 	}
 
-	return kvm_s2_fault_map(s2fd, &s2vi, prot, memcache);
+	ret = kvm_s2_fault_map(s2fd, &s2vi, prot, memcache);
+	if (ret == -EFAULT && realm_shared_fault &&
+	    s2fd->vcpu->run->exit_reason != KVM_EXIT_MEMORY_FAULT)
+		kvm_prepare_memory_fault_exit(s2fd->vcpu, gpa, PAGE_SIZE,
+					      kvm_is_write_fault(s2fd->vcpu),
+					      kvm_vcpu_trap_is_exec_fault(s2fd->vcpu),
+					      false);
+	return ret;
 }
 
 /* Resolve the access fault by making the page young again. */
@@ -2537,13 +2571,6 @@ int kvm_handle_guest_sea(struct kvm_vcpu *vcpu)
 	}
 
 	return 0;
-}
-
-static bool shared_ipa_fault(struct kvm *kvm, phys_addr_t fault_ipa)
-{
-	gpa_t gpa = kvm_gpa_from_fault(kvm, fault_ipa);
-
-	return (gpa != fault_ipa);
 }
 
 /**
