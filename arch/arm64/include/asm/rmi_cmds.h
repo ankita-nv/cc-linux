@@ -8,6 +8,14 @@
 
 #include <linux/arm-rmi-cmds.h>
 #include <linux/arm-smccc-rmi.h>
+#include <linux/processor.h>
+
+/* Retry temporary RMI_BUSY results, but return RMI_BLOCKED to the caller. */
+#define rmi_smccc(...) do {						\
+	arm_smccc_1_1_invoke(__VA_ARGS__);				\
+	if (RMI_RETURN_STATUS(res.a0) == RMI_BUSY)			\
+		cpu_relax();						\
+} while (RMI_RETURN_STATUS(res.a0) == RMI_BUSY)
 
 /**
  * rmi_rtt_data_map_init() - Create a protected mapping with data contents
@@ -121,7 +129,7 @@ static inline long rmi_psci_complete(unsigned long calling_rec,
 {
 	struct arm_smccc_res res;
 
-	arm_smccc_1_1_invoke(SMC_RMI_PSCI_COMPLETE, calling_rec, status, &res);
+	rmi_smccc(SMC_RMI_PSCI_COMPLETE, calling_rec, status, &res);
 
 	return res.a0;
 }

@@ -39,7 +39,7 @@ int rmi_delegate_range(phys_addr_t phys,
 		ret = rmi_granule_range_delegate(phys, top, &out_top);
 		if (ret == RMI_SUCCESS)
 			phys = out_top;
-		else if (ret == RMI_BUSY || ret == RMI_BLOCKED)
+		else if (ret == RMI_BUSY)
 			cpu_relax();
 		else
 			break;
@@ -63,7 +63,7 @@ int rmi_undelegate_range(phys_addr_t phys,
 		ret = rmi_granule_range_undelegate(phys, top, &out_top);
 		if (ret == RMI_SUCCESS)
 			phys = out_top;
-		else if (ret == RMI_BUSY || ret == RMI_BLOCKED)
+		else if (ret == RMI_BUSY)
 			cpu_relax();
 		else
 			break;
@@ -86,13 +86,17 @@ static void rmi_smccc_invoke(struct arm_smccc_1_2_regs *regs_in,
 	struct arm_smccc_1_2_regs regs = *regs_in;
 	unsigned long status;
 
-	while (1) {
+	/*
+	 * BUSY can make progress without host action, so retry with a CPU
+	 * relaxation hint. BLOCKED depends on another incomplete operation and
+	 * must be returned to the caller rather than spun on here.
+	 */
+	do {
 		arm_smccc_1_2_invoke(&regs, regs_out);
 		status = RMI_RETURN_STATUS(regs_out->a0);
-		if (status != RMI_BUSY && status != RMI_BLOCKED)
-			break;
-		cpu_relax();
-	}
+		if (status == RMI_BUSY)
+			cpu_relax();
+	} while (status == RMI_BUSY);
 }
 
 static void rmi_op_continue(unsigned long sro_handle, unsigned long flags,
