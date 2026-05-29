@@ -1013,6 +1013,9 @@ static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
 	phys_addr_t dst_phys, src_phys;
 	int ret;
 
+	lockdep_assert_held(&kvm->slots_lock);
+	lockdep_assert_held(&kvm->arch.config_lock);
+
 	dst_phys = __pfn_to_phys(dst_pfn);
 	src_phys = __pfn_to_phys(src_pfn);
 
@@ -1510,10 +1513,11 @@ static long populate_region(struct kvm *kvm,
 {
 	long ret = 0;
 
-	mutex_lock(&kvm->slots_lock);
+	lockdep_assert_held(&kvm->slots_lock);
+	lockdep_assert_held(&kvm->arch.config_lock);
+
 	ret = kvm_gmem_populate(kvm, base_gfn, u64_to_user_ptr(uaddr), pages,
 				false, populate_region_cb, &data_flags);
-	mutex_unlock(&kvm->slots_lock);
 
 	return ret;
 }
@@ -1640,6 +1644,8 @@ static int realm_ensure_created(struct kvm *kvm)
 {
 	int ret;
 
+	lockdep_assert_held(&kvm->arch.config_lock);
+
 	switch (kvm_realm_state(kvm)) {
 	case REALM_STATE_NONE:
 		break;
@@ -1661,6 +1667,8 @@ static int set_ripas_of_protected_regions(struct kvm *kvm)
 	struct kvm_memory_slot *memslot;
 	int idx, bkt;
 	int ret = 0;
+
+	lockdep_assert_held(&kvm->arch.config_lock);
 
 	idx = srcu_read_lock(&kvm->srcu);
 
@@ -1695,25 +1703,33 @@ int kvm_arm_rmi_populate(struct kvm *kvm,
 	    !IS_ALIGNED(args->source_uaddr, PAGE_SIZE))
 		return -EINVAL;
 
-	ret = realm_ensure_created(kvm);
-	if (ret)
-		return ret;
-
 	if (args->flags & KVM_ARM_RMI_POPULATE_FLAGS_MEASURE)
 		data_flags |= RMI_MEASURE_CONTENT;
+
+	mutex_lock(&kvm->slots_lock);
+	mutex_lock(&kvm->arch.config_lock);
+
+	ret = realm_ensure_created(kvm);
+	if (ret)
+		goto out_unlock;
 
 	pages_populated = populate_region(kvm, gpa_to_gfn(ipa_start),
 					  args->size >> PAGE_SHIFT,
 					  args->source_uaddr, data_flags);
 
-	if (pages_populated < 0)
-		return pages_populated;
+	if (pages_populated < 0) {
+		ret = pages_populated;
+		goto out_unlock;
+	}
 
 	args->size -= pages_populated << PAGE_SHIFT;
 	args->source_uaddr += pages_populated << PAGE_SHIFT;
 	args->base += pages_populated << PAGE_SHIFT;
 
-	return 0;
+out_unlock:
+	mutex_unlock(&kvm->arch.config_lock);
+	mutex_unlock(&kvm->slots_lock);
+	return ret;
 }
 
 static int kvm_complete_ripas_change(struct kvm_vcpu *vcpu)
