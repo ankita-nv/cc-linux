@@ -99,7 +99,7 @@ static inline long rmi_rtt_data_map(unsigned long rd,
 
 	ret = rmi_sro_execute_no_xfer(&regs);
 
-	if (ret == RMI_SUCCESS && out_top)
+	if (ret >= 0 && RMI_RETURN_STATUS(ret) == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
 
 	return ret;
@@ -136,7 +136,7 @@ static inline long rmi_rtt_data_unmap(unsigned long rd,
 
 	ret = rmi_sro_execute_no_xfer(&regs);
 
-	if (ret == RMI_SUCCESS) {
+	if (ret >= 0 && RMI_RETURN_STATUS(ret) == RMI_SUCCESS) {
 		if (out_top)
 			*out_top = regs.a1;
 		if (out_range)
@@ -198,24 +198,28 @@ static inline long rmi_realm_activate(unsigned long rd)
 static inline long rmi_realm_create(unsigned long rd, unsigned long params,
 				    struct rmi_sro_state *sro)
 {
-	return rmi_sro_memxfer_cmd(sro, GFP_KERNEL,
-				   SMC_RMI_REALM_CREATE, rd, params);
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_REALM_CREATE, rd, params
+	};
+
+	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
 }
 
 /**
  * rmi_realm_terminate() - Terminate a realm
  * @rd: PA of the RD
- * @sro: Preallocated SRO context to be used
  *
  * Terminates a realm, moving it into a ZOMBIE state
  *
  * Return: 0 on success, positive RMI result code or negative Linux error code
  */
-static inline long rmi_realm_terminate(unsigned long rd,
-				       struct rmi_sro_state *sro)
+static inline long rmi_realm_terminate(unsigned long rd)
 {
-	return rmi_sro_memxfer_cmd(sro, GFP_KERNEL,
-				   SMC_RMI_REALM_TERMINATE, rd);
+	struct arm_smccc_1_2_regs regs = {
+		SMC_RMI_REALM_TERMINATE, rd
+	};
+
+	return rmi_sro_execute_no_xfer(&regs);
 }
 
 /**
@@ -230,8 +234,11 @@ static inline long rmi_realm_terminate(unsigned long rd,
 static inline long rmi_realm_destroy(unsigned long rd,
 				     struct rmi_sro_state *sro)
 {
-	return rmi_sro_memxfer_cmd(sro, GFP_KERNEL,
-				   SMC_RMI_REALM_DESTROY, rd);
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_REALM_DESTROY, rd
+	};
+
+	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
 }
 
 /**
@@ -251,15 +258,11 @@ static inline long rmi_rec_create(unsigned long rd,
 				  unsigned long params,
 				  struct rmi_sro_state *sro)
 {
-	long ret;
-
-	*sro = (struct rmi_sro_state){.regs = {
+	sro->regs = (struct arm_smccc_1_2_regs){
 		SMC_RMI_REC_CREATE, rd, rec, params
-	}};
-	ret = rmi_sro_execute(sro, GFP_KERNEL);
-	rmi_sro_free(sro);
+	};
 
-	return ret;
+	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
 }
 
 /**
@@ -274,7 +277,11 @@ static inline long rmi_rec_create(unsigned long rd,
 static inline long rmi_rec_destroy(unsigned long rec,
 				   struct rmi_sro_state *sro)
 {
-	return rmi_sro_memxfer_cmd(sro, GFP_KERNEL, SMC_RMI_REC_DESTROY, rec);
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_REC_DESTROY, rec
+	};
+
+	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
 }
 
 /**
@@ -342,12 +349,10 @@ static inline long rmi_rtt_destroy(unsigned long rd,
 	};
 	long ret = rmi_sro_execute_no_xfer(&regs);
 
-	if (ret == RMI_SUCCESS) {
-		if (out_rtt)
-			*out_rtt = regs.a1;
-		if (out_top)
-			*out_top = regs.a2;
-	}
+	if (ret == RMI_SUCCESS && out_rtt)
+		*out_rtt = regs.a1;
+	if (ret >= 0 && out_top)
+		*out_top = regs.a2;
 
 	return ret;
 }
@@ -397,7 +402,7 @@ static inline long rmi_rtt_init_ripas(unsigned long rd, unsigned long base,
 	};
 	long ret = rmi_sro_execute_no_xfer(&regs);
 
-	if (ret == RMI_SUCCESS && out_top)
+	if (ret >= 0 && out_top)
 		*out_top = regs.a1;
 
 	return ret;
@@ -428,7 +433,7 @@ static inline long rmi_rtt_unprot_map(unsigned long rd,
 	};
 	long ret = rmi_sro_execute_no_xfer(&regs);
 
-	if (ret == RMI_SUCCESS && out_top)
+	if (ret >= 0 && RMI_RETURN_STATUS(ret) == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
 
 	return ret;
@@ -456,7 +461,7 @@ static inline long rmi_rtt_set_ripas(unsigned long rd, unsigned long rec,
 	};
 	long ret = rmi_sro_execute_no_xfer(&regs);
 
-	if (ret == RMI_SUCCESS && out_top)
+	if (ret >= 0 && out_top)
 		*out_top = regs.a1;
 
 	return ret;
@@ -491,7 +496,7 @@ static inline long rmi_rtt_unprot_unmap(unsigned long rd,
 	};
 	long ret = rmi_sro_execute_no_xfer(&regs);
 
-	if (ret == RMI_SUCCESS) {
+	if (ret >= 0 && RMI_RETURN_STATUS(ret) == RMI_SUCCESS) {
 		if (out_top)
 			*out_top = regs.a1;
 		if (out_range)

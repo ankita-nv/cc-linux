@@ -6,6 +6,10 @@
 #include <linux/arm-rmi-cmds.h>
 #include <linux/cpufeature.h>
 #include <linux/memblock.h>
+#include <linux/mm.h>
+#include <linux/mmzone.h>
+#include <linux/numa.h>
+#include <linux/overflow.h>
 #include <linux/processor.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
@@ -69,7 +73,6 @@ long rmi_delegate_range(phys_addr_t phys, unsigned long size,
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(rmi_delegate_range);
 
 long rmi_undelegate_range(phys_addr_t phys, unsigned long size,
 			  unsigned long *undelegated_size)
@@ -105,7 +108,6 @@ long rmi_undelegate_range(phys_addr_t phys, unsigned long size,
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(rmi_undelegate_range);
 
 /*
  * Free an allocation after range delegation failed. The delegated prefix must
@@ -139,9 +141,201 @@ static void rmi_free_failed_delegation(void *virt, unsigned long size,
 		free_pages_exact(virt, size);
 }
 
-static bool rmi_op_mem_needs_delegation(unsigned long flags)
+static unsigned long rmi_sro_allocatable_pages(unsigned long entry)
 {
-	return RMI_OP_MEM_FLAGS_STATE(flags) != RMI_OP_MEM_UNDELEGATED;
+	unsigned long bsize = RMI_ADDR_RANGE_SIZE(entry);
+	unsigned long count = RMI_ADDR_RANGE_COUNT(entry);
+	unsigned long nr_pages;
+
+	if (!count)
+		return 0;
+
+	nr_pages = count *
+		   (RMI_ADDR_BSIZE_BYTES(bsize) >> PAGE_SHIFT);
+	if ((nr_pages - 1) > FIELD_MAX(RMI_ADDR_RANGE_COUNT_MASK))
+		return 0;
+
+	return nr_pages;
+}
+
+/*
+ * Ensure at least @min undelegated granules are cached in sro->addr_list[], up
+ * to @capacity, preferring allocations from @nid. Already-cached undelegated
+ * granules count towards the target, so only the shortfall is allocated. The
+ * donate path's existing cached-entry matching picks the entries up without any
+ * extra mechanism, and delegates them (or not) based on the donation request's
+ * RmiOpMemState. Must run outside atomic context.
+ *
+ * Allocates the shortfall in large contiguous chunks (up to MAX_ORDER_NR_PAGES)
+ * and stores each as one addr_list entry with size = PAGE (so the count is
+ * always in pages), marked UNDELEGATED. The chunks are cached Non-secure; the
+ * PAS transition is deferred to donate time (see rmi_op_mem_needs_delegation()),
+ * so a donation that requires Non-secure memory is handed the cached page as-is
+ * while one that requires delegation transitions it then. Each cached entry is
+ * a complete Beta3 RmiAddrRangeDesc containing its block size and memory state.
+ *
+ * Best-effort: if capacity or allocation limits the count, whatever was
+ * successfully stored is still useful; the donate path falls back to fresh
+ * allocation for the rest.
+ */
+int rmi_sro_topup_node(struct rmi_sro_state *sro, unsigned long capacity,
+		       unsigned long min, int nid)
+{
+	unsigned long available = 0;
+	unsigned long max_chunk;
+	unsigned long total = 0;
+	unsigned long nr_pages;
+
+	/*
+	 * Count cached undelegated memory that rmi_sro_alloc() can consume.
+	 * Descriptor counts are in units of the architected block size, and the
+	 * remainder after one page is consumed must fit one PAGE descriptor.
+	 */
+	for (unsigned long i = 0; i < sro->addr_count; i++) {
+		unsigned long entry = sro->addr_list[i];
+
+		if (RMI_ADDR_RANGE_STATE(entry) != RMI_OP_MEM_UNDELEGATED)
+			continue;
+
+		available += rmi_sro_allocatable_pages(entry);
+	}
+
+	if (available >= min || available >= capacity)
+		return 0;
+
+	nr_pages = capacity - available;
+	if ((!nr_pages) || (sro->addr_count >= RMI_MAX_ADDR_LIST))
+		return 0;
+
+	max_chunk = min_t(unsigned long, MAX_ORDER_NR_PAGES,
+			  FIELD_MAX(RMI_ADDR_RANGE_COUNT_MASK));
+
+	while ((total < nr_pages) && (sro->addr_count < RMI_MAX_ADDR_LIST)) {
+		unsigned long chunk;
+		unsigned int order;
+		phys_addr_t phys;
+		struct page *page;
+
+		/*
+		 * Allocate a power-of-two chunk, capped by the buddy allocator
+		 * and the address-range count field used for cached PAGE blocks.
+		 * A power-of-two size keeps the buddy allocation naturally
+		 * aligned to its size. Prefer @nid, then split the order
+		 * allocation so cached pages can later be freed one by one after
+		 * partial donation.
+		 */
+		chunk = min(nr_pages - total, max_chunk);
+		chunk = rounddown_pow_of_two(chunk);
+		order = ilog2(chunk);
+		page = alloc_pages_node(nid,
+					GFP_KERNEL_ACCOUNT | __GFP_ZERO |
+					__GFP_NORETRY | __GFP_NOWARN,
+					order);
+		if (!page)
+			break;
+		split_page(page, order);
+		phys = page_to_phys(page);
+
+		/*
+		 * Cache the chunk UNDELEGATED (Non-secure). The PAS transition,
+		 * if the donation requires one, is performed at donate time
+		 * based on the request's RmiOpMemState
+		 * (rmi_op_mem_needs_delegation()). Stored as one contiguous
+		 * PAGE-block descriptor (count is in pages) so the donate path
+		 * can reuse it.
+		 */
+		sro->addr_list[sro->addr_count] =
+			RMI_ADDR_RANGE_DESC(phys, RMI_ADDR_RANGE_SIZE_PAGE,
+					    chunk, RMI_OP_MEM_UNDELEGATED);
+		sro->addr_count++;
+		total += chunk;
+	}
+
+	return total ? 0 : -ENOMEM;
+}
+/*
+ * Allocate one delegated page for RMM use.
+ *
+ * First try to pop a page from @sro's hot list (when an SRO is attached),
+ * accepting either a delegated or an undelegated cached entry. After carving
+ * one page, describe the remainder in PAGE units. A remainder converted from
+ * a larger block size is non-contiguous. As the caller needs a delegated page,
+ * a page taken from an undelegated entry is delegated before it is returned
+ * (and freed if that delegation fails).
+ *
+ * On a hot-list miss - or when @sro is NULL - fall back to allocating a fresh
+ * zeroed page with @gfp and delegating it to the RMM.
+ *
+ * Returns the physical address or PHYS_ADDR_MAX on failure. The caller takes
+ * ownership and is responsible for undelegation + free.
+ */
+phys_addr_t rmi_sro_alloc(struct rmi_sro_state *sro, gfp_t gfp)
+{
+	phys_addr_t phys;
+	void *virt;
+
+	/* Find the first cached entry in the delegated or undelegated state. */
+	for (unsigned long i = 0; sro && i < sro->addr_count; i++) {
+		unsigned long entry, new_count, nr_pages, state;
+		phys_addr_t new_phys;
+
+		entry = sro->addr_list[i];
+		state = RMI_ADDR_RANGE_STATE(entry);
+		if (state != RMI_OP_MEM_DELEGATED &&
+		    state != RMI_OP_MEM_UNDELEGATED)
+			continue;
+
+		nr_pages = rmi_sro_allocatable_pages(entry);
+		if (!nr_pages)
+			continue;
+
+		/* Hand out the first page of the entry to the caller. */
+		phys = RMI_ADDR_RANGE_ADDR(entry);
+
+		if (nr_pages == 1) {
+			/* Last page in entry: remove by swap with tail. */
+			sro->addr_count--;
+			swap(sro->addr_list[sro->addr_count],
+			     sro->addr_list[i]);
+		} else {
+			new_phys = phys + PAGE_SIZE;
+			new_count = nr_pages - 1;
+
+			sro->addr_list[i] =
+				RMI_ADDR_RANGE_DESC(new_phys,
+						    RMI_ADDR_RANGE_SIZE_PAGE,
+						    new_count, state);
+		}
+
+		/* Delegated entry is ready; undelegated must be delegated first. */
+		if (state != RMI_OP_MEM_UNDELEGATED)
+			return phys;
+
+		virt = phys_to_virt(phys);
+		goto delegate;
+	}
+
+	/*
+	 * Hot-list miss (or no SRO): allocate a fresh zeroed page and delegate
+	 * it to the RMM.
+	 */
+	virt = (void *)__get_free_page(gfp | __GFP_ZERO | __GFP_ACCOUNT);
+	if (!virt)
+		return PHYS_ADDR_MAX;
+
+delegate:
+	phys = virt_to_phys(virt);
+	if (rmi_delegate_page(phys)) {
+		free_page((unsigned long)virt);
+		return PHYS_ADDR_MAX;
+	}
+
+	return phys;
+}
+
+static bool rmi_op_mem_needs_delegation(unsigned long state)
+{
+	return state != RMI_OP_MEM_UNDELEGATED;
 }
 
 static void rmi_smccc_invoke(const struct arm_smccc_1_2_regs *regs_in,
@@ -171,28 +365,53 @@ static void rmi_smccc_invoke(const struct arm_smccc_1_2_regs *regs_in,
 	} while (status == RMI_BUSY);
 }
 
-static void rmi_sro_free_entry(unsigned long entry, unsigned long flags)
+/*
+ * Return a contiguous host-owned range to the page allocator. The RMM can hand
+ * back memory that is not available to the page allocator, such as a no-map
+ * range without a struct page or a memblock-reserved range. Freeing the former
+ * faults on the unpopulated vmemmap; freeing the latter corrupts the allocator.
+ * Such ranges are returned whole, so if any part is no-map or reserved, leak
+ * the entire range rather than free it; otherwise free it in one shot.
+ */
+static void rmi_free_host_range(phys_addr_t phys, unsigned long size)
+{
+	if (!size)
+		return;
+
+	if (!memblock_is_region_memory(phys, size) ||
+	    !memblock_is_map_memory(phys) ||
+	    (!pfn_valid(PHYS_PFN(phys))) ||
+	    (!pfn_valid(PHYS_PFN(phys + size - 1))) ||
+	    memblock_is_region_reserved(phys, size)) {
+		pr_warn_ratelimited("rmi: leak reserved range phys=%pa size=0x%lx\n",
+				    &phys, size);
+		return;
+	}
+
+	free_pages_exact(phys_to_virt(phys), size);
+}
+
+static void rmi_sro_free_entry(unsigned long entry)
 {
 	unsigned long addr = RMI_ADDR_RANGE_ADDR(entry);
-	unsigned long bsize = RMI_OP_MEM_FLAGS_BSIZE(flags);
+	unsigned long bsize = RMI_ADDR_RANGE_SIZE(entry);
 	unsigned long count = RMI_ADDR_RANGE_COUNT(entry);
+	unsigned long state = RMI_ADDR_RANGE_STATE(entry);
 	unsigned long size = RMI_ADDR_BSIZE_BYTES(bsize) * count;
 	long ret;
 
-	if (rmi_op_mem_needs_delegation(flags)) {
+	if (rmi_op_mem_needs_delegation(state)) {
 		unsigned long undelegated_size = 0;
 
 		ret = rmi_undelegate_range(addr, size, &undelegated_size);
 		if (WARN_ONCE(ret != RMI_SUCCESS,
 			      "RMI: failed SRO entry undelegate: %ld\n", ret)) {
 			/* Leak the still-delegated tail. */
-			if (undelegated_size)
-				free_pages_exact(phys_to_virt(addr),
-						 undelegated_size);
+			rmi_free_host_range(addr, undelegated_size);
 			return;
 		}
 	}
-	free_pages_exact(phys_to_virt(addr), size);
+	rmi_free_host_range(addr, size);
 }
 
 static int rmi_sro_ensure_capacity(struct rmi_sro_state *sro,
@@ -209,8 +428,7 @@ static int rmi_sro_ensure_capacity(struct rmi_sro_state *sro,
 	/* Make room by dropping cached entries that are still host-owned. */
 	while (count > (RMI_MAX_ADDR_LIST - sro->addr_count)) {
 		sro->addr_count--;
-		rmi_sro_free_entry(sro->addr_list[sro->addr_count],
-				   sro->addr_flags[sro->addr_count]);
+		rmi_sro_free_entry(sro->addr_list[sro->addr_count]);
 	}
 
 	return 0;
@@ -226,13 +444,13 @@ static int rmi_sro_ensure_capacity(struct rmi_sro_state *sro,
  * leak the range.
  */
 static void rmi_sro_free_donated_tail(phys_addr_t phys, unsigned long size,
-				      unsigned long flags)
+				      unsigned long state)
 {
 	unsigned long undelegated_size = 0;
 	unsigned long off;
 	long ret;
 
-	if (rmi_op_mem_needs_delegation(flags)) {
+	if (rmi_op_mem_needs_delegation(state)) {
 		ret = rmi_undelegate_range(phys, size, &undelegated_size);
 		if (WARN_ONCE(ret != RMI_SUCCESS,
 			      "RMI: failed donated tail undelegate: %ld\n", ret)) {
@@ -246,30 +464,12 @@ static void rmi_sro_free_donated_tail(phys_addr_t phys, unsigned long size,
 		__free_page(phys_to_page(phys + off));
 }
 
-static unsigned long rmi_sro_cache_entry_flags(unsigned long flags,
-					       phys_addr_t phys,
-					       unsigned long count)
+static bool rmi_sro_cache_entry_matches(unsigned long entry,
+					unsigned long bsize,
+					unsigned long state)
 {
-	unsigned long entry_flags;
-	unsigned long block_size;
-
-	entry_flags = flags & ~RMI_OP_MEM_FLAGS_CONTIG_MASK;
-	block_size = RMI_ADDR_BSIZE_BYTES(RMI_OP_MEM_FLAGS_BSIZE(entry_flags));
-	if (!block_size)
-		return entry_flags;
-
-	if (is_power_of_2(count) && IS_ALIGNED(phys, block_size * count))
-		entry_flags |= RMI_OP_MEM_FLAGS_CONTIG_MASK;
-
-	return entry_flags;
-}
-
-static bool rmi_sro_cache_entry_matches(unsigned long entry_flags,
-					unsigned long flags)
-{
-	unsigned long mask = ~RMI_OP_MEM_FLAGS_CONTIG_MASK;
-
-	return (entry_flags & mask) == (flags & mask);
+	return RMI_ADDR_RANGE_SIZE(entry) == bsize &&
+	       RMI_ADDR_RANGE_STATE(entry) == state;
 }
 
 /*
@@ -279,23 +479,17 @@ static bool rmi_sro_cache_entry_matches(unsigned long entry_flags,
  */
 static void rmi_sro_cache_donated_tail(struct rmi_sro_state *sro,
 				       phys_addr_t phys, unsigned long size,
-				       unsigned long flags)
+				       unsigned long state)
 {
 	unsigned long max_count = FIELD_MAX(RMI_ADDR_RANGE_COUNT_MASK);
 	unsigned long nr_pages = size >> PAGE_SHIFT;
-	unsigned long tail_flags;
-
-	tail_flags = flags & ~RMI_OP_MEM_FLAGS_BSIZE_MASK;
-	tail_flags |= FIELD_PREP(RMI_OP_MEM_FLAGS_BSIZE_MASK,
-				 RMI_ADDR_RANGE_SIZE_PAGE);
 
 	while (nr_pages && (sro->addr_count < RMI_MAX_ADDR_LIST)) {
 		unsigned long count = min(nr_pages, max_count);
 
 		sro->addr_list[sro->addr_count] =
-			RMI_ADDR_RANGE_DESC(phys, count);
-		sro->addr_flags[sro->addr_count] =
-			rmi_sro_cache_entry_flags(tail_flags, phys, count);
+			RMI_ADDR_RANGE_DESC(phys, RMI_ADDR_RANGE_SIZE_PAGE,
+					    count, state);
 		sro->addr_count++;
 
 		phys += count << PAGE_SHIFT;
@@ -303,22 +497,82 @@ static void rmi_sro_cache_donated_tail(struct rmi_sro_state *sro,
 	}
 
 	if (nr_pages)
-		rmi_sro_free_donated_tail(phys, nr_pages << PAGE_SHIFT, flags);
+		rmi_sro_free_donated_tail(phys, nr_pages << PAGE_SHIFT, state);
 }
 
+/*
+ * Find a cached contiguous range in @state which satisfies the requested
+ * block size, count, and alignment. Prefer an exact count; otherwise return
+ * the first larger range which can be split.
+ */
+static long rmi_sro_find_contig_state(struct rmi_sro_state *sro,
+				      unsigned long bsize,
+				      unsigned long block_count,
+				      unsigned long state)
+{
+	unsigned long size = RMI_ADDR_BSIZE_BYTES(bsize) * block_count;
+	long larger = -1;
+
+	for (unsigned long i = 0; i < sro->addr_count; i++) {
+		unsigned long entry = sro->addr_list[i];
+		unsigned long entry_count = RMI_ADDR_RANGE_COUNT(entry);
+
+		if (RMI_ADDR_RANGE_SIZE(entry) != bsize ||
+		    RMI_ADDR_RANGE_STATE(entry) != state ||
+		    entry_count < block_count ||
+		    !IS_ALIGNED(RMI_ADDR_RANGE_ADDR(entry), size))
+			continue;
+
+		if (entry_count == block_count)
+			return i;
+		if (larger < 0)
+			larger = i;
+	}
+
+	return larger;
+}
+
+/*
+ * Select a cached range for a contiguous donation. Prefer memory already in
+ * the requested state. If the request requires delegation and no such range
+ * exists, allow an undelegated range which can be transitioned before use.
+ */
+static long rmi_sro_find_contig(struct rmi_sro_state *sro,
+				unsigned long bsize,
+				unsigned long block_count,
+				unsigned long state)
+{
+	long selected;
+
+	selected = rmi_sro_find_contig_state(sro, bsize, block_count, state);
+	if (selected >= 0 || !rmi_op_mem_needs_delegation(state))
+		return selected;
+
+	return rmi_sro_find_contig_state(sro, bsize, block_count,
+					 RMI_OP_MEM_UNDELEGATED);
+}
+
+/*
+ * Satisfy one contiguous SRO donation. Reuse an exact or larger cached range,
+ * splitting a larger range and transitioning its PAS when required. If the
+ * cache has no suitable range, allocate fresh contiguous memory. Publish one
+ * address-range descriptor to the RMM and preserve any unused donated tail.
+ */
 static int rmi_sro_donate_contig(struct rmi_sro_state *sro,
 				 unsigned long sro_handle,
 				 unsigned long donatereq,
 				 struct arm_smccc_1_2_regs *out_regs,
 				 gfp_t gfp)
 {
-	unsigned long flags = RMI_DONATE_FLAGS(donatereq);
+	unsigned long bsize = RMI_DONATE_BSIZE(donatereq);
 	unsigned long block_count = RMI_DONATE_COUNT(donatereq);
+	unsigned long state = RMI_DONATE_STATE(donatereq);
 	unsigned long size;
 	unsigned long addr_range;
 	unsigned long donated_granules;
 	unsigned long donated_size;
 	unsigned long delegated_size = 0;
+	long selected;
 	int ret;
 	void *virt;
 	phys_addr_t phys;
@@ -338,87 +592,107 @@ static int rmi_sro_donate_contig(struct rmi_sro_state *sro,
 		      block_count, -EPROTO))
 		return -EPROTO;
 
-	size = RMI_ADDR_BSIZE_BYTES(RMI_DONATE_BSIZE(donatereq)) * block_count;
+	/* CONDITIONAL donations are safely satisfied with delegated memory. */
+	if (state == RMI_OP_MEM_CONDITIONAL)
+		state = RMI_OP_MEM_DELEGATED;
 
-	for (int i = 0; i < sro->addr_count; i++) {
-		unsigned long entry = sro->addr_list[i];
-
-		/*
-		 * Contiguous donation requires the base address to be
-		 * aligned to the total donation size per DEN0137 v2.0-bet3.
-		 * The fresh-alloc path below honours this via
-		 * alloc_pages_exact(size), but cached entries may have come
-		 * from RMI_OP_MEM_RECLAIM and the RMM is free to return them at
-		 * any alignment. Reusing a misaligned entry would trip
-		 * RMI_ERROR_INPUT and tear down the SRO context, so skip such
-		 * entries and fall through to a fresh
-		 * allocation instead.
-		 */
-		if (sro->addr_flags[i] == flags &&
-		    RMI_ADDR_RANGE_COUNT(entry) == block_count &&
-		    IS_ALIGNED(RMI_ADDR_RANGE_ADDR(entry), size)) {
-			sro->addr_count--;
-			swap(sro->addr_list[sro->addr_count],
-			     sro->addr_list[i]);
-			swap(sro->addr_flags[sro->addr_count],
-			     sro->addr_flags[i]);
-
-			goto out;
-		}
-	}
-
+	size = RMI_ADDR_BSIZE_BYTES(bsize) * block_count;
 	ret = rmi_sro_ensure_capacity(sro, 1);
 	if (ret)
 		return ret;
+
+	/*
+	 * Prefer an exact same-state range, then a larger same-state range,
+	 * followed by corresponding UNDELEGATED candidates which need a PAS
+	 * transition. A larger range remains active in the cache while its
+	 * aligned prefix occupies the inactive donation slot at @addr_count.
+	 */
+	selected = rmi_sro_find_contig(sro, bsize, block_count, state);
+
+	if (selected >= 0) {
+		unsigned long entry = sro->addr_list[selected];
+		unsigned long entry_count = RMI_ADDR_RANGE_COUNT(entry);
+		bool needs_delegation = RMI_ADDR_RANGE_STATE(entry) != state;
+
+		phys = RMI_ADDR_RANGE_ADDR(entry);
+		if (entry_count == block_count) {
+			sro->addr_count--;
+			swap(sro->addr_list[sro->addr_count],
+			     sro->addr_list[selected]);
+		} else {
+			sro->addr_list[selected] =
+				RMI_ADDR_RANGE_DESC(phys + size, bsize,
+						    entry_count - block_count,
+						    RMI_ADDR_RANGE_STATE(entry));
+		}
+		sro->addr_list[sro->addr_count] =
+			RMI_ADDR_RANGE_DESC(phys, bsize, block_count, state);
+
+		if (needs_delegation &&
+		    rmi_delegate_range(phys, size, &delegated_size)) {
+			rmi_free_failed_delegation(phys_to_virt(phys), size,
+						   delegated_size);
+			return -ENXIO;
+		}
+
+		goto out;
+	}
 
 	virt = alloc_pages_exact(size, gfp);
 	if (!virt)
 		return -ENOMEM;
 	phys = virt_to_phys(virt);
 
-	if (rmi_op_mem_needs_delegation(flags)) {
+	if (rmi_op_mem_needs_delegation(state)) {
 		if (rmi_delegate_range(phys, size, &delegated_size)) {
 			rmi_free_failed_delegation(virt, size, delegated_size);
 			return -ENXIO;
 		}
 	}
 
-	addr_range = RMI_ADDR_RANGE_DESC(phys, block_count);
+	addr_range = RMI_ADDR_RANGE_DESC(phys, bsize, block_count, state);
 	sro->addr_list[sro->addr_count] = addr_range;
-	sro->addr_flags[sro->addr_count] = flags;
 
 out:
 	regs.a2 = virt_to_phys(&sro->addr_list[sro->addr_count]);
 	regs.a3 = 1;
-	regs.a4 = flags;
 	rmi_smccc_invoke(&regs, out_regs);
 
 	donated_granules = out_regs->a1;
+	if (WARN_ON(donated_granules > (size >> PAGE_SHIFT)))
+		donated_granules = size >> PAGE_SHIFT;
 	donated_size = donated_granules << PAGE_SHIFT;
 
 	if (donated_granules == 0) {
 		/* No pages used by the RMM */
 		sro->addr_count++;
-	} else if (donated_size < size) {
-		/* Not all granules used by the RMM. */
+	} else {
+		/* RMM kept the consumed prefix: record it, cache any tail. */
 		phys = RMI_ADDR_RANGE_ADDR(sro->addr_list[sro->addr_count]);
-		rmi_sro_cache_donated_tail(sro, phys + donated_size,
-					   size - donated_size, flags);
+		if (donated_size < size)
+			rmi_sro_cache_donated_tail(sro, phys + donated_size,
+						   size - donated_size, state);
 	}
 
 	return 0;
 }
 
+/*
+ * Satisfy a non-contiguous SRO donation by collecting matching cached ranges,
+ * splitting oversized ranges, and filling any shortfall with fresh one-block
+ * allocations. Submit the resulting descriptor list, track the consumed
+ * prefix, and compact any unconsumed ranges back into the cache.
+ */
 static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 				    unsigned long sro_handle,
 				    unsigned long donatereq,
 				    struct arm_smccc_1_2_regs *out_regs,
 				    gfp_t gfp)
 {
-	unsigned long flags = RMI_DONATE_FLAGS(donatereq);
-	unsigned long block_size =
-		RMI_ADDR_BSIZE_BYTES(RMI_DONATE_BSIZE(donatereq));
+	unsigned long bsize = RMI_DONATE_BSIZE(donatereq);
+	unsigned long block_size = RMI_ADDR_BSIZE_BYTES(bsize);
 	unsigned long block_count = RMI_DONATE_COUNT(donatereq);
+	unsigned long state = RMI_DONATE_STATE(donatereq);
 	unsigned long blocks = 0;
 	unsigned long list_count = 0;
 	unsigned long capacity, donate_blocks;
@@ -433,14 +707,17 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 		sro_handle
 	};
 
+	/* CONDITIONAL donations are safely satisfied with delegated memory. */
+	if (state == RMI_OP_MEM_CONDITIONAL)
+		state = RMI_OP_MEM_DELEGATED;
+
 	/*
-	 * Reuse cached ranges with matching block size and state. The cached
-	 * CONTIG bit is only a local descriptor property, so ignore it here:
-	 * X4 carries the non-contiguous requirement for this donation.
+	 * Reuse cached ranges with matching block size and state. Each Beta3
+	 * address-range descriptor carries both properties; contiguity is a
+	 * property of the donation request rather than of each list entry.
 	 */
 	for (unsigned long i = 0; i < addr_list_start && blocks < block_count; ) {
 		unsigned long entry = sro->addr_list[i];
-		unsigned long entry_flags = sro->addr_flags[i];
 		unsigned long entry_count = RMI_ADDR_RANGE_COUNT(entry);
 		unsigned long remaining = block_count - blocks;
 		phys_addr_t phys = RMI_ADDR_RANGE_ADDR(entry);
@@ -451,7 +728,7 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 		 * match the requested block size and memory state.
 		 */
 		if (!entry_count ||
-		    !rmi_sro_cache_entry_matches(entry_flags, flags) ||
+		    !rmi_sro_cache_entry_matches(entry, bsize, state) ||
 		    !IS_ALIGNED(phys, block_size)) {
 			i++;
 			continue;
@@ -465,8 +742,6 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 			addr_list_start--;
 			swap(sro->addr_list[addr_list_start],
 			     sro->addr_list[i]);
-			swap(sro->addr_flags[addr_list_start],
-			     sro->addr_flags[i]);
 			blocks += entry_count;
 			list_count++;
 			continue;
@@ -479,19 +754,14 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 		 */
 		if (sro->addr_count < RMI_MAX_ADDR_LIST) {
 			sro->addr_list[sro->addr_count] =
-				RMI_ADDR_RANGE_DESC(phys, remaining);
-			sro->addr_flags[sro->addr_count] =
-				rmi_sro_cache_entry_flags(entry_flags, phys,
-							  remaining);
+				RMI_ADDR_RANGE_DESC(phys, bsize, remaining, state);
 			sro->addr_count++;
 
 			phys += remaining * block_size;
 			entry_count -= remaining;
 			sro->addr_list[i] =
-				RMI_ADDR_RANGE_DESC(phys, entry_count);
-			sro->addr_flags[i] =
-				rmi_sro_cache_entry_flags(entry_flags, phys,
-							  entry_count);
+				RMI_ADDR_RANGE_DESC(phys, bsize, entry_count,
+						    state);
 
 			blocks += remaining;
 			list_count++;
@@ -519,15 +789,16 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 
 	/*
 	 * Fill any remaining donation shortfall with freshly allocated
-	 * one-block ranges. These entries already match the requested flags,
-	 * so they can be appended directly to the donation suffix.
+	 * one-block ranges. These descriptors already match the requested size
+	 * and state, so they can be appended directly to the donation suffix.
 	 */
 	while (blocks < donate_blocks) {
 		unsigned long delegated_size = 0;
 		unsigned long addr_range;
-		void *virt = alloc_pages_exact(block_size, gfp);
 		phys_addr_t phys;
+		void *virt;
 
+		virt = alloc_pages_exact(block_size, gfp);
 		if (!virt) {
 			if (blocks)
 				break;
@@ -535,8 +806,7 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 		}
 
 		phys = virt_to_phys(virt);
-
-		if (rmi_op_mem_needs_delegation(flags)) {
+		if (rmi_op_mem_needs_delegation(state)) {
 			if (rmi_delegate_range(phys, block_size,
 					       &delegated_size)) {
 				rmi_free_failed_delegation(virt, block_size,
@@ -547,9 +817,8 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 			}
 		}
 
-		addr_range = RMI_ADDR_RANGE_DESC(phys, 1);
+		addr_range = RMI_ADDR_RANGE_DESC(phys, bsize, 1, state);
 		sro->addr_list[sro->addr_count++] = addr_range;
-		sro->addr_flags[sro->addr_count - 1] = flags;
 		blocks++;
 		list_count++;
 	}
@@ -561,7 +830,6 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 	 */
 	regs.a2 = virt_to_phys(&sro->addr_list[addr_list_start]);
 	regs.a3 = list_count;
-	regs.a4 = flags;
 	rmi_smccc_invoke(&regs, out_regs);
 
 	donated_granules = out_regs->a1;
@@ -587,7 +855,6 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 	 */
 	for (unsigned long i = 0; i < list_count; i++) {
 		unsigned long entry = sro->addr_list[addr_list_start + i];
-		unsigned long entry_flags = sro->addr_flags[addr_list_start + i];
 		unsigned long entry_count = RMI_ADDR_RANGE_COUNT(entry);
 		phys_addr_t phys = RMI_ADDR_RANGE_ADDR(entry);
 
@@ -612,7 +879,7 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 
 			rmi_sro_free_donated_tail(phys + donated_size,
 						  block_size - donated_size,
-						  entry_flags);
+						  state);
 			phys += block_size;
 			entry_count--;
 			partial_granules = 0;
@@ -622,9 +889,7 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 			continue;
 
 		sro->addr_list[cache_pos] =
-			RMI_ADDR_RANGE_DESC(phys, entry_count);
-		sro->addr_flags[cache_pos] =
-			rmi_sro_cache_entry_flags(entry_flags, phys, entry_count);
+			RMI_ADDR_RANGE_DESC(phys, bsize, entry_count, state);
 		cache_pos++;
 	}
 
@@ -640,9 +905,12 @@ static int rmi_sro_donate(struct rmi_sro_state *sro,
 			  gfp_t gfp)
 {
 	unsigned long block_count = RMI_DONATE_COUNT(donatereq);
+	unsigned long state = RMI_DONATE_STATE(donatereq);
 
-	if (WARN_ONCE(!block_count, "RMI: zero donation count: %d\n",
-		      -EPROTO))
+	if (WARN_ONCE(!block_count || state > RMI_OP_MEM_CONDITIONAL ||
+		      (donatereq & ~GENMASK(18, 0)),
+		      "RMI: invalid donation request %#lx: %d\n",
+		      donatereq, -EPROTO))
 		return -EPROTO;
 
 	if (RMI_DONATE_CONTIG(donatereq)) {
@@ -684,9 +952,19 @@ static int rmi_sro_reclaim(struct rmi_sro_state *sro,
 	if (WARN_ON_ONCE(out_regs->a1 > capacity))
 		out_regs->a1 = capacity;
 
-	for (unsigned long i = 0; i < out_regs->a1; i++)
-		sro->addr_flags[sro->addr_count + i] =
-			out_regs->a2 & RMI_OP_MEM_FLAGS_MASK;
+	for (unsigned long i = 0; i < out_regs->a1; i++) {
+		unsigned long idx = sro->addr_count + i;
+		unsigned long entry = sro->addr_list[idx];
+		phys_addr_t phys = RMI_ADDR_RANGE_ADDR(entry);
+		unsigned long range_count = RMI_ADDR_RANGE_COUNT(entry);
+		unsigned long size;
+
+		size = RMI_ADDR_BSIZE_BYTES(RMI_ADDR_RANGE_SIZE(entry)) *
+		       range_count;
+
+		/* The reclaimed range is host-owned again. */
+		rmi_region_untrack(sro, phys, size);
+	}
 
 	sro->addr_count += out_regs->a1;
 
@@ -718,16 +996,17 @@ static bool rmi_sro_mem_xfer_needs_continue(unsigned long memreq,
 
 void rmi_sro_free(struct rmi_sro_state *sro)
 {
-	for (int i = 0; i < sro->addr_count; i++) {
-		unsigned long entry = sro->addr_list[i];
-		unsigned long flags = sro->addr_flags[i];
+	if (!sro)
+		return;
 
-		rmi_sro_free_entry(entry, flags);
+	for (unsigned long i = 0; i < sro->addr_count; i++) {
+		unsigned long entry = sro->addr_list[i];
+
+		rmi_sro_free_entry(entry);
 	}
 
 	sro->addr_count = 0;
 }
-EXPORT_SYMBOL_GPL(rmi_sro_free);
 
 /*
  * Cancel an SRO after the host cannot service its current request.
@@ -782,19 +1061,22 @@ static int rmi_sro_cancel(struct rmi_sro_state *sro, unsigned long sro_handle,
 	}
 }
 
-static unsigned long __rmi_sro_execute(struct rmi_sro_state *sro,
-				       gfp_t gfp,
-				       struct arm_smccc_1_2_regs *out_regs)
+/*
+ * Drive an SRO command to completion. Does NOT free the SRO hot list - the
+ * delegated remainder is left in place so the caller can reuse it across
+ * commands and release it once when the SRO is no longer needed.
+ */
+long rmi_sro_execute(struct rmi_sro_state *sro, gfp_t gfp,
+		     struct arm_smccc_1_2_regs *out_regs)
 {
 	unsigned long sro_handle;
 	struct arm_smccc_1_2_regs regs;
-	struct arm_smccc_1_2_regs *regs_in = &sro->regs;
 	int host_error = 0;
 
 	/* Memory-transferring SROs may wait for host memory. */
 	might_sleep();
 
-	rmi_smccc_invoke(regs_in, &regs);
+	rmi_smccc_invoke(&sro->regs, &regs);
 
 	sro_handle = regs.a1;
 
@@ -803,6 +1085,7 @@ static unsigned long __rmi_sro_execute(struct rmi_sro_state *sro,
 		unsigned long memreq = RMI_RETURN_MEMREQ(regs.a0);
 		int cancel_ret;
 		int ret = 0;
+
 		switch (memreq) {
 		case RMI_OP_MEM_REQ_NONE:
 			rmi_sro_continue(sro_handle, &regs);
@@ -860,46 +1143,11 @@ static unsigned long __rmi_sro_execute(struct rmi_sro_state *sro,
 	if (out_regs)
 		*out_regs = regs;
 
-	return host_error ? host_error : regs.a0;
+	if (host_error)
+		return host_error;
+
+	return regs.a0;
 }
-
-unsigned long rmi_sro_execute(struct rmi_sro_state *sro, gfp_t gfp)
-{
-	return __rmi_sro_execute(sro, gfp, NULL);
-}
-EXPORT_SYMBOL_GPL(rmi_sro_execute);
-
-unsigned long rmi_sro_execute_cmd(struct rmi_sro_state *sro,
-				  const struct arm_smccc_1_2_regs *regs,
-				  gfp_t gfp,
-				  struct arm_smccc_1_2_regs *out_regs)
-{
-	unsigned long ret;
-
-	*sro = (struct rmi_sro_state){ .regs = *regs };
-	ret = __rmi_sro_execute(sro, gfp, out_regs);
-	rmi_sro_free(sro);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(rmi_sro_execute_cmd);
-
-unsigned long rmi_sro_execute_cmd_alloc(const struct arm_smccc_1_2_regs *regs,
-					gfp_t gfp,
-					struct arm_smccc_1_2_regs *out_regs)
-{
-	unsigned long ret;
-	struct rmi_sro_state *sro;
-
-	sro = kmalloc_obj(*sro, gfp);
-	if (!sro)
-		return -ENOMEM;
-
-	ret = rmi_sro_execute_cmd(sro, regs, gfp, out_regs);
-	kfree(sro);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(rmi_sro_execute_cmd_alloc);
 
 /*
  * Cancel a no-transfer SRO after a protocol error. A command driven via
@@ -941,7 +1189,7 @@ static int rmi_sro_cancel_no_xfer(unsigned long sro_handle,
 	return 0;
 }
 
-unsigned long rmi_sro_execute_no_xfer(struct arm_smccc_1_2_regs *regs)
+long rmi_sro_execute_no_xfer(struct arm_smccc_1_2_regs *regs)
 {
 	unsigned long fid = regs->a0;
 	unsigned long sro_handle;
@@ -988,7 +1236,6 @@ unsigned long rmi_sro_execute_no_xfer(struct arm_smccc_1_2_regs *regs)
 
 	return regs->a0;
 }
-EXPORT_SYMBOL_GPL(rmi_sro_execute_no_xfer);
 
 static int rmi_check_version(void)
 {
@@ -1031,7 +1278,6 @@ static int rmi_check_version(void)
 
 static int rmi_read_features(void)
 {
-	/* Negotiating a compatible version makes these registers mandatory. */
 	for (int i = 0; i < RMI_FEAT_REG_COUNT; i++) {
 		if (WARN_ON(rmi_features(i, &rmi_feat_reg_cache[i])))
 			return -EINVAL;
@@ -1040,89 +1286,133 @@ static int rmi_read_features(void)
 	return 0;
 }
 
-static int rmi_configure(void)
+static int rmi_configure(struct rmi_sro_state *sro)
 {
+	struct rmm_config *config __free(free_page) = NULL;
 	unsigned long granule_feature;
-	unsigned long granule_size;
-	struct rmm_config *config;
-	struct rmi_sro_state *sro;
-	long rmi_ret;
-	int ret = 0;
+	unsigned long ret;
 
 	config = (struct rmm_config *)get_zeroed_page(GFP_KERNEL);
 	if (!config)
 		return -ENOMEM;
 
-	sro = kmalloc_obj(*sro, GFP_KERNEL);
-	if (!sro) {
-		ret = -ENOMEM;
-		goto out_free_config;
-	}
-
 	switch (PAGE_SIZE) {
 	case SZ_4K:
-		granule_size = RMI_GRANULE_SIZE_4KB;
+		config->rmi_granule_size = RMI_GRANULE_SIZE_4KB;
 		granule_feature = RMI_FEATURE_REGISTER_1_RMI_GRAN_SZ_4KB;
 		break;
 	case SZ_16K:
-		granule_size = RMI_GRANULE_SIZE_16KB;
+		config->rmi_granule_size = RMI_GRANULE_SIZE_16KB;
 		granule_feature = RMI_FEATURE_REGISTER_1_RMI_GRAN_SZ_16KB;
 		break;
 	case SZ_64K:
-		granule_size = RMI_GRANULE_SIZE_64KB;
+		config->rmi_granule_size = RMI_GRANULE_SIZE_64KB;
 		granule_feature = RMI_FEATURE_REGISTER_1_RMI_GRAN_SZ_64KB;
 		break;
 	default:
-		BUILD_BUG();
+		pr_err("Unsupported PAGE_SIZE for RMM\n");
+		return -EINVAL;
 	}
 
 	if (!(rmi_feat_reg(1) & granule_feature)) {
 		pr_err("RMM does not support %luKB granules\n", PAGE_SIZE >> 10);
-		ret = -ENXIO;
-		goto out_free_sro;
+		return -ENXIO;
 	}
 
-	config->rmi_granule_size = granule_size;
-	config->tracking_region_size = 0;
-
-	rmi_ret = rmi_rmm_config_set(virt_to_phys(config));
-	if (rmi_ret) {
+	ret = rmi_rmm_config_set(virt_to_phys(config));
+	if (ret) {
 		pr_err("RMM config set failed\n");
-		ret = -EINVAL;
-		goto out_free_sro;
+		return -EINVAL;
 	}
 
-	rmi_ret = rmi_rmm_activate(sro);
-	if (rmi_ret) {
+	/*
+	 * Pre-populate the SRO hot list with one max-order buddy chunk of
+	 * delegated granules before activating the RMM, so activation donates
+	 * from a single contiguous allocation rather than many scattered
+	 * per-donate allocs. That keeps the metadata the RMM consumes contiguous
+	 * and the kexec reservation coalesced; the unconsumed remainder stays in
+	 * the hot list and is reused by the GPT L1 creates that follow. Best-
+	 * effort: the donate path falls back to fresh allocation on shortfall.
+	 */
+	rmi_sro_topup(sro, MAX_ORDER_NR_PAGES, MAX_ORDER_NR_PAGES);
+
+	ret = rmi_rmm_activate(sro);
+	if (ret) {
 		pr_err("RMM activate failed\n");
-		ret = rmi_ret < 0 ? rmi_ret : -ENXIO;
+		return -ENXIO;
 	}
 
-out_free_sro:
-	kfree(sro);
-out_free_config:
-	free_page((unsigned long)config);
-	return ret;
+	return 0;
 }
 
 /*
- * Make sure the area is tracked by RMM at FINE granularity.
- * We do not support changing the tracking yet.
+ * For now we set the tracking_region_size to 0 for RMI_RMM_CONFIG_SET().
+ * TODO: Support other tracking sizes (via Kconfig option).
  */
-static int rmi_verify_memory_tracking(phys_addr_t start, phys_addr_t end)
+#ifdef CONFIG_PAGE_SIZE_4KB
+#define RMM_GRANULE_TRACKING_SIZE	SZ_1G
+#elif defined(CONFIG_PAGE_SIZE_16KB)
+#define RMM_GRANULE_TRACKING_SIZE	SZ_32M
+#elif defined(CONFIG_PAGE_SIZE_64KB)
+#define RMM_GRANULE_TRACKING_SIZE	SZ_512M
+#endif
+
+/* Make sure the area is conventional memory tracked at FINE granularity. */
+static int rmi_init_memory_tracking(phys_addr_t start, phys_addr_t end,
+				    struct rmi_sro_state *sro)
 {
 	while (start < end) {
 		unsigned long ret, category, state, next;
+		phys_addr_t region_top;
 
 		ret = rmi_granule_tracking_get(start, end, &category, &state, &next);
-		if (ret != RMI_SUCCESS ||
-		    state != RMI_TRACKING_FINE ||
-		    category != RMI_MEM_CATEGORY_CONVENTIONAL) {
-			/* TODO: Set granule tracking in this case */
-			pr_err("Granule tracking for region isn't fine/conventional: %llx",
-			       start);
+		if (ret != RMI_SUCCESS) {
+			pr_err("RMI: tracking query failed for %pa: ret=0x%lx\n",
+			       &start, ret);
 			return -ENODEV;
 		}
+		if (next <= start || next > end) {
+			pr_err("RMI: invalid tracking query cursor for %pa: next=0x%lx\n",
+			       &start, next);
+			return -ENODEV;
+		}
+		if (category != RMI_MEM_CATEGORY_CONVENTIONAL) {
+			pr_err("RMI: non-conventional tracking region at %pa: category=%lu\n",
+			       &start, category);
+			return -ENODEV;
+		}
+		if (state == RMI_TRACKING_FINE) {
+			start = next;
+			continue;
+		}
+
+		ret = rmi_granule_tracking_set(start,
+				RMI_MEM_CATEGORY_CONVENTIONAL,
+				RMI_TRACKING_FINE, sro);
+		if (ret) {
+			pr_err("RMI: tracking set failed for %pa: state=%lu ret=0x%lx\n",
+			       &start, state, ret);
+			return -ENODEV;
+		}
+
+		/* SET changes one tracking region; verify that exact region. */
+		region_top = min_t(phys_addr_t, start + RMM_GRANULE_TRACKING_SIZE,
+				   end);
+		ret = rmi_granule_tracking_get(start, region_top, &category,
+					       &state, &next);
+		if (ret != RMI_SUCCESS) {
+			pr_err("RMI: tracking verification query failed for %pa: ret=0x%lx\n",
+			       &start, ret);
+			return -ENODEV;
+		}
+		if (next != region_top ||
+		    category != RMI_MEM_CATEGORY_CONVENTIONAL ||
+		    state != RMI_TRACKING_FINE) {
+			pr_err("RMI: tracking verification failed for %pa: category=%lu state=%lu next=0x%lx\n",
+			       &start, category, state, next);
+			return -ENODEV;
+		}
+
 		start = next;
 	}
 
@@ -1133,6 +1423,18 @@ static unsigned long rmi_l0gpt_size(void)
 {
 	return 1UL << (30 + FIELD_GET(RMI_FEATURE_REGISTER_1_L0GPTSZ,
 				      rmi_feat_reg(1)));
+}
+
+/*
+ * Size in bytes of the L1 GPT that describes one rmi_l0gpt_size() region.
+ * Per DEN0137 v2.0-bet3 the GPT encodes a 4-bit GPI per granule, and the GPT
+ * granule size matches the RMM granule (PAGE_SIZE, see rmi_configure()), so
+ * the table needs (rmi_l0gpt_size() / PAGE_SIZE) granules * 4 bits, i.e.
+ * (rmi_l0gpt_size() >> PAGE_SHIFT) / 2 bytes.
+ */
+static unsigned long rmi_l1gpt_size(void)
+{
+	return (rmi_l0gpt_size() >> PAGE_SHIFT) / 2;
 }
 
 static int rmi_query_gpt_info(phys_addr_t base, phys_addr_t top,
@@ -1163,133 +1465,348 @@ static int rmi_query_gpt_info(phys_addr_t base, phys_addr_t top,
 	return 0;
 }
 
-static int rmi_verify_host_memory_tracking(phys_addr_t start, phys_addr_t end)
+static int rmi_query_gpt_par(phys_addr_t addr, unsigned long l0gpt_sz,
+			     unsigned long *state)
 {
+	phys_addr_t top;
+	int ret;
+
+	ret = rmi_query_gpt_info(addr, addr + l0gpt_sz, &top, state);
+	if (ret)
+		return ret;
+
+	if (top != addr + l0gpt_sz)
+		return -EPROTO;
+
+	return 0;
+}
+
+/*
+ * Create one host-allocated L1 GPT, including the explicit backfill flow from
+ * DEN0137 v2.0-bet3 A2.3.9.3. If the first donated L1 GPT lies in another
+ * host PAR which is not yet created, the RMM rejects the target CREATE and
+ * reclaims the donation. Use that returned range to identify PAR_D, create
+ * PAR_D, then retry PAR_T. The contiguous hot-list allocator keeps subsequent
+ * donations in PAR_D, so the donor create is self-describing and the retry is
+ * non-self-describing.
+ */
+static int rmi_create_gpt_l1(phys_addr_t target, unsigned long l0gpt_sz,
+			     unsigned long l1_pages,
+			     struct rmi_sro_state *sro)
+{
+	unsigned long donor_state, target_state;
+	unsigned long entry, status;
+	phys_addr_t donor;
+	long ret;
+
+	ret = rmi_gpt_l1_create(target, sro);
+	if (ret < 0)
+		return ret;
+
+	status = RMI_RETURN_STATUS(ret);
+	if (status == RMI_SUCCESS)
+		return 0;
+	if (status != RMI_ERROR_GPT)
+		goto fail_target;
+
+	/*
+	 * RMI_ERROR_GPT can also mean that another caller created PAR_T.
+	 * Re-read the architectural state before interpreting the reclaimed
+	 * donation as a request for L1GPT backfill.
+	 */
+	ret = rmi_query_gpt_par(target, l0gpt_sz, &target_state);
+	if (ret)
+		return ret;
+	if (target_state == RMI_GPT_PAR_HOST_CREATED)
+		return 0;
+	if (target_state != RMI_GPT_PAR_HOST_NOT_CREATED)
+		return -EPROTO;
+
+	/*
+	 * A strict Beta3 RMM reclaimed the unsuccessful donation as the last
+	 * hot-list entry. It must be the one contiguous, undelegated L1 GPT
+	 * range requested by RMI_GPT_L1_CREATE.
+	 */
+	if (!sro->addr_count)
+		return -EPROTO;
+	entry = sro->addr_list[sro->addr_count - 1];
+	if (RMI_ADDR_RANGE_SIZE(entry) != RMI_ADDR_RANGE_SIZE_PAGE ||
+	    RMI_ADDR_RANGE_COUNT(entry) != l1_pages ||
+	    RMI_ADDR_RANGE_STATE(entry) != RMI_OP_MEM_UNDELEGATED ||
+	    !IS_ALIGNED(RMI_ADDR_RANGE_ADDR(entry), l1_pages << PAGE_SHIFT))
+		return -EPROTO;
+
+	donor = ALIGN_DOWN(RMI_ADDR_RANGE_ADDR(entry), l0gpt_sz);
+	if (donor == target)
+		return -EPROTO;
+
+	/* Make the reclaimed range the donor CREATE's first exact match. */
+	swap(sro->addr_list[0], sro->addr_list[sro->addr_count - 1]);
+
+	ret = rmi_query_gpt_par(donor, l0gpt_sz, &donor_state);
+	if (ret)
+		return ret;
+
+	if (donor_state == RMI_GPT_PAR_HOST_NOT_CREATED) {
+		ret = rmi_gpt_l1_create(donor, sro);
+		if (ret < 0)
+			return ret;
+		status = RMI_RETURN_STATUS(ret);
+		if (status != RMI_SUCCESS) {
+			/* Accept a concurrent successful backfill of PAR_D. */
+			if (status != RMI_ERROR_GPT ||
+			    rmi_query_gpt_par(donor, l0gpt_sz, &donor_state) ||
+			    donor_state != RMI_GPT_PAR_HOST_CREATED) {
+				pr_err("GPT Level1 backfill failed for %pa: 0x%lx\n",
+				       &donor, status);
+				return -ENXIO;
+			}
+		}
+	} else if (donor_state != RMI_GPT_PAR_HOST_CREATED) {
+		return -EPROTO;
+	}
+
+	ret = rmi_gpt_l1_create(target, sro);
+	if (ret < 0)
+		return ret;
+	status = RMI_RETURN_STATUS(ret);
+	if (status == RMI_SUCCESS)
+		return 0;
+
+	/* A racing caller may have completed PAR_T before the retry. */
+	if (status == RMI_ERROR_GPT &&
+	    !rmi_query_gpt_par(target, l0gpt_sz, &target_state) &&
+	    target_state == RMI_GPT_PAR_HOST_CREATED)
+		return 0;
+
+fail_target:
+	pr_err("GPT Level1 create failed for %pa: 0x%lx\n", &target, status);
+	return -ENXIO;
+}
+
+/*
+ * Create self-describing L1 GPTs for every physical address region represented
+ * by the SRO address list before that memory is used as L1 GPT backing. Creating
+ * an L1 GPT can consume, split, or reorder the cached descriptors, so restart
+ * the walk after every successful creation. Cache the last completed target to
+ * avoid repeated GPT_INFO calls for descriptors in the same L0 region.
+ */
+static int rmi_create_self_describing_gpt(struct rmi_sro_state *sro)
+{
+	static phys_addr_t cached_target = PHYS_ADDR_MAX;
 	unsigned long l0gpt_sz = rmi_l0gpt_size();
+	unsigned long l1_pages = PFN_UP(rmi_l1gpt_size());
+	unsigned long i = 0;
 
-	start = ALIGN_DOWN(start, l0gpt_sz);
-	end = ALIGN(end, l0gpt_sz);
-
-	while (start < end) {
-		phys_addr_t state_top;
+	while (i < sro->addr_count) {
+		unsigned long entry = sro->addr_list[i];
+		unsigned long block_size;
+		unsigned long range_size;
+		unsigned long count;
 		unsigned long state;
+		phys_addr_t phys, end;
+		phys_addr_t target;
 		int ret;
 
-		ret = rmi_query_gpt_info(start, end, &state_top, &state);
-		if (ret)
-			return ret;
+		block_size = RMI_ADDR_BSIZE_BYTES(RMI_ADDR_RANGE_SIZE(entry));
+		count = RMI_ADDR_RANGE_COUNT(entry);
+		phys = RMI_ADDR_RANGE_ADDR(entry);
+		if (!count || check_mul_overflow(block_size, count, &range_size))
+			return -EPROTO;
+		end = phys + range_size;
 
-		if (state == RMI_GPT_PAR_HOST_NOT_CREATED ||
-		    state == RMI_GPT_PAR_HOST_CREATED) {
-			ret = rmi_verify_memory_tracking(start, state_top);
+		target = ALIGN_DOWN(phys, l0gpt_sz);
+		end = ALIGN(end, l0gpt_sz);
+		while (target < end) {
+			if (target == cached_target) {
+				target += l0gpt_sz;
+				continue;
+			}
+
+			ret = rmi_query_gpt_par(target, l0gpt_sz, &state);
 			if (ret)
 				return ret;
+
+			if (state == RMI_GPT_PAR_HOST_CREATED) {
+				cached_target = target;
+				target += l0gpt_sz;
+				continue;
+			}
+			if (state != RMI_GPT_PAR_HOST_NOT_CREATED)
+				return -EPROTO;
+
+			ret = rmi_create_gpt_l1(target, l0gpt_sz, l1_pages, sro);
+			if (ret)
+				return ret;
+
+			cached_target = target;
+			/* rmi_create_gpt_l1() may have changed the entire list. */
+			i = 0;
+			break;
 		}
 
-		start = state_top;
+		if (target >= end)
+			i++;
 	}
 
 	return 0;
 }
 
-static int rmi_create_gpts(phys_addr_t start, phys_addr_t end)
+static int rmi_init_metadata(struct rmi_sro_state *sro)
 {
-	struct rmi_sro_state *sro;
 	unsigned long l0gpt_sz = rmi_l0gpt_size();
-	int ret = 0;
-
-	sro = kmalloc_obj(*sro, GFP_KERNEL);
-	if (!sro)
-		return -ENOMEM;
-
-	start = ALIGN_DOWN(start, l0gpt_sz);
-	end = ALIGN(end, l0gpt_sz);
-
-	while (start < end) {
-		phys_addr_t state_top;
-		unsigned long state;
-
-		ret = rmi_query_gpt_info(start, end, &state_top, &state);
-		if (ret)
-			break;
-
-		switch (state) {
-		case RMI_GPT_PAR_RESERVED:
-		case RMI_GPT_PAR_PLAT:
-		case RMI_GPT_PAR_HOST_CREATED:
-			start = state_top;
-			continue;
-		case RMI_GPT_PAR_HOST_NOT_CREATED:
-			break;
-		default:
-			ret = -EPROTO;
-			goto out;
-		}
-
-		while (start < state_top) {
-			long rmi_ret;
-
-			rmi_ret = rmi_gpt_l1_create(start, sro, GFP_KERNEL);
-			if (rmi_ret < 0) {
-				ret = rmi_ret;
-				goto out;
-			}
-			if (RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS) {
-				pr_err("RMI: GPT L1 create failed for %pa: 0x%lx\n",
-				       &start, rmi_ret);
-				ret = -ENXIO;
-				goto out;
-			}
-			start += l0gpt_sz;
-		}
-	}
-
-out:
-	kfree(sro);
-	return ret;
-}
-
-static int rmi_init_metadata(void)
-{
+	unsigned long l1_pages = PFN_UP(rmi_l1gpt_size());
+	unsigned long created_l1 = 0;
+	unsigned long existing_l1 = 0;
+	unsigned long non_host_l0 = 0;
+	struct memblock_region *r;
+	phys_addr_t last_end = 0;
 	phys_addr_t start, end;
-	const struct memblock_region *r;
+	int last_nid = NUMA_NO_NODE;
+	int ret;
 
 	/*
-	 * DEN0137 v2.0-bet3 requires L1 GPT creation to be independent of
-	 * Granule tracking. Create every required host L1 GPT before checking
-	 * that host memory uses fine-grained conventional tracking.
+	 * Query the Beta3 GPT PAR state and create an L1 GPT only
+	 * for host-allocated L0 blocks which do not already have one. Each
+	 * GPT_L1_CREATE donates its own (SRO-decided) granule count, carved from a
+	 * hot list which persists across each NUMA-node run. @last_end dedups L0
+	 * blocks shared with or overlapped by an earlier region. Leave
+	 * platform-owned blocks and existing host L1 GPTs untouched.
+	 *
+	 * DEN0137 v2.0-bet3 A2.3.9.1 requires L1 GPT creation to work before
+	 * Granule tracking is configured, so do not inspect tracking state until
+	 * every required host L1 GPT has been created.
 	 */
+	/* Discard activation leftovers before the NUMA-aware GPT sweep. */
+	rmi_sro_free(sro);
+	last_end = 0;
 	for_each_mem_region(r) {
-		int ret;
+		phys_addr_t state_top;
+		unsigned long state;
+		int nid;
 
-		/* Firmware-reserved NOMAP regions are not usable system RAM. */
 		if (memblock_is_nomap(r))
 			continue;
 
-		start = memblock_region_memory_base_pfn(r) << PAGE_SHIFT;
-		end = memblock_region_memory_end_pfn(r) << PAGE_SHIFT;
-		ret = rmi_create_gpts(start, end);
-		if (ret)
-			return ret;
+		start = ALIGN_DOWN(PFN_PHYS(memblock_region_memory_base_pfn(r)),
+				   l0gpt_sz);
+		end = ALIGN(PFN_PHYS(memblock_region_memory_end_pfn(r)),
+			    l0gpt_sz);
+
+		if (start < last_end)
+			start = last_end;
+		if (start >= end)
+			continue;
+		last_end = end;
+
+		state_top = start;
+		nid = memblock_get_region_node(r);
+		if (memblock_is_hotpluggable(r) || !numa_valid_node(nid))
+			nid = NUMA_NO_NODE;
+
+		do {
+			if (start == state_top) {
+				unsigned long nr_l0;
+
+				ret = rmi_query_gpt_info(start, end, &state_top,
+							 &state);
+				if (ret)
+					return ret;
+
+				nr_l0 = (state_top - start) / l0gpt_sz;
+				switch (state) {
+				case RMI_GPT_PAR_RESERVED:
+				case RMI_GPT_PAR_PLAT:
+					non_host_l0 += nr_l0;
+					start = state_top;
+					continue;
+				case RMI_GPT_PAR_HOST_CREATED:
+					existing_l1 += nr_l0;
+					start = state_top;
+					continue;
+				case RMI_GPT_PAR_HOST_NOT_CREATED:
+					break;
+				default:
+					return -EPROTO;
+				}
+
+				/*
+				 * Keep L1 GPT backing local to fixed memory. For
+				 * hotpluggable memory, use the allocator's default
+				 * node. Drop cached memory before changing nodes.
+				 */
+				if (nid != last_nid) {
+					rmi_sro_free(sro);
+					last_nid = nid;
+				}
+			}
+
+			/* Keep two L1 GPT chunks for Beta3 backfill. */
+			rmi_sro_topup_node(sro, MAX_ORDER_NR_PAGES,
+					    2 * l1_pages, nid);
+
+			ret = rmi_create_self_describing_gpt(sro);
+			if (ret)
+				return ret;
+
+			ret = rmi_query_gpt_par(start, l0gpt_sz, &state);
+			if (ret)
+				return ret;
+			if (state == RMI_GPT_PAR_HOST_NOT_CREATED) {
+				ret = rmi_create_gpt_l1(start, l0gpt_sz,
+							l1_pages, sro);
+				if (ret)
+					return ret;
+			} else if (state != RMI_GPT_PAR_HOST_CREATED) {
+				return -EPROTO;
+			}
+			created_l1++;
+			start += l0gpt_sz;
+		} while (start < end);
 	}
 
 	/*
 	 * The current host implementation supports Realm memory only in
-	 * fine-grained conventional tracking regions. Validate that prerequisite
-	 * only after all required GPTs have been created.
+	 * fine-grained conventional tracking regions. Verify that prerequisite
+	 * after GPT creation, since Beta3 explicitly makes the two management
+	 * mechanisms independent. Skip PARs managed by the platform.
 	 */
+	last_end = 0;
 	for_each_mem_region(r) {
-		int ret;
-
 		if (memblock_is_nomap(r))
 			continue;
 
-		start = memblock_region_memory_base_pfn(r) << PAGE_SHIFT;
-		end = memblock_region_memory_end_pfn(r) << PAGE_SHIFT;
-		ret = rmi_verify_host_memory_tracking(start, end);
-		if (ret)
-			return ret;
+		start = ALIGN_DOWN(PFN_PHYS(memblock_region_memory_base_pfn(r)),
+				   l0gpt_sz);
+		end = ALIGN(PFN_PHYS(memblock_region_memory_end_pfn(r)),
+			    l0gpt_sz);
+
+		if (start < last_end)
+			start = last_end;
+		if (start >= end)
+			continue;
+		last_end = end;
+
+		while (start < end) {
+			phys_addr_t state_top;
+			unsigned long state;
+
+			ret = rmi_query_gpt_info(start, end, &state_top, &state);
+			if (ret)
+				return ret;
+
+			if (state == RMI_GPT_PAR_HOST_NOT_CREATED ||
+			    state == RMI_GPT_PAR_HOST_CREATED) {
+				ret = rmi_init_memory_tracking(start, state_top, sro);
+				if (ret)
+					return ret;
+			}
+			start = state_top;
+		}
 	}
+
+	pr_info("RMI: GPT PARs created=%lu existing=%lu non-host=%lu\n",
+		created_l1, existing_l1, non_host_l0);
 
 	return 0;
 }
@@ -1301,9 +1818,10 @@ bool is_rmi_available(void)
 
 static int __init arm64_init_rmi(void)
 {
+	struct rmi_sro_state *sro;
 	int ret;
 
-	/* Continue without realm support if we can't agree on a version */
+	/* Continue without Realm support if the RMI cannot be initialized. */
 	ret = rmi_check_version();
 	if (ret)
 		return ret;
@@ -1312,17 +1830,23 @@ static int __init arm64_init_rmi(void)
 	if (ret)
 		return ret;
 
-	ret = rmi_configure();
-	if (ret)
-		return ret;
+	sro = kzalloc_obj(*sro, GFP_KERNEL);
+	if (!sro)
+		return -ENOMEM;
 
-	ret = rmi_init_metadata();
+	ret = rmi_configure(sro);
 	if (ret)
-		return ret;
+		goto out_free_sro;
+	ret = rmi_init_metadata(sro);
+	if (ret)
+		goto out_free_sro;
 
 	arm64_rmi_is_available = true;
 	pr_info("RMI configured\n");
 
-	return 0;
+out_free_sro:
+	rmi_sro_free(sro);
+	kfree(sro);
+	return ret;
 }
 subsys_initcall(arm64_init_rmi);

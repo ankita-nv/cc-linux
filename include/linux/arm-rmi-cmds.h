@@ -8,6 +8,7 @@
 
 #include <linux/arm-smccc-rmi.h>
 #include <linux/bug.h>
+#include <linux/numa.h>
 #include <linux/types.h>
 
 #include <asm/page.h>
@@ -17,8 +18,9 @@
 struct rmi_sro_state {
 	struct arm_smccc_1_2_regs regs;
 	unsigned long addr_count;
+	/* Complete DEN0137 v2.0-bet3 RmiAddrRangeDesc entries. */
 	unsigned long addr_list[RMI_MAX_ADDR_LIST];
-	unsigned long addr_flags[RMI_MAX_ADDR_LIST];
+	u16 trackid;
 };
 
 unsigned long rmi_feat_reg(unsigned long id);
@@ -27,6 +29,18 @@ long rmi_delegate_range(phys_addr_t phys, unsigned long size,
 			unsigned long *delegated_size);
 long rmi_undelegate_range(phys_addr_t phys, unsigned long size,
 			  unsigned long *undelegated_size);
+
+int rmi_sro_topup_node(struct rmi_sro_state *sro, unsigned long capacity,
+		       unsigned long min, int nid);
+
+static inline int rmi_sro_topup(struct rmi_sro_state *sro,
+				unsigned long capacity, unsigned long min)
+{
+	return rmi_sro_topup_node(sro, capacity, min, NUMA_NO_NODE);
+}
+
+phys_addr_t rmi_sro_alloc(struct rmi_sro_state *sro, gfp_t gfp);
+
 static inline long rmi_delegate_page(phys_addr_t phys)
 {
 	return rmi_delegate_range(phys, PAGE_SIZE, NULL);
@@ -39,22 +53,10 @@ static inline long rmi_undelegate_page(phys_addr_t phys)
 
 bool is_rmi_available(void);
 
-unsigned long rmi_sro_execute(struct rmi_sro_state *sro, gfp_t gfp);
-unsigned long rmi_sro_execute_cmd(struct rmi_sro_state *sro,
-				  const struct arm_smccc_1_2_regs *regs,
-				  gfp_t gfp,
-				  struct arm_smccc_1_2_regs *out_regs);
-unsigned long rmi_sro_execute_cmd_alloc(const struct arm_smccc_1_2_regs *regs,
-					gfp_t gfp,
-					struct arm_smccc_1_2_regs *out_regs);
-unsigned long rmi_sro_execute_no_xfer(struct arm_smccc_1_2_regs *regs);
+long rmi_sro_execute(struct rmi_sro_state *sro, gfp_t gfp,
+		     struct arm_smccc_1_2_regs *out_regs);
+long rmi_sro_execute_no_xfer(struct arm_smccc_1_2_regs *regs);
 void rmi_sro_free(struct rmi_sro_state *sro);
-
-#define rmi_sro_memxfer_cmd(sro, gfp, ...) ({				\
-	struct arm_smccc_1_2_regs __regs = { __VA_ARGS__ };		\
-	long __ret = rmi_sro_execute_cmd((sro), &__regs, (gfp), NULL);	\
-	__ret;								\
-})
 
 /**
  * rmi_rmm_config_set() - Configure the RMM
@@ -81,7 +83,9 @@ static inline int rmi_rmm_config_set(unsigned long cfg_ptr)
  */
 static inline long rmi_rmm_activate(struct rmi_sro_state *sro)
 {
-	return rmi_sro_memxfer_cmd(sro, GFP_KERNEL, SMC_RMI_RMM_ACTIVATE);
+	sro->regs = (struct arm_smccc_1_2_regs){ SMC_RMI_RMM_ACTIVATE };
+
+	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
 }
 
 /**
@@ -117,6 +121,27 @@ static inline int rmi_granule_tracking_get(unsigned long start,
 }
 
 /**
+ * rmi_granule_tracking_set() - Set a Granule tracking region configuration
+ * @addr: Tracking-region-aligned PA
+ * @category: RmiMemCategory value
+ * @state: RmiTrackingRegionState value
+ * @sro: Preallocated SRO context to be used
+ *
+ * Return: 0 on success, positive RMI result code or negative Linux error code
+ */
+static inline long rmi_granule_tracking_set(unsigned long addr,
+					    unsigned long category,
+					    unsigned long state,
+					    struct rmi_sro_state *sro)
+{
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_GRANULE_TRACKING_SET, addr, category, state
+	};
+
+	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
+}
+
+/**
  * rmi_gpt_info() - Query the L1 GPT state of a physical address range
  * @base: L0GPTSZ-aligned base PA of the target range
  * @top: L0GPTSZ-aligned top PA of the target range
@@ -146,15 +171,17 @@ static inline int rmi_gpt_info(unsigned long base, unsigned long top,
  * rmi_gpt_l1_create() - Create a Level 1 GPT
  * @addr: Base of physical address region described by the L1GPT
  * @sro: Preallocated SRO context to be used
- * @gfp: Allocation flags for SRO memory donation requests
  *
  * Return: 0 on success, positive RMI result code or negative Linux error code
  */
 static inline long rmi_gpt_l1_create(unsigned long addr,
-				     struct rmi_sro_state *sro,
-				     gfp_t gfp)
+				     struct rmi_sro_state *sro)
 {
-	return rmi_sro_memxfer_cmd(sro, gfp, SMC_RMI_GPT_L1_CREATE, addr);
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_GPT_L1_CREATE, addr
+	};
+
+	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
 }
 
 /**
@@ -197,7 +224,7 @@ static inline long rmi_granule_range_delegate(unsigned long base,
 	};
 	long ret = rmi_sro_execute_no_xfer(&regs);
 
-	if (ret == RMI_SUCCESS && out_top)
+	if (ret >= 0 && RMI_RETURN_STATUS(ret) == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
 
 	return ret;
@@ -223,7 +250,7 @@ static inline long rmi_granule_range_undelegate(unsigned long base,
 	};
 	long ret = rmi_sro_execute_no_xfer(&regs);
 
-	if (ret == RMI_SUCCESS && out_top)
+	if (ret >= 0 && RMI_RETURN_STATUS(ret) == RMI_SUCCESS && out_top)
 		*out_top = regs.a1;
 
 	return ret;

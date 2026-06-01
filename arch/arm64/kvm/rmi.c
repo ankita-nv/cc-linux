@@ -318,28 +318,10 @@ static void realm_free_unmap_desc_buf(struct realm *realm)
 	realm->unmap_desc_cap = 0;
 }
 
-static phys_addr_t alloc_delegated_granule(struct kvm_mmu_memory_cache *mc)
+static phys_addr_t alloc_delegated_granule(struct rmi_sro_state *sro,
+					   gfp_t gfp)
 {
-	phys_addr_t phys;
-	void *virt;
-
-	if (mc) {
-		virt = kvm_mmu_memory_cache_alloc(mc);
-	} else {
-		virt = (void *)__get_free_page(GFP_ATOMIC | __GFP_ZERO |
-					       __GFP_ACCOUNT);
-	}
-
-	if (!virt)
-		return PHYS_ADDR_MAX;
-
-	phys = virt_to_phys(virt);
-	if (realm_delegate_range(phys, PAGE_SIZE, NULL)) {
-		free_page((unsigned long)virt);
-		return PHYS_ADDR_MAX;
-	}
-
-	return phys;
+	return rmi_sro_alloc(sro, gfp);
 }
 
 static int realm_free_delegated_page(phys_addr_t phys)
@@ -353,9 +335,9 @@ static int realm_free_delegated_page(phys_addr_t phys)
 	return 0;
 }
 
-static phys_addr_t alloc_rtt(struct kvm_mmu_memory_cache *mc)
+static phys_addr_t alloc_rtt(struct rmi_sro_state *sro)
 {
-	phys_addr_t phys = alloc_delegated_granule(mc);
+	phys_addr_t phys = alloc_delegated_granule(sro, GFP_ATOMIC);
 
 	if (phys != PHYS_ADDR_MAX)
 		kvm_account_pgtable_pages(phys_to_virt(phys), 1);
@@ -446,10 +428,10 @@ static int realm_create_rtt_levels(struct realm *realm,
 				   unsigned long ipa,
 				   int level,
 				   int max_level,
-				   struct kvm_mmu_memory_cache *mc)
+				   struct rmi_sro_state *sro)
 {
 	while (level++ < max_level) {
-		phys_addr_t rtt = alloc_rtt(mc);
+		phys_addr_t rtt = alloc_rtt(sro);
 		int ret;
 
 		if (rtt == PHYS_ADDR_MAX)
@@ -739,11 +721,6 @@ retry:
 		case RMI_SUCCESS: {
 			unsigned long count = RMI_ADDR_RANGE_COUNT(out_range);
 
-			/*
-			 * @next_addr is RMM's out_top: the IPA up to which the
-			 * architecture unmapped (page or block, picked by RMM
-			 * transparently per DEN0137 v2.0-bet3 §B4.5.70).
-			 */
 			if (WARN_ON(next_addr <= addr || next_addr > end))
 				return;
 			if (count)
@@ -769,7 +746,8 @@ retry:
 
 			ret = realm_create_rtt_levels(realm,
 						      addr, err_level,
-						      err_level + 1, NULL);
+						      err_level + 1,
+						      NULL);
 			if (ret) {
 				WARN_ONCE(1,
 					  "RMI: RTT split failed unmapping %#lx: %d\n",
@@ -844,15 +822,19 @@ static int realm_create_rd(struct kvm *kvm)
 	if (!params)
 		return -ENOMEM;
 
-	rd = (void *)__get_free_page(GFP_KERNEL_ACCOUNT);
-	if (!rd)
-		return -ENOMEM;
+	/*
+	 * Pre-warm the SRO hot list during Realm creation (process context,
+	 * outside mmu_lock) so the RD and the Realm's initial RTTs are served
+	 * from pre-delegated entries. Best-effort: a failure just leaves the
+	 * allocators on the per-granule fallback path.
+	 */
+	rmi_sro_topup(realm->sro, SZ_2M >> PAGE_SHIFT,
+		      kvm_mmu_cache_min_pages(&kvm->arch.mmu));
 
-	rd_phys = virt_to_phys(rd);
-	if (realm_delegate_range(rd_phys, PAGE_SIZE, NULL)) {
-		r = -ENXIO;
-		goto free_rd;
-	}
+	rd_phys = alloc_delegated_granule(realm->sro, GFP_KERNEL_ACCOUNT);
+	if (rd_phys == PHYS_ADDR_MAX)
+		return -ENOMEM;
+	rd = phys_to_virt(rd_phys);
 
 	if (realm_delegate_range(kvm->arch.mmu.pgd_phys,
 				 pgd_size, &pgd_delegated_size)) {
@@ -898,12 +880,8 @@ out_undelegate_tables:
 		/* Leak the pages if they cannot be returned */
 		kvm->arch.mmu.pgt = NULL;
 	}
-	if (WARN_ON(realm_undelegate_range(rd_phys, PAGE_SIZE, NULL))) {
-		/* Leak the page if it isn't returned */
-		return r;
-	}
-free_rd:
-	free_page((unsigned long)rd);
+	/* Undelegate + free (leaks on undelegate failure). */
+	realm_free_delegated_page(rd_phys);
 	return r;
 }
 
@@ -955,7 +933,8 @@ retry:
 
 			ret = realm_create_rtt_levels(realm,
 						      addr, err_level,
-						      err_level + 1, NULL);
+						      err_level + 1,
+						      NULL);
 			if (ret) {
 				WARN_ONCE(1,
 					  "RMI: RTT split failed unmapping %#lx: %d\n",
@@ -1042,7 +1021,8 @@ retry:
 
 			ret = realm_create_rtt_levels(realm,
 						      addr, err_level,
-						      err_level + 1, NULL);
+						      err_level + 1,
+						      NULL);
 			if (ret) {
 				WARN_ONCE(1,
 					  "RMI: RTT split failed unmapping %#lx: %d\n",
@@ -1109,7 +1089,8 @@ static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
 		KVM_BUG_ON(level == KVM_PGTABLE_LAST_LEVEL, kvm);
 
 		ret = realm_create_rtt_levels(realm, ipa, level,
-					      KVM_PGTABLE_LAST_LEVEL, NULL);
+					      KVM_PGTABLE_LAST_LEVEL,
+					      realm->sro);
 		if (ret)
 			return ret;
 
@@ -1472,7 +1453,7 @@ retry_check:
  */
 static int realm_map_delegated_range(struct realm *realm,
 				     const struct realm_map_run *run,
-				     struct kvm_mmu_memory_cache *memcache)
+				     struct rmi_sro_state *sro)
 {
 	phys_addr_t rd = virt_to_phys(realm->rd);
 	phys_addr_t phys = run->phys;
@@ -1553,8 +1534,7 @@ retry_chunk:
 			if (level < map_level) {
 				/* The walk stopped above the target; create its RTTs. */
 				ret = realm_create_rtt_levels(realm, ipa,
-							      level, map_level,
-							      memcache);
+							      level, map_level, sro);
 				if (ret)
 					return ret;
 				continue;
@@ -1594,7 +1574,7 @@ retry_chunk:
 
 static int __realm_map_protected(struct kvm *kvm, unsigned long ipa,
 				 kvm_pfn_t pfn, unsigned long map_size,
-				 struct kvm_mmu_memory_cache *memcache,
+				 struct rmi_sro_state *sro,
 				 bool allow_fault_fallback)
 {
 	struct realm *realm = &kvm->arch.realm;
@@ -1627,7 +1607,7 @@ static int __realm_map_protected(struct kvm *kvm, unsigned long ipa,
 		if (run.top <= run.ipa)
 			break;
 
-		ret = realm_map_delegated_range(realm, &run, memcache);
+		ret = realm_map_delegated_range(realm, &run, sro);
 		if (ret)
 			return ret;
 
@@ -1638,8 +1618,7 @@ static int __realm_map_protected(struct kvm *kvm, unsigned long ipa,
 }
 
 int realm_map_protected(struct kvm *kvm, unsigned long ipa, kvm_pfn_t pfn,
-			unsigned long map_size,
-			struct kvm_mmu_memory_cache *memcache)
+			unsigned long map_size, struct rmi_sro_state *sro)
 {
 	bool allow_fault_fallback;
 
@@ -1647,7 +1626,7 @@ int realm_map_protected(struct kvm *kvm, unsigned long ipa, kvm_pfn_t pfn,
 				map_size == PMD_SIZE) &&
 			       IS_ALIGNED(ipa | __pfn_to_phys(pfn), map_size);
 
-	return __realm_map_protected(kvm, ipa, pfn, map_size, memcache,
+	return __realm_map_protected(kvm, ipa, pfn, map_size, sro,
 				     allow_fault_fallback);
 }
 
@@ -1662,7 +1641,7 @@ struct realm_map_request {
 	unsigned long ipa;
 	kvm_pfn_t pfn;
 	unsigned long size;
-	struct kvm_mmu_memory_cache *memcache;
+	struct rmi_sro_state *sro;
 };
 
 static int realm_recover_protected_map(const struct realm_map_request *req,
@@ -1750,7 +1729,7 @@ retry:
 	     ((map_ret >= 0) &&
 	      (RMI_RETURN_STATUS(map_ret) == RMI_ERROR_INPUT)))) {
 		ret = __realm_map_protected(kvm, start_ipa, req->pfn, req->size,
-					    req->memcache, false);
+					    req->sro, false);
 		if (!ret)
 			return 0;
 
@@ -1781,8 +1760,7 @@ retry:
 
 int realm_recover_protected(struct kvm *kvm, unsigned long ipa,
 			    kvm_pfn_t pfn, unsigned long map_size,
-			    int map_ret,
-			    struct kvm_mmu_memory_cache *memcache,
+			    int map_ret, struct rmi_sro_state *sro,
 			    bool mmu_invalidated)
 {
 	const struct realm_map_request req = {
@@ -1790,7 +1768,7 @@ int realm_recover_protected(struct kvm *kvm, unsigned long ipa,
 		.ipa = ipa,
 		.pfn = pfn,
 		.size = map_size,
-		.memcache = memcache,
+		.sro = sro,
 	};
 	enum realm_map_recovery recovery;
 
@@ -1805,7 +1783,7 @@ int realm_map_non_secure(struct kvm *kvm,
 			 kvm_pfn_t pfn,
 			 unsigned long size,
 			 enum kvm_pgtable_prot prot,
-			 struct kvm_mmu_memory_cache *memcache)
+			 struct rmi_sro_state *sro)
 {
 	struct realm *realm = &kvm->arch.realm;
 	unsigned long attr, flags = 0;
@@ -1917,8 +1895,7 @@ retry_chunk:
 			if (level < map_level) {
 				/* The walk stopped above the target; create its RTTs. */
 				ret = realm_create_rtt_levels(realm, ipa,
-							      level, map_level,
-							      memcache);
+							      level, map_level, sro);
 				if (ret)
 					return ret;
 				continue;
@@ -2027,14 +2004,13 @@ static int ripas_change(struct kvm *kvm,
 {
 	struct realm *realm = &kvm->arch.realm;
 	phys_addr_t rd_phys = virt_to_phys(realm->rd);
+	struct rmi_sro_state *sro = realm->sro;
 	phys_addr_t rec_phys;
-	struct kvm_mmu_memory_cache *memcache = NULL;
 	int ret = 0;
 
 	if (vcpu) {
 		rec_phys = virt_to_phys(vcpu->arch.rec.rec_page);
-		memcache = &vcpu->arch.mmu_page_cache;
-
+		sro = vcpu->arch.rec.sro;
 		WARN_ON(action != RIPAS_SET);
 	} else {
 		WARN_ON(action != RIPAS_INIT);
@@ -2079,7 +2055,7 @@ static int ripas_change(struct kvm *kvm,
 			}
 
 			ret = realm_create_rtt_levels(realm, ipa, err_level,
-						      level, memcache);
+						      level, sro);
 			if (ret) {
 				/*
 				 * Report progress so the caller retries from
@@ -2234,8 +2210,18 @@ static int kvm_complete_ripas_change(struct kvm_vcpu *vcpu)
 	int ret;
 
 	do {
+		unsigned long min_pages =
+			kvm_mmu_cache_min_pages(vcpu->arch.hw_mmu);
+
 		kvm_mmu_topup_memory_cache(&vcpu->arch.mmu_page_cache,
-					   kvm_mmu_cache_min_pages(vcpu->arch.hw_mmu));
+					   min_pages);
+		/*
+		 * Best-effort refill of the SRO hot list outside mmu_lock; on
+		 * failure alloc_delegated_granule() falls back to the
+		 * per-granule delegate path under the lock.
+		 */
+		rmi_sro_topup(vcpu->arch.rec.sro, SZ_2M >> PAGE_SHIFT,
+			      min_pages);
 		write_lock(&kvm->mmu_lock);
 		ret = realm_set_ipa_state(vcpu, base, top, ripas, &top_ipa);
 		write_unlock(&kvm->mmu_lock);
@@ -2423,14 +2409,31 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	BUILD_BUG_ON(sizeof(*rec->run) > PAGE_SIZE);
 
 	params = (struct rec_params *)get_zeroed_page(GFP_KERNEL);
-	rec->rec_page = (void *)__get_free_page(GFP_KERNEL);
 	rec->run = (void *)get_zeroed_page(GFP_KERNEL);
-	rec->sro = kmalloc_obj(*rec->sro);
-	if (!params || !rec->rec_page || !rec->run || !rec->sro) {
+	rec->sro = kzalloc_obj(*rec->sro, GFP_KERNEL);
+	if (!params || !rec->run || !rec->sro) {
 		r = -ENOMEM;
 		goto out_free_pages;
 	}
 	rec->run_phys = virt_to_phys(rec->run);
+
+	/*
+	 * Pre-warm the SRO hot list (process context, outside mmu_lock) so the
+	 * REC page and the aux granules donated by RMI_REC_CREATE are served
+	 * from pre-delegated entries. Best-effort: a failure just leaves the
+	 * allocator on the per-granule fallback path.
+	 */
+	rmi_sro_topup(rec->sro, SZ_2M >> PAGE_SHIFT,
+		      kvm_mmu_cache_min_pages(&vcpu->kvm->arch.mmu));
+
+	/* Pre-delegated granule for the RMM-private REC page (or fallback). */
+	rec_page_phys = alloc_delegated_granule(rec->sro, GFP_KERNEL);
+	if (rec_page_phys == PHYS_ADDR_MAX) {
+		r = -ENOMEM;
+		goto out_free_pages;
+	}
+	rec->rec_page = phys_to_virt(rec_page_phys);
+	rec->rec_phys = rec_page_phys;
 
 	for (i = 0; i < ARRAY_SIZE(params->gprs); i++)
 		params->gprs[i] = vcpu_regs->regs[i];
@@ -2440,20 +2443,12 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	if (vcpu->vcpu_id == 0)
 		params->flags |= REC_PARAMS_FLAG_RUNNABLE;
 
-	rec_page_phys = virt_to_phys(rec->rec_page);
-	rec->rec_phys = rec_page_phys;
-
-	if (realm_delegate_range(rec_page_phys, PAGE_SIZE, NULL)) {
-		r = -ENXIO;
-		goto out_free_pages;
-	}
-
 	params->mpidr = rec_mpidr;
 
 	if (rmi_rec_create(virt_to_phys(realm->rd), rec_page_phys,
 			   virt_to_phys(params), rec->sro)) {
 		r = -ENXIO;
-		goto out_undelegate_rmm_rec;
+		goto out_free_rec_page;
 	}
 
 	rec->mpidr = mpidr;
@@ -2461,13 +2456,14 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	free_page((unsigned long)params);
 	return 0;
 
-out_undelegate_rmm_rec:
-	if (WARN_ON(realm_undelegate_range(rec_page_phys, PAGE_SIZE, NULL)))
-		rec->rec_page = NULL;
+out_free_rec_page:
+	/* Undelegate + free (leaks on undelegate failure). */
+	realm_free_delegated_page(rec_page_phys);
+	rec->rec_page = NULL;
 out_free_pages:
 	free_page((unsigned long)rec->run);
-	free_page((unsigned long)rec->rec_page);
 	free_page((unsigned long)params);
+	rmi_sro_free(rec->sro);
 	kfree(rec->sro);
 	rec->run = NULL;
 	rec->run_phys = 0;
@@ -2525,6 +2521,7 @@ void kvm_destroy_rec(struct kvm_vcpu *vcpu)
 	rec->rec_page = NULL;
 	rec->rec_phys = 0;
 
+	rmi_sro_free(rec->sro);
 	kfree(rec->sro);
 	rec->sro = NULL;
 }

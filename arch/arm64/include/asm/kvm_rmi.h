@@ -141,21 +141,21 @@ int realm_map_protected(struct kvm *kvm,
 			unsigned long base_ipa,
 			kvm_pfn_t pfn,
 			unsigned long size,
-			struct kvm_mmu_memory_cache *memcache);
+			struct rmi_sro_state *sro);
 int realm_rtt_map_order(struct kvm *kvm, unsigned long ipa, int max_order);
 int realm_recover_protected(struct kvm *kvm,
 			    unsigned long ipa,
 			    kvm_pfn_t pfn,
 			    unsigned long size,
 			    int map_ret,
-			    struct kvm_mmu_memory_cache *memcache,
+			    struct rmi_sro_state *sro,
 			    bool mmu_invalidated);
 int realm_map_non_secure(struct kvm *kvm,
 			 unsigned long ipa,
 			 kvm_pfn_t pfn,
 			 unsigned long size,
 			 enum kvm_pgtable_prot prot,
-			 struct kvm_mmu_memory_cache *memcache);
+			 struct rmi_sro_state *sro);
 unsigned long realm_psci_complete(struct kvm_vcpu *vcpu, unsigned long status);
 
 static inline bool kvm_realm_is_private_address(struct realm *realm,

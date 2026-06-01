@@ -9,6 +9,7 @@
 #include <linux/kvm_host.h>
 #include <linux/io.h>
 #include <linux/hugetlb.h>
+#include <linux/arm-rmi-cmds.h>
 #include <linux/sched/signal.h>
 #include <trace/events/kvm.h>
 #include <asm/acpi.h>
@@ -1587,7 +1588,7 @@ static int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
 			 kvm_pfn_t pfn, unsigned long map_size,
 			 enum kvm_pgtable_prot prot,
 			 unsigned long mmu_seq,
-			 struct kvm_mmu_memory_cache *memcache)
+			 struct rmi_sro_state *sro)
 {
 	struct realm *realm = &kvm->arch.realm;
 	bool invalidated;
@@ -1595,11 +1596,6 @@ static int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
 
 	lockdep_assert_held(&kvm->mmu_lock);
 
-	/*
-	 * Write permission is required for now even though it's possible to
-	 * map unprotected pages (granules) as read-only. It's impossible to
-	 * map protected pages (granules) as read-only.
-	 */
 	if (WARN_ON(!(prot & KVM_PGTABLE_PROT_W)))
 		return -EFAULT;
 
@@ -1608,7 +1604,7 @@ static int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
 				kvm_realm_is_private_address(realm, ipa));
 	if (!kvm_realm_is_private_address(realm, ipa))
 		return realm_map_non_secure(kvm, ipa, pfn, map_size, prot,
-					    memcache);
+					    sro);
 
 	fault_ipa = ALIGN_DOWN(fault_ipa, PAGE_SIZE);
 	if ((fault_ipa < ipa) || ((fault_ipa - ipa) >= map_size))
@@ -1617,7 +1613,7 @@ static int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
 	for (;;) {
 		phys_addr_t next_ipa;
 
-		ret = realm_map_protected(kvm, ipa, pfn, map_size, memcache);
+		ret = realm_map_protected(kvm, ipa, pfn, map_size, sro);
 		if (ret != -E2BIG)
 			break;
 
@@ -1651,7 +1647,7 @@ static int realm_map_ipa(struct kvm *kvm, phys_addr_t ipa,
 	write_lock(&kvm->mmu_lock);
 	invalidated = mmu_invalidate_retry(kvm, mmu_seq);
 	ret = realm_recover_protected(kvm, ipa, pfn, map_size, ret,
-				      memcache, invalidated);
+				      sro, invalidated);
 	if (invalidated && !ret)
 		ret = -EAGAIN;
 	write_unlock(&kvm->mmu_lock);
@@ -1683,6 +1679,18 @@ static void *get_mmu_memcache(struct kvm_vcpu *vcpu)
 static int topup_mmu_memcache(struct kvm_vcpu *vcpu, void *memcache)
 {
 	int min_pages = kvm_mmu_cache_min_pages(vcpu->arch.hw_mmu);
+
+	/*
+	 * Realm stage-2 maps allocate RTTs from the SRO hot list under
+	 * mmu_lock. Warm it here, before the lock is taken, so those
+	 * allocations come from pre-delegated entries. Best-effort: failure
+	 * just leaves the per-granule delegate fallback in place.
+	 */
+	if (kvm_is_realm(vcpu->kvm)) {
+		rmi_sro_topup(vcpu->arch.rec.sro, SZ_2M >> PAGE_SHIFT,
+			      min_pages);
+		return 0;
+	}
 
 	if (!is_protected_kvm_enabled())
 		return kvm_mmu_topup_memory_cache(memcache, min_pages);
@@ -1910,7 +1918,7 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 				    aligned_pfn, mapping_size,
 				    KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W,
 				    mmu_seq,
-				    memcache);
+				    s2fd->vcpu->arch.rec.sro);
 		goto out_release_page;
 	}
 
@@ -2363,7 +2371,7 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
 	if (kvm_is_realm(kvm)) {
 		ret = realm_map_ipa(kvm, map_ipa, s2fd->fault_ipa, pfn,
 				    mapping_size, prot, s2vi->mmu_seq,
-				    memcache);
+				    s2fd->vcpu->arch.rec.sro);
 	} else if (mapping_size == perm_fault_granule) {
 		/*
 		 * Under the premise of getting a FSC_PERM fault, we just need to relax
