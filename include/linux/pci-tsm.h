@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __PCI_TSM_H
 #define __PCI_TSM_H
+#include <linux/bits.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
@@ -184,10 +185,13 @@ struct pci_tsm_pf0 {
  * @res: MMIO address range (typically Guest Physical Address, GPA)
  * @tsm_offset: Host Physical Address, HPA obfuscation offset added by the TSM.
  *		Translates report addresses to GPA.
+ * @flags: PCI_TSM_MMIO_F_* attributes for the range
  */
+#define PCI_TSM_MMIO_F_COHERENT BIT(0)
 struct pci_tsm_mmio_entry {
 	struct resource res;
 	u64 tsm_offset;
+	u32 flags;
 };
 
 struct pci_tsm_mmio {

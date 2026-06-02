@@ -812,6 +812,7 @@ EXPORT_SYMBOL_GPL(pci_tsm_mmio_teardown);
 #define PCI_TSM_DEVIF_REPORT_MMIO_ATTR_IS_NON_TEE BIT(2)
 #define PCI_TSM_DEVIF_REPORT_MMIO_ATTR_IS_UPDATABLE BIT(3)
 #define PCI_TSM_DEVIF_REPORT_MMIO_ATTR_RANGE_ID GENMASK(31, 16)
+#define PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_COHERENT 0xffff
 
 /* An interface report 'pfn' is 4K in size */
 struct pci_tsm_devif_mmio {
@@ -829,6 +830,21 @@ struct pci_tsm_devif_report {
 	__le32 mmio_range_count;
 	struct pci_tsm_devif_mmio mmio[];
 };
+
+static int pci_tsm_next_mem_bar(struct pci_dev *pdev, int start)
+{
+	for (int bar = start; bar < PCI_STD_NUM_BARS; bar++) {
+		if (!(pci_resource_flags(pdev, bar) & IORESOURCE_MEM))
+			continue;
+
+		if (!pci_resource_len(pdev, bar))
+			continue;
+
+		return bar;
+	}
+
+	return -ENODEV;
+}
 
 /**
  * pci_tsm_mmio_alloc() - allocate encrypted MMIO range descriptor
@@ -886,6 +902,21 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev)
 		u32 attr = __le32_to_cpu(mmio_data->attributes);
 		int bar = FIELD_GET(PCI_TSM_DEVIF_REPORT_MMIO_ATTR_RANGE_ID,
 				    attr);
+		bool coherent =
+			bar == PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_COHERENT;
+
+		if (coherent) {
+			if (i != mmio_range_count - 1) {
+				pci_dbg(pdev, "Coherent reporting range is not last\n");
+				return NULL;
+			}
+
+			bar = pci_tsm_next_mem_bar(pdev, last_bar + 1);
+			if (bar < 0) {
+				pci_dbg(pdev, "No BAR found for coherent reporting range\n");
+				return NULL;
+			}
+		}
 
 		if (bar >= PCI_STD_NUM_BARS ||
 		    !(pci_resource_flags(pdev, bar) & IORESOURCE_MEM)) {
@@ -941,6 +972,8 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev)
 		entry->res.start = range.start;
 		entry->res.end = range.end;
 		entry->tsm_offset = tsm_offset;
+		if (coherent)
+			entry->flags |= PCI_TSM_MMIO_F_COHERENT;
 		mmio->nr++;
 	}
 
