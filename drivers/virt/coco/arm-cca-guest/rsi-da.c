@@ -183,7 +183,6 @@ static int cca_apply_evidence_report_range(struct pci_dev *pdev,
 {
 	int i, ret;
 	struct resource *res;
-	unsigned long mmio_flags = 0; /* non coherent, not limited order */
 	int vdev_id = rsi_vdev_id(pdev);
 	struct pci_tsm_mmio_entry *entry;
 	struct cca_guest_dsc *dsc = to_cca_guest_dsc(pdev);
@@ -195,15 +194,21 @@ static int cca_apply_evidence_report_range(struct pci_dev *pdev,
 		if (res->desc != IORES_DESC_ENCRYPTED)
 			continue;
 
-		if (map)
+		if (map) {
+			unsigned long mmio_flags = 0; /* not limited order */
+
+			if (entry->flags & PCI_TSM_MMIO_F_COHERENT)
+				mmio_flags |= RSI_DEV_MEM_COHERENT;
+
 			ret = rsi_validate_dev_mapping(vdev_id, res->start,
 						       res->end + 1, entry->tsm_offset,
 						       mmio_flags,
 						       dsc->dev_info.lock_seq,
 						       dsc->dev_info.meas_seq,
 						       dsc->dev_info.report_seq);
-		else
+		} else {
 			ret = rsi_invalidate_dev_mapping(res->start, res->end + 1);
+		}
 		if (ret)
 			goto err_rollback;
 	}
