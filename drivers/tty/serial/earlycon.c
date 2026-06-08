@@ -25,7 +25,7 @@
 #endif
 
 #ifdef CONFIG_ARM64
-#include <asm/rsi.h>
+#include <linux/arm-rsi-cmds.h>
 #endif
 
 #include <asm/serial.h>

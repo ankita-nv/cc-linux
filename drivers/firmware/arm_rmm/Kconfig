@@ -24,3 +24,7 @@ config ARM_RMM
 	  Selecting this option does not by itself make Realm guests available:
 	  the system must also provide RME-capable hardware and firmware with a
 	  compatible RMM implementation.
+
+	  It also provides the Realm Service Interface (RSI) used by Realm
+	  guests to negotiate the RSI version and Realm configuration with
+	  the RMM and to manage the protected state of memory.
