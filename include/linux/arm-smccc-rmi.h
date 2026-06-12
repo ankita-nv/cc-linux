@@ -3,8 +3,8 @@
  * Copyright (C) 2023-2026 ARM Ltd.
  *
  * The values and structures in this file are from the Realm Management Monitor
- * specification (DEN0137) version 2.0-bet2:
- * https://developer.arm.com/documentation/den0137/2-0bet2/
+ * specification (DEN0137) version 2.0-bet3:
+ * https://developer.arm.com/documentation/den0137/2-0bet3/
  */
 
 #ifndef __LINUX_ARM_SMCCC_RMI_H_
@@ -15,8 +15,10 @@
 #include <linux/bits.h>
 #include <linux/build_bug.h>
 #include <linux/sizes.h>
+#include <linux/stddef.h>
 
 #include <asm/page.h>
+#include <asm/pgtable-hwdef.h>
 
 #define SMC_RMI_CALL(func)				\
 	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,		\
@@ -78,8 +80,6 @@
 #define SMC_RMI_VDEV_GET_MEASUREMENTS		SMC_RMI_CALL(0x01d1)
 #define SMC_RMI_VDEV_LOCK			SMC_RMI_CALL(0x01d2)
 #define SMC_RMI_VDEV_START			SMC_RMI_CALL(0x01d3)
-#define SMC_RMI_VDEV_P2P_BIND			SMC_RMI_CALL(0x01d4)
-#define SMC_RMI_VDEV_P2P_UNBIND			SMC_RMI_CALL(0x01d5)
 #define SMC_RMI_VSMMU_EVENT_HANDLE		SMC_RMI_CALL(0x01d6)
 #define SMC_RMI_PSMMU_ACTIVATE			SMC_RMI_CALL(0x01d7)
 #define SMC_RMI_PSMMU_DEACTIVATE		SMC_RMI_CALL(0x01d8)
@@ -93,16 +93,7 @@
 #define SMC_RMI_GRANULE_TRACKING_GET		SMC_RMI_CALL(0x01e1)
 
 #define SMC_RMI_GRANULE_TRACKING_SET		SMC_RMI_CALL(0x01e3)
-#define SMC_RMI_CMEM_ADD_PDEV			SMC_RMI_CALL(0x01e4)
-#define SMC_RMI_CMEM_CREATE			SMC_RMI_CALL(0x01e5)
-#define SMC_RMI_CMEM_DESTROY			SMC_RMI_CALL(0x01e6)
-#define SMC_RMI_CMEM_POPULATE			SMC_RMI_CALL(0x01e7)
-#define SMC_RMI_CMEM_REMOVE_PDEV		SMC_RMI_CALL(0x01e8)
-#define SMC_RMI_CMEM_START			SMC_RMI_CALL(0x01e9)
-#define SMC_RMI_CMEM_STOP			SMC_RMI_CALL(0x01ea)
-#define SMC_RMI_CMEM_UNPOPULATE			SMC_RMI_CALL(0x01eb)
 #define SMC_RMI_RMM_CONFIG_GET			SMC_RMI_CALL(0x01ec)
-#define SMC_RMI_PDEV_MEC_REFRESH		SMC_RMI_CALL(0x01ed)
 #define SMC_RMI_RMM_STATE_GET			SMC_RMI_CALL(0x01ee)
 
 #define SMC_RMI_PSMMU_EVENT_CONSUME		SMC_RMI_CALL(0x01f0)
@@ -136,6 +127,9 @@
 #define SMC_RMI_VSMMU_CMD_GET			SMC_RMI_CALL(0x020c)
 #define SMC_RMI_VSMMU_CMD_COMPLETE		SMC_RMI_CALL(0x020d)
 #define SMC_RMI_PSMMU_INFO			SMC_RMI_CALL(0x020e)
+#define SMC_RMI_RMM_DEACTIVATE			SMC_RMI_CALL(0x020f)
+#define SMC_RMI_PDEV_STREAM_INFO		SMC_RMI_CALL(0x0210)
+#define SMC_RMI_GPT_INFO			SMC_RMI_CALL(0x0211)
 
 #define RMI_ABI_MAJOR_VERSION	2
 #define RMI_ABI_MINOR_VERSION	0
@@ -179,18 +173,22 @@
 #define RMI_OP_MEM_REQ_DONATE		1
 #define RMI_OP_MEM_REQ_RECLAIM		2
 
-#define RMI_DONATE_SIZE_MASK		3UL
-#define RMI_DONATE_COUNT_MASK		GENMASK(15, 2)
-#define RMI_DONATE_CONTIG_MASK		BIT(16)
-#define RMI_DONATE_STATE_MASK		BIT(17)
-
-#define RMI_DONATE_SIZE(req)		FIELD_GET(RMI_DONATE_SIZE_MASK, req)
-#define RMI_DONATE_COUNT(req)		FIELD_GET(RMI_DONATE_COUNT_MASK, req)
-#define RMI_DONATE_CONTIG(req)		FIELD_GET(RMI_DONATE_CONTIG_MASK, req)
-#define RMI_DONATE_STATE(req)		FIELD_GET(RMI_DONATE_STATE_MASK, req)
-
 #define RMI_OP_MEM_DELEGATED		0
 #define RMI_OP_MEM_UNDELEGATED		1
+#define RMI_OP_MEM_CONDITIONAL		2
+
+#define RMI_OP_MEM_NON_CONTIG		0
+#define RMI_OP_MEM_CONTIG		1
+
+#define RMI_DONATE_SIZE_MASK		GENMASK(1, 0)
+#define RMI_DONATE_COUNT_MASK		GENMASK(15, 2)
+#define RMI_DONATE_CONTIG_MASK		BIT(16)
+#define RMI_DONATE_STATE_MASK		GENMASK(18, 17)
+
+#define RMI_DONATE_BSIZE(req)		FIELD_GET(RMI_DONATE_SIZE_MASK, (req))
+#define RMI_DONATE_COUNT(req)		FIELD_GET(RMI_DONATE_COUNT_MASK, (req))
+#define RMI_DONATE_CONTIG(req)		FIELD_GET(RMI_DONATE_CONTIG_MASK, (req))
+#define RMI_DONATE_STATE(req)		FIELD_GET(RMI_DONATE_STATE_MASK, (req))
 
 #define RMI_ADDR_TYPE_NONE		0
 #define RMI_ADDR_TYPE_SINGLE		1
@@ -199,15 +197,36 @@
 #define RMI_ADDR_RANGE_SIZE_MASK	GENMASK(1, 0)
 #define RMI_ADDR_RANGE_COUNT_MASK	GENMASK(PAGE_SHIFT - 1, 2)
 #define RMI_ADDR_RANGE_ADDR_MASK	(PAGE_MASK & GENMASK(51, 0))
-#define RMI_ADDR_RANGE_STATE_MASK	BIT(63)
+#define RMI_ADDR_RANGE_RESERVED_MASK	GENMASK(61, 52)
+#define RMI_ADDR_RANGE_STATE_MASK	GENMASK(63, 62)
+#define RMI_ADDR_BSIZE_BYTES(bsize)				\
+	BIT(ARM64_HW_PGTABLE_LEVEL_SHIFT(3 - (bsize)))
 
-#define RMI_ADDR_RANGE_SIZE(ar)		(FIELD_GET(RMI_ADDR_RANGE_SIZE_MASK, \
-						   (ar)))
-#define RMI_ADDR_RANGE_COUNT(ar)	(FIELD_GET(RMI_ADDR_RANGE_COUNT_MASK, \
-						   (ar)))
+/* RmiAddrBlockSize encoding (DEN0137 v2.0-bet3 section B4.6.1). */
+#define RMI_ADDR_RANGE_SIZE_PAGE	0
+#define RMI_ADDR_RANGE_SIZE_PMD		1
+#define RMI_ADDR_RANGE_SIZE_PUD		2
+#define RMI_ADDR_RANGE_SIZE_P4D		3
+
+#define RMI_ADDR_RANGE_SIZE(ar)		FIELD_GET(RMI_ADDR_RANGE_SIZE_MASK, (ar))
+#define RMI_ADDR_RANGE_COUNT(ar)	FIELD_GET(RMI_ADDR_RANGE_COUNT_MASK, (ar))
 #define RMI_ADDR_RANGE_ADDR(ar)		((ar) & RMI_ADDR_RANGE_ADDR_MASK)
-#define RMI_ADDR_RANGE_STATE(ar)	(FIELD_GET(RMI_ADDR_RANGE_STATE_MASK, \
-						   (ar)))
+#define RMI_ADDR_RANGE_STATE(ar)	FIELD_GET(RMI_ADDR_RANGE_STATE_MASK, (ar))
+#define RMI_ADDR_RANGE_DESC(addr, size, count, state)			\
+	(((addr) & RMI_ADDR_RANGE_ADDR_MASK) |				\
+	 FIELD_PREP(RMI_ADDR_RANGE_SIZE_MASK, (size)) |			\
+	 FIELD_PREP(RMI_ADDR_RANGE_COUNT_MASK, (count)) |		\
+	 FIELD_PREP(RMI_ADDR_RANGE_STATE_MASK, (state)))
+
+#define RMI_RTT_UNMAP_FLAGS_OADDR_TYPE_MASK	GENMASK(1, 0)
+#define RMI_RTT_UNMAP_FLAGS_LIST_COUNT_MASK	GENMASK(15, 2)
+
+#define RMI_UNASSIGNED			0
+#define RMI_ASSIGNED			1
+#define RMI_TABLE			2
+#define RMI_ASSIGNED_DEV		3
+#define RMI_AUX_DESTROYED		4
+#define RMI_ASSIGNED_VSMMU		5
 
 enum rmi_ripas {
 	RMI_EMPTY = 0,
@@ -227,6 +246,8 @@ enum rmi_ripas {
 #define RMI_FEATURE_REGISTER_0_NUM_WPS		GENMASK(25, 20)
 #define RMI_FEATURE_REGISTER_0_PMU		BIT(26)
 #define RMI_FEATURE_REGISTER_0_PMU_NUM_CTRS	GENMASK(31, 27)
+#define RMI_FEATURE_REGISTER_0_L0GPT_BLOCK_DELEGATE	BIT(32)
+#define RMI_FEATURE_REGISTER_0_S2OASZ		GENMASK(40, 33)
 
 #define RMI_FEATURE_REGISTER_1_RMI_GRAN_SZ_4KB	BIT(0)
 #define RMI_FEATURE_REGISTER_1_RMI_GRAN_SZ_16KB	BIT(1)
@@ -242,13 +263,10 @@ enum rmi_ripas {
 #define RMI_FEATURE_REGISTER_2_DA_COH		BIT(1)
 #define RMI_FEATURE_REGISTER_2_VSMMU		BIT(2)
 #define RMI_FEATURE_REGISTER_2_ATS		BIT(3)
-#define RMI_FEATURE_REGISTER_2_MAX_VDEVS_ORDER	GENMASK(7, 4)
+#define RMI_FEATURE_REGISTER_2_PDEV_MAX_VDEVS_ORDER	GENMASK(7, 4)
 #define RMI_FEATURE_REGISTER_2_VDEV_KROU	BIT(8)
 #define RMI_FEATURE_REGISTER_2_NON_TEE_STREAM	BIT(9)
-#define RMI_FEATURE_REGISTER_2_P2P		BIT(10)
-#define RMI_FEATURE_REGISTER_2_CMEM_CXL		BIT(11)
-#define RMI_FEATURE_REGISTER_2_MAX_CMEM		GENMASK(19, 12)
-#define RMI_FEATURE_REGISTER_2_CMEM_TSE_REQ	BIT(20)
+#define RMI_FEATURE_REGISTER_2_REALM_MAX_VDEVS_ORDER	GENMASK(14, 10)
 
 #define RMI_FEATURE_REGISTER_3_MAX_NUM_AUX_PLANES	GENMASK(3, 0)
 #define RMI_FEATURE_REGISTER_3_RTT_PLANE		GENMASK(5, 4)
@@ -259,15 +277,42 @@ enum rmi_ripas {
 #define RMI_MEM_CATEGORY_CONVENTIONAL		0
 #define RMI_MEM_CATEGORY_DEV_NCOH		1
 #define RMI_MEM_CATEGORY_DEV_COH		2
+#define RMI_MEM_CATEGORY_NONE			3
 
 #define RMI_TRACKING_RESERVED			0
 #define RMI_TRACKING_NONE			1
 #define RMI_TRACKING_FINE			2
 #define RMI_TRACKING_COARSE			3
+#define RMI_TRACKING_INTERMEDIATE		4
+
+/* RmiIrqCfg, DEN0137 v2.0-bet3 section B4.6.34. */
+#define RMI_IRQ_DISABLED			0
+#define RMI_IRQ_WIRED				1
+#define RMI_IRQ_MSI				2
+
+/* RmiL0DptSize, DEN0137 v2.0-bet3 section B4.6.35. */
+#define RMI_L0DPTSZ_1GB			0
+#define RMI_L0DPTSZ_16GB			1
+#define RMI_L0DPTSZ_64GB			2
+#define RMI_L0DPTSZ_512GB			3
+
+/* RmiPsmmuInfoFlags, DEN0137 v2.0-bet3 section B4.6.56. */
+#define RMI_PSMMU_INFO_FLAGS_IRQ_CFG		GENMASK(1, 0)
+#define RMI_PSMMU_INFO_FLAGS_CMDQ_SYNC_IRQ_WIRED	BIT(2)
+#define RMI_PSMMU_INFO_FLAGS_ATS			BIT(3)
+
+/* RmiGptParState encodings returned by RMI_GPT_INFO. */
+#define RMI_GPT_PAR_RESERVED			0
+#define RMI_GPT_PAR_PLAT			1
+#define RMI_GPT_PAR_HOST_NOT_CREATED		2
+#define RMI_GPT_PAR_HOST_CREATED		3
 
 #define RMI_GRANULE_SIZE_4KB	0
 #define RMI_GRANULE_SIZE_16KB	1
 #define RMI_GRANULE_SIZE_64KB	2
+
+#define RMI_RMM_STATE_INIT	0
+#define RMI_RMM_STATE_ACTIVE	1
 
 /*
  * Note many of these fields are smaller than u64 but all fields have u64
@@ -285,16 +330,47 @@ struct rmm_config {
 
 static_assert(sizeof(struct rmm_config) == SZ_4K);
 
-#define RMI_REALM_PARAM_FLAG_LPA2		BIT(0)
+/*
+ * RmiRealmFlags0 (RmiRealmParams.flags0, byte offset 0x0): Host-supplied
+ * Realm-creation flags reflected in the Realm Initial Measurement.
+ * See DEN0137 v2.0-bet3 B4.6.63. LFA/MEC policy values come from the
+ * RmiLfaPolicy / RmiMecPolicy enumerations.
+ */
+/* bit 0 reserved (SBZ) */
 #define RMI_REALM_PARAM_FLAG_SVE		BIT(1)
 #define RMI_REALM_PARAM_FLAG_PMU		BIT(2)
 #define RMI_REALM_PARAM_FLAG_DA			BIT(3)
+/* bit 4 reserved (SBZ) */
 #define RMI_REALM_PARAM_FLAG_LFA_POLICY		GENMASK(6, 5)
 #define RMI_REALM_PARAM_FLAG_MEC_POLICY		GENMASK(8, 7)
+/* bits 63:9 reserved (SBZ) */
+
+#define RMI_LFA_DISALLOW			0
+#define RMI_LFA_ALLOW				1
+
+#define RMI_MEC_POLICY_SHARED			0
+#define RMI_MEC_POLICY_PRIVATE			1
 
 #define RMI_HASH_SHA_256			0
 #define RMI_HASH_SHA_512			1
 #define RMI_HASH_SHA_384			2
+
+/*
+ * RmiRealmFlags1 (RmiRealmParams.flags1, byte offset 0x820): Host-supplied
+ * Realm-creation flags NOT reflected in the Realm Initial Measurement.
+ * See DEN0137 v2.0-bet3 B4.6.64.
+ *
+ * RTT_TREE_PER_PLANE: 0 = all Planes share a single RTT tree,
+ *                     1 = each Plane has a separate RTT tree
+ *                     (ignored if the Realm has no auxiliary Planes).
+ * RTT_S2AP_ENCODING:  value comes from the RmiRttS2APEncoding enumeration.
+ * ATS:                whether Address Translation Service is supported for
+ *                     devices assigned to the Realm.
+ */
+#define RMI_REALM_PARAM_FLAG1_RTT_TREE_PER_PLANE	BIT(0)
+#define RMI_REALM_PARAM_FLAG1_RTT_S2AP_ENCODING		BIT(1)
+#define RMI_REALM_PARAM_FLAG1_ATS			BIT(2)
+/* bits 63:3 reserved (SBZ) */
 
 struct realm_params {
 	union { /* 0x0 */
@@ -324,6 +400,7 @@ struct realm_params {
 			s64 rtt_level_start;
 			u64 rtt_num_start;
 			u64 flags1;
+			u64 max_num_vdevs;
 		};
 		u8 padding3[0x700];
 	};
@@ -337,6 +414,12 @@ struct realm_params {
 };
 
 static_assert(sizeof(struct realm_params) == SZ_4K);
+static_assert(offsetof(struct realm_params, flags0) == 0x0);
+static_assert(offsetof(struct realm_params, ats_plane) == 0x440);
+static_assert(offsetof(struct realm_params, rtt_base) == 0x808);
+static_assert(offsetof(struct realm_params, flags1) == 0x820);
+static_assert(offsetof(struct realm_params, max_num_vdevs) == 0x828);
+static_assert(offsetof(struct realm_params, aux_rtt_base) == 0xf80);
 
 /*
  * The number of GPRs (starting from X0) that are
@@ -401,7 +484,6 @@ static_assert(sizeof(struct rec_enter) == SZ_2K);
 #define RMI_EXIT_S2AP_CHANGE		0x07
 #define RMI_EXIT_VDEV_VALIDATE_MAPPING	0x08
 #define RMI_EXIT_VSMMU_COMMAND		0x0a
-#define RMI_EXIT_VDEV_P2P_BINDING	0x0b
 
 struct rec_exit {
 	union { /* 0x000 */
@@ -476,18 +558,22 @@ struct rec_run {
 
 static_assert(sizeof(struct rec_run) == SZ_4K);
 
-/* RMI_RTT_UNPROT_MAP_FLAGS definitions */
-#define RMI_RTT_UNPROT_MAP_FLAGS_OADDR_TYPE	GENMASK(1, 0)
-#define RMI_RTT_UNPROT_MAP_FLAGS_LIST_COUNT	GENMASK(15, 2)
-#define RMI_RTT_UNPROT_MAP_FLAGS_MEMATTR	GENMASK(18, 16)
-#define RMI_RTT_UNPROT_MAP_FLAGS_S2AP		GENMASK(22, 19)
+/* RmiRttUnprotMapFlags, DEN0137 v2.0-bet3 section B4.6.95. */
+#define RMI_RTT_UNPROT_MAP_FLAGS_OADDR_TYPE_MASK	\
+	RMI_RTT_UNMAP_FLAGS_OADDR_TYPE_MASK
+#define RMI_RTT_UNPROT_MAP_FLAGS_LIST_COUNT_MASK	\
+	RMI_RTT_UNMAP_FLAGS_LIST_COUNT_MASK
+#define RMI_RTT_UNPROT_MAP_FLAGS_MEMATTR_MASK		GENMASK(18, 16)
+#define RMI_RTT_UNPROT_MAP_FLAGS_S2AP_MASK		GENMASK(22, 19)
 
-/* RMI_RTT_PROT_MAP_FLAGS definitions */
-#define RMI_RTT_PROT_MAP_FLAGS_OADDR_TYPE	GENMASK(1, 0)
-#define RMI_RTT_PROT_MAP_FLAGS_LIST_COUNT	GENMASK(15, 2)
+/* RmiRttS2APBase direct encoding, DEN0137 v2.0-bet3 section B4.6.92. */
+#define RMI_S2AP_NO_ACCESS		0
+#define RMI_S2AP_RO			1
+#define RMI_S2AP_WO			2
+#define RMI_S2AP_RW			3
+#define RMI_S2AP_RW_PUX			4
 
-/* S2AP Direct Encodings, used in RMI_RTT_UNPROT_MAP_FLAGS_S2AP */
-#define RMI_S2AP_DIRECT_WRITE			BIT(0)
-#define RMI_S2AP_DIRECT_READ			BIT(1)
+#define RMI_S2AP_DIRECT			0
+#define RMI_S2AP_INDIRECT		1
 
 #endif /* __LINUX_ARM_SMCCC_RMI_H_ */

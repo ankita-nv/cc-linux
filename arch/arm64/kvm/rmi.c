@@ -586,9 +586,6 @@ static int realm_create_rd(struct kvm *kvm)
 		params->flags0 |= RMI_REALM_PARAM_FLAG_PMU;
 	}
 
-	if (kvm_lpa2_is_enabled())
-		params->flags0 |= RMI_REALM_PARAM_FLAG_LPA2;
-
 	r = realm_init_sve_param(kvm, params);
 	if (r)
 		goto out_undelegate_tables;

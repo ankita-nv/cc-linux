@@ -14,8 +14,8 @@
 
 static bool arm64_rmi_is_available;
 
-/* Currently only the first 2 registers are used by Linux */
-#define RMI_FEAT_REG_COUNT	2
+/* DEN0137 v2.0-bet3 defines feature registers 0 through 4. */
+#define RMI_FEAT_REG_COUNT	5
 static __ro_after_init unsigned long rmi_feat_reg_cache[RMI_FEAT_REG_COUNT];
 
 unsigned long rmi_feat_reg(unsigned long id)
