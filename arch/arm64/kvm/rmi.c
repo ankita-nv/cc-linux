@@ -30,36 +30,31 @@ static inline unsigned long rmi_rtt_next_addr(unsigned long addr,
 	return min(ALIGN(addr + 1, rmi_rtt_level_mapsize(level)), end);
 }
 
-static bool rmi_has_feature0(unsigned long feature)
+static bool rmi_has_feature(unsigned long reg, unsigned long feature)
 {
-	return !!u64_get_bits(rmm_feat_reg0, feature);
-}
-
-static bool rmi_has_feature1(unsigned long feature)
-{
-	return !!u64_get_bits(rmm_feat_reg1, feature);
+	return !!u64_get_bits(rmi_feat_reg(reg), feature);
 }
 
 bool kvm_rmi_supports_sve(void)
 {
-	return rmi_has_feature0(RMI_FEATURE_REGISTER_0_SVE);
+	return rmi_has_feature(0, RMI_FEATURE_REGISTER_0_SVE);
 }
 
-u32 kvm_realm_ipa_limit(void)
+u32 kvm_rmm_ipa_limit(void)
 {
-	return u64_get_bits(rmm_feat_reg0, RMI_FEATURE_REGISTER_0_S2SZ);
+	return u64_get_bits(rmi_feat_reg(0), RMI_FEATURE_REGISTER_0_S2SZ);
 }
 
 unsigned int kvm_realm_sve_max_vl(void)
 {
-	return sve_vl_from_vq(u64_get_bits(rmm_feat_reg0,
+	return sve_vl_from_vq(u64_get_bits(rmi_feat_reg(0),
 					   RMI_FEATURE_REGISTER_0_SVE_VL) + 1);
 }
 
 u64 kvm_realm_reset_id_aa64dfr0_el1(const struct kvm_vcpu *vcpu, u64 val)
 {
-	u32 bps = u64_get_bits(rmm_feat_reg0, RMI_FEATURE_REGISTER_0_NUM_BPS);
-	u32 wps = u64_get_bits(rmm_feat_reg0, RMI_FEATURE_REGISTER_0_NUM_WPS);
+	u32 bps = u64_get_bits(rmi_feat_reg(0), RMI_FEATURE_REGISTER_0_NUM_BPS);
+	u32 wps = u64_get_bits(rmi_feat_reg(0), RMI_FEATURE_REGISTER_0_NUM_WPS);
 	u32 ctx_cmps;
 
 	/* Ensure CTX_CMPs is still valid */
@@ -2640,12 +2635,12 @@ int kvm_init_realm(struct kvm *kvm)
 static int rmm_check_features(void)
 {
 	if (kvm_lpa2_is_enabled() &&
-	    !rmi_has_feature0(RMI_FEATURE_REGISTER_0_LPA2)) {
+	    !rmi_has_feature(0, RMI_FEATURE_REGISTER_0_LPA2)) {
 		kvm_err("RMM doesn't support LPA2");
 		return -ENXIO;
 	}
 
-	if (!rmi_has_feature1(RMI_FEATURE_REGISTER_1_HASH_SHA_256)) {
+	if (!rmi_has_feature(1, RMI_FEATURE_REGISTER_1_HASH_SHA_256)) {
 		kvm_err("RMM doesn't support SHA-256 realms");
 		return -ENXIO;
 	}
@@ -2662,7 +2657,7 @@ void kvm_init_rmi(void)
 	if (!is_kernel_in_hyp_mode())
 		return;
 
-	if (!rmi_is_available())
+	if (!is_rmi_available())
 		return;
 
 	if (rmm_check_features())

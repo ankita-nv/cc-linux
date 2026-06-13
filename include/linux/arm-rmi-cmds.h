@@ -184,6 +184,16 @@ static inline long rmi_gpt_l1_create(unsigned long addr,
 	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
 }
 
+static inline long rmi_gpt_l1_destroy(unsigned long addr,
+				      struct rmi_sro_state *sro)
+{
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_GPT_L1_DESTROY, addr
+	};
+
+	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
+}
+
 /**
  * rmi_features() - Read feature register
  * @index: Feature register index

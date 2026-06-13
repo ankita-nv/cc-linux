@@ -5,12 +5,15 @@
 
 #include <linux/arm-rmi-cmds.h>
 #include <linux/cpufeature.h>
+#include <linux/crash_dump.h>
+#include <linux/kexec.h>
 #include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
 #include <linux/numa.h>
 #include <linux/overflow.h>
 #include <linux/processor.h>
+#include <linux/reboot.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -447,21 +450,18 @@ static void rmi_sro_free_donated_tail(phys_addr_t phys, unsigned long size,
 				      unsigned long state)
 {
 	unsigned long undelegated_size = 0;
-	unsigned long off;
 	long ret;
 
 	if (rmi_op_mem_needs_delegation(state)) {
 		ret = rmi_undelegate_range(phys, size, &undelegated_size);
 		if (WARN_ONCE(ret != RMI_SUCCESS,
 			      "RMI: failed donated tail undelegate: %ld\n", ret)) {
-			for (off = 0; off < undelegated_size; off += PAGE_SIZE)
-				__free_page(phys_to_page(phys + off));
+			rmi_free_host_range(phys, undelegated_size);
 			return;
 		}
 	}
 
-	for (off = 0; off < size; off += PAGE_SIZE)
-		__free_page(phys_to_page(phys + off));
+	rmi_free_host_range(phys, size);
 }
 
 static bool rmi_sro_cache_entry_matches(unsigned long entry,
@@ -1286,38 +1286,28 @@ static int rmi_read_features(void)
 	return 0;
 }
 
+/*
+ * RmiRmmConfig.rmi_granule_size encoding for this kernel's PAGE_SIZE.
+ * The arm64 page shifts are 12/14/16 (4K/16K/64K), which map to the spec
+ * encoding 0/1/2 as (PAGE_SHIFT - 12) / 2. Compile-time constant.
+ */
+#define RMI_PAGE_GRANULE_SIZE	((PAGE_SHIFT - 12) >> 1)
+
 static int rmi_configure(struct rmi_sro_state *sro)
 {
 	struct rmm_config *config __free(free_page) = NULL;
-	unsigned long granule_feature;
 	unsigned long ret;
+
+	if (!(rmi_feat_reg(1) & BIT(RMI_PAGE_GRANULE_SIZE))) {
+		pr_err("RMM does not support %luKB granules\n", PAGE_SIZE >> 10);
+		return -ENXIO;
+	}
 
 	config = (struct rmm_config *)get_zeroed_page(GFP_KERNEL);
 	if (!config)
 		return -ENOMEM;
 
-	switch (PAGE_SIZE) {
-	case SZ_4K:
-		config->rmi_granule_size = RMI_GRANULE_SIZE_4KB;
-		granule_feature = RMI_FEATURE_REGISTER_1_RMI_GRAN_SZ_4KB;
-		break;
-	case SZ_16K:
-		config->rmi_granule_size = RMI_GRANULE_SIZE_16KB;
-		granule_feature = RMI_FEATURE_REGISTER_1_RMI_GRAN_SZ_16KB;
-		break;
-	case SZ_64K:
-		config->rmi_granule_size = RMI_GRANULE_SIZE_64KB;
-		granule_feature = RMI_FEATURE_REGISTER_1_RMI_GRAN_SZ_64KB;
-		break;
-	default:
-		pr_err("Unsupported PAGE_SIZE for RMM\n");
-		return -EINVAL;
-	}
-
-	if (!(rmi_feat_reg(1) & granule_feature)) {
-		pr_err("RMM does not support %luKB granules\n", PAGE_SIZE >> 10);
-		return -ENXIO;
-	}
+	config->rmi_granule_size = RMI_PAGE_GRANULE_SIZE;
 
 	ret = rmi_rmm_config_set(virt_to_phys(config));
 	if (ret) {
@@ -1816,37 +1806,120 @@ bool is_rmi_available(void)
 	return arm64_rmi_is_available;
 }
 
+/*
+ * Best-effort fold of the RMM's L1 GPTs back to blocks on the way into a kexec.
+ * Walk every L0 block across all memory once, in ascending order (mirroring the
+ * cold-boot create loop, rmi_init_metadata), asking the RMM to destroy each L1
+ * GPT; the RMM returns the freed L1 granules through the SRO reclaim path.
+ */
+static void rmi_destroy_metadata(struct rmi_sro_state *sro)
+{
+	unsigned long l0gpt_sz = rmi_l0gpt_size();
+	const struct memblock_region *r;
+	phys_addr_t last_end = 0;
+	phys_addr_t start, end;
+
+	/* First pass: fold every L0 block across all memory, in ascending order. */
+	for_each_mem_region(r) {
+		if (memblock_is_nomap(r))
+			continue;
+
+		start = ALIGN_DOWN(PFN_PHYS(memblock_region_memory_base_pfn(r)),
+				   l0gpt_sz);
+		end = ALIGN(PFN_PHYS(memblock_region_memory_end_pfn(r)),
+			    l0gpt_sz);
+
+		/* Skip L0 blocks already handled by an earlier region. */
+		if (start < last_end)
+			start = last_end;
+		if (start >= end)
+			continue;
+		last_end = end;
+
+		while (start < end) {
+			rmi_gpt_l1_destroy(start, sro);
+			start += l0gpt_sz;
+		}
+	}
+}
+
+/*
+ * SRO allocated for RMM bring-up in arm64_init_rmi() and reused here to drive
+ * the kexec hand-off. Kept allocated for the system lifetime with an empty hot
+ * list (bring-up frees the boot leftovers); NULL if bring-up failed.
+ */
+static struct rmi_sro_state *rmi_sro;
+
+/*
+ * On the way into a kexec, fold away the L1 GPTs the RMM can release. This runs
+ * in the reboot notifier chain (process context, before machine_shutdown()),
+ * where the GPT_L1_DESTROY SRO is safe to call.
+ *
+ * Only act on a kexec (kexec_in_progress is set by kernel_kexec() just before
+ * the reboot chain runs). A normal reboot/poweroff resets the firmware, which
+ * reinitialises the RMM, so there is nothing to hand over.
+ */
+static int rmi_reboot_notify(struct notifier_block *nb, unsigned long action,
+			     void *data)
+{
+	if (kexec_in_progress && rmi_sro)
+		rmi_destroy_metadata(rmi_sro);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block rmi_reboot_nb = {
+	.notifier_call = rmi_reboot_notify,
+};
+
 static int __init arm64_init_rmi(void)
 {
-	struct rmi_sro_state *sro;
 	int ret;
 
-	/* Continue without Realm support if the RMI cannot be initialized. */
-	ret = rmi_check_version();
-	if (ret)
-		return ret;
+	/*
+	 * A kdump/crash kernel runs inside the reserved crashkernel region and
+	 * must not reconfigure the RMM or rebuild the GPTs: that state belongs
+	 * to the crashed production kernel and is needed to capture the dump.
+	 * Skip RMI/CCA bring-up entirely.
+	 */
+	if (is_kdump_kernel())
+		return 0;
+
+	/* Continue without realm support if we can't agree on a version */
+	if (rmi_check_version())
+		return 0;
 
 	ret = rmi_read_features();
 	if (ret)
-		return ret;
+		return 0;
 
-	sro = kzalloc_obj(*sro, GFP_KERNEL);
-	if (!sro)
+	rmi_sro = kzalloc_obj(*rmi_sro, GFP_KERNEL);
+	if (!rmi_sro)
 		return -ENOMEM;
 
-	ret = rmi_configure(sro);
+	/* Configure and activate the RMM, then build the GPT L1 tables. */
+	ret = rmi_configure(rmi_sro);
 	if (ret)
 		goto out_free_sro;
-	ret = rmi_init_metadata(sro);
+	ret = rmi_init_metadata(rmi_sro);
 	if (ret)
 		goto out_free_sro;
 
 	arm64_rmi_is_available = true;
 	pr_info("RMI configured\n");
 
+	/*
+	 * Drop the boot hot list (undelegate + free any leftover delegated
+	 * granules) but keep the SRO struct allocated; the reboot notifier
+	 * reuses it to tear down the L1 GPTs on a subsequent kexec.
+	 */
+	rmi_sro_free(rmi_sro);
+	register_reboot_notifier(&rmi_reboot_nb);
+	return 0;
+
 out_free_sro:
-	rmi_sro_free(sro);
-	kfree(sro);
-	return ret;
+	rmi_sro_free(rmi_sro);
+	kfree(rmi_sro);
+	rmi_sro = NULL;
+	return 0;
 }
 subsys_initcall(arm64_init_rmi);
