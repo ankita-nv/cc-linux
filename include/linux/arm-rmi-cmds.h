@@ -15,6 +15,9 @@
 
 #define RMI_MAX_ADDR_LIST	256
 
+#define RMI_SMC_SLOT_IDX(_fid) \
+	((unsigned int)(((_fid) - SMC_RMI_VERSION) & 0xffUL))
+
 struct rmi_sro_state {
 	struct arm_smccc_1_2_regs regs;
 	unsigned long addr_count;
@@ -40,6 +43,14 @@ static inline int rmi_sro_topup(struct rmi_sro_state *sro,
 }
 
 phys_addr_t rmi_sro_alloc(struct rmi_sro_state *sro, gfp_t gfp);
+
+/* Track global RMM-owned physical ranges. */
+void rmi_region_track(struct rmi_sro_state *sro, phys_addr_t phys,
+		      unsigned long size, unsigned long fid,
+		      unsigned long ipa);
+void rmi_region_untrack(struct rmi_sro_state *sro, phys_addr_t phys,
+			unsigned long size);
+u64 rmi_region_owned_bytes(struct rmi_sro_state *sro);
 
 static inline long rmi_delegate_page(phys_addr_t phys)
 {
@@ -84,6 +95,19 @@ static inline int rmi_rmm_config_set(unsigned long cfg_ptr)
 static inline long rmi_rmm_activate(struct rmi_sro_state *sro)
 {
 	sro->regs = (struct arm_smccc_1_2_regs){ SMC_RMI_RMM_ACTIVATE };
+
+	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
+}
+
+/**
+ * rmi_rmm_deactivate() - Deactivate the RMM and reclaim its metadata
+ * @sro: Preallocated SRO context to be used
+ *
+ * Return: 0 on success, positive RMI result code or negative Linux error code
+ */
+static inline long rmi_rmm_deactivate(struct rmi_sro_state *sro)
+{
+	sro->regs = (struct arm_smccc_1_2_regs){ SMC_RMI_RMM_DEACTIVATE };
 
 	return rmi_sro_execute(sro, GFP_KERNEL, NULL);
 }

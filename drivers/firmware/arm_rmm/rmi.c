@@ -7,6 +7,7 @@
 #include <linux/cpufeature.h>
 #include <linux/crash_dump.h>
 #include <linux/kexec.h>
+#include <linux/maple_tree.h>
 #include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
@@ -17,6 +18,7 @@
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/xarray.h>
 
 #include <asm/memory.h>
 #include <asm/pgtable-hwdef.h>
@@ -256,6 +258,97 @@ int rmi_sro_topup_node(struct rmi_sro_state *sro, unsigned long capacity,
 
 	return total ? 0 : -ENOMEM;
 }
+
+/*
+ * RMM-owned range metadata stored as a 63-bit xa_value payload:
+ *
+ *   [62:48] TRACKID[14:0]
+ *   [47:12] IPA[47:12] (reserved, currently zero)
+ *   [11:4]  RMI FID ordinal relative to SMC_RMI_VERSION
+ *   [3:0]   reserved flags
+ *
+ * Payload bit 0 is shifted to entry bit 1 by xa_mk_value(); entry bit 0
+ * remains the XArray value tag. This preserves all four flag bits while keeping
+ * the entry allocation-free for updates from atomic context.
+ */
+#define RMI_MT_TRACKID_MASK	GENMASK_ULL(62, 48)
+#define RMI_MT_IPA_MASK		GENMASK_ULL(47, 12)
+#define RMI_MT_SLOT_MASK		GENMASK_ULL(11, 4)
+
+#define RMI_TRACKID_GLOBAL	1
+
+static DEFINE_MTREE(rmi_mt);
+static bool rmi_sro_donate_tracking_failed;
+
+/* Boot SRO for global RMI allocations. */
+static struct rmi_sro_state *rmi_sro;
+
+static void rmi_region_store(struct rmi_sro_state *sro, phys_addr_t phys,
+			     unsigned long size, void *entry)
+{
+	int ret;
+
+	if (sro != rmi_sro || !size)
+		return;
+
+	ret = mtree_store_range(&rmi_mt, phys, phys + size - 1,
+				entry, GFP_ATOMIC);
+	if (ret && entry)
+		WRITE_ONCE(rmi_sro_donate_tracking_failed, true);
+
+	WARN_ONCE(ret, "RMI: ownership tracking update failed: %d\n", ret);
+}
+
+void rmi_region_track(struct rmi_sro_state *sro, phys_addr_t phys,
+		      unsigned long size, unsigned long fid,
+		      unsigned long ipa)
+{
+	unsigned long mark;
+
+	if (sro != rmi_sro || !size)
+		return;
+
+	mark = FIELD_PREP(RMI_MT_TRACKID_MASK, RMI_TRACKID_GLOBAL) |
+	       (ipa & RMI_MT_IPA_MASK) |
+	       FIELD_PREP(RMI_MT_SLOT_MASK, RMI_SMC_SLOT_IDX(fid));
+
+	rmi_region_store(sro, phys, size, xa_mk_value(mark));
+}
+
+void rmi_region_untrack(struct rmi_sro_state *sro, phys_addr_t phys,
+			unsigned long size)
+{
+	rmi_region_store(sro, phys, size, NULL);
+}
+
+static u64 rmi_mt_owned_bytes(int trackid)
+{
+	MA_STATE(mas, &rmi_mt, 0, 0);
+	void *entry;
+	u64 total = 0;
+
+	rcu_read_lock();
+	mas_for_each(&mas, entry, ULONG_MAX) {
+		unsigned long mark = xa_to_value(entry);
+
+		if (trackid >= 0 &&
+		    FIELD_GET(RMI_MT_TRACKID_MASK, mark) != trackid)
+			continue;
+		total += mas.last - mas.index + 1;
+	}
+	rcu_read_unlock();
+
+	return total;
+}
+
+u64 rmi_region_owned_bytes(struct rmi_sro_state *sro)
+{
+	if (sro != rmi_sro)
+		return 0;
+
+	return rmi_mt_owned_bytes(RMI_TRACKID_GLOBAL);
+}
+
 /*
  * Allocate one delegated page for RMM use.
  *
@@ -669,6 +762,7 @@ out:
 	} else {
 		/* RMM kept the consumed prefix: record it, cache any tail. */
 		phys = RMI_ADDR_RANGE_ADDR(sro->addr_list[sro->addr_count]);
+		rmi_region_track(sro, phys, donated_size, sro->regs.a0, 0);
 		if (donated_size < size)
 			rmi_sro_cache_donated_tail(sro, phys + donated_size,
 						   size - donated_size, state);
@@ -859,11 +953,15 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 		phys_addr_t phys = RMI_ADDR_RANGE_ADDR(entry);
 
 		if (consumed_blocks >= entry_count) {
+			rmi_region_track(sro, phys, entry_count * block_size,
+					 sro->regs.a0, 0);
 			consumed_blocks -= entry_count;
 			continue;
 		}
 
 		if (consumed_blocks) {
+			rmi_region_track(sro, phys, consumed_blocks * block_size,
+					 sro->regs.a0, 0);
 			phys += consumed_blocks * block_size;
 			entry_count -= consumed_blocks;
 			consumed_blocks = 0;
@@ -877,6 +975,7 @@ static int rmi_sro_donate_noncontig(struct rmi_sro_state *sro,
 			unsigned long donated_size =
 				partial_granules << PAGE_SHIFT;
 
+			rmi_region_track(sro, phys, donated_size, sro->regs.a0, 0);
 			rmi_sro_free_donated_tail(phys + donated_size,
 						  block_size - donated_size,
 						  state);
@@ -1302,7 +1401,6 @@ static int rmi_configure(struct rmi_sro_state *sro)
 		pr_err("RMM does not support %luKB granules\n", PAGE_SIZE >> 10);
 		return -ENXIO;
 	}
-
 	config = (struct rmm_config *)get_zeroed_page(GFP_KERNEL);
 	if (!config)
 		return -ENOMEM;
@@ -1806,37 +1904,24 @@ bool is_rmi_available(void)
 	return arm64_rmi_is_available;
 }
 
-/*
- * Best-effort fold of the RMM's L1 GPTs back to blocks on the way into a kexec.
- * Walk every L0 block across all memory once, in ascending order (mirroring the
- * cold-boot create loop, rmi_init_metadata), asking the RMM to destroy each L1
- * GPT; the RMM returns the freed L1 granules through the SRO reclaim path.
- */
-static void rmi_destroy_metadata(struct rmi_sro_state *sro)
+static void rmi_destroy_gpt_range(struct rmi_sro_state *sro,
+				  phys_addr_t start, phys_addr_t end)
 {
 	unsigned long l0gpt_sz = rmi_l0gpt_size();
-	const struct memblock_region *r;
-	phys_addr_t last_end = 0;
-	phys_addr_t start, end;
 
-	/* First pass: fold every L0 block across all memory, in ascending order. */
-	for_each_mem_region(r) {
-		if (memblock_is_nomap(r))
+	while (start < end) {
+		phys_addr_t state_top;
+		unsigned long state;
+
+		if (rmi_query_gpt_info(start, end, &state_top, &state))
+			return;
+
+		if (state != RMI_GPT_PAR_HOST_CREATED) {
+			start = state_top;
 			continue;
+		}
 
-		start = ALIGN_DOWN(PFN_PHYS(memblock_region_memory_base_pfn(r)),
-				   l0gpt_sz);
-		end = ALIGN(PFN_PHYS(memblock_region_memory_end_pfn(r)),
-			    l0gpt_sz);
-
-		/* Skip L0 blocks already handled by an earlier region. */
-		if (start < last_end)
-			start = last_end;
-		if (start >= end)
-			continue;
-		last_end = end;
-
-		while (start < end) {
+		while (start < state_top) {
 			rmi_gpt_l1_destroy(start, sro);
 			start += l0gpt_sz;
 		}
@@ -1844,11 +1929,40 @@ static void rmi_destroy_metadata(struct rmi_sro_state *sro)
 }
 
 /*
- * SRO allocated for RMM bring-up in arm64_init_rmi() and reused here to drive
- * the kexec hand-off. Kept allocated for the system lifetime with an empty hot
- * list (bring-up frees the boot leftovers); NULL if bring-up failed.
+ * Destroy non-self-describing L1 GPTs first, reclaiming their backing memory
+ * from the PARs which describe it. A second pass then destroys those
+ * self-describing L1 GPTs after their dependent backing has been reclaimed.
  */
-static struct rmi_sro_state *rmi_sro;
+static void rmi_destroy_metadata(struct rmi_sro_state *sro)
+{
+	unsigned long l0gpt_sz = rmi_l0gpt_size();
+	struct memblock_region *r;
+
+	for (unsigned int pass = 0; pass < 2; pass++) {
+		phys_addr_t last_end = 0;
+
+		for_each_mem_region(r) {
+			phys_addr_t start, end;
+
+			if (memblock_is_nomap(r))
+				continue;
+
+			start = ALIGN_DOWN(
+				PFN_PHYS(memblock_region_memory_base_pfn(r)), l0gpt_sz);
+			end = ALIGN(PFN_PHYS(memblock_region_memory_end_pfn(r)),
+				    l0gpt_sz);
+
+			/* Skip L0 blocks handled by an earlier memory region. */
+			if (start < last_end)
+				start = last_end;
+			if (start >= end)
+				continue;
+			last_end = end;
+
+			rmi_destroy_gpt_range(sro, start, end);
+		}
+	}
+}
 
 /*
  * On the way into a kexec, fold away the L1 GPTs the RMM can release. This runs
@@ -1856,14 +1970,41 @@ static struct rmi_sro_state *rmi_sro;
  * where the GPT_L1_DESTROY SRO is safe to call.
  *
  * Only act on a kexec (kexec_in_progress is set by kernel_kexec() just before
- * the reboot chain runs). A normal reboot/poweroff resets the firmware, which
- * reinitialises the RMM, so there is nothing to hand over.
+ * the reboot chain runs). A normal reboot/poweroff resets the firmware and
+ * reinitialises the RMM, so explicit deactivation is unnecessary.
  */
 static int rmi_reboot_notify(struct notifier_block *nb, unsigned long action,
 			     void *data)
 {
-	if (kexec_in_progress && rmi_sro)
+	if (kexec_in_progress && rmi_sro) {
+		u64 remaining_bytes;
+		long ret;
+
 		rmi_destroy_metadata(rmi_sro);
+		ret = rmi_rmm_deactivate(rmi_sro);
+		remaining_bytes = rmi_region_owned_bytes(rmi_sro);
+
+		if (ret)
+			pr_err("RMI: RMM deactivate failed: 0x%lx\n", ret);
+		if (READ_ONCE(rmi_sro_donate_tracking_failed))
+			pr_err("RMI: metadata ownership tracking is incomplete\n");
+		if (remaining_bytes)
+			pr_err("RMI: %llu KiB of metadata was not reclaimed\n",
+			       remaining_bytes >> 10);
+		else if (!ret)
+			pr_info("RMI: RMM deactivated; all metadata reclaimed\n");
+
+		/*
+		 * A reboot notifier cannot veto the restart, so if any RMM-owned
+		 * memory remains we must not let kexec proceed: the next kernel
+		 * has no handoff for these reservations and would treat the
+		 * still-owned granules as free RAM, corrupting live RMM state.
+		 * Halt loudly instead of booting into a known-inconsistent map.
+		 */
+		if (ret || remaining_bytes ||
+		    READ_ONCE(rmi_sro_donate_tracking_failed))
+			panic("RMI: RMM memory still owned, unsafe to kexec\n");
+	}
 	return NOTIFY_DONE;
 }
 
@@ -1873,6 +2014,8 @@ static struct notifier_block rmi_reboot_nb = {
 
 static int __init arm64_init_rmi(void)
 {
+	u64 remaining_bytes;
+	long deactivate_ret;
 	int ret;
 
 	/*
@@ -1896,13 +2039,16 @@ static int __init arm64_init_rmi(void)
 	if (!rmi_sro)
 		return -ENOMEM;
 
+	/* Start tracking global SRO donations before activating the RMM. */
+	register_reboot_notifier(&rmi_reboot_nb);
+
 	/* Configure and activate the RMM, then build the GPT L1 tables. */
 	ret = rmi_configure(rmi_sro);
 	if (ret)
 		goto out_free_sro;
 	ret = rmi_init_metadata(rmi_sro);
 	if (ret)
-		goto out_free_sro;
+		goto out_deactivate;
 
 	arm64_rmi_is_available = true;
 	pr_info("RMI configured\n");
@@ -1913,13 +2059,36 @@ static int __init arm64_init_rmi(void)
 	 * reuses it to tear down the L1 GPTs on a subsequent kexec.
 	 */
 	rmi_sro_free(rmi_sro);
-	register_reboot_notifier(&rmi_reboot_nb);
 	return 0;
 
-out_free_sro:
+out_deactivate:
+	/*
+	 * Beta3 permits L1 GPT destruction before tracking is configured. Undo
+	 * any partial GPT setup, then return the RMM to INIT and reclaim every
+	 * activation donation. Keep the notifier and tracking state only if the
+	 * firmware fails to return all memory, so a later kexec can retry.
+	 */
+	rmi_destroy_metadata(rmi_sro);
+	deactivate_ret = rmi_rmm_deactivate(rmi_sro);
+	remaining_bytes = rmi_region_owned_bytes(rmi_sro);
+	if (deactivate_ret)
+		pr_err("RMI: setup rollback deactivate failed: 0x%lx\n",
+		       deactivate_ret);
+	if (remaining_bytes)
+		pr_err("RMI: setup rollback left %llu KiB owned by RMM\n",
+		       remaining_bytes >> 10);
+	if (deactivate_ret || remaining_bytes)
+		goto out_free_sro;
+
+	unregister_reboot_notifier(&rmi_reboot_nb);
 	rmi_sro_free(rmi_sro);
 	kfree(rmi_sro);
 	rmi_sro = NULL;
+	return 0;
+
+out_free_sro:
+	/* Keep ownership tracking alive if setup consumed RMM metadata. */
+	rmi_sro_free(rmi_sro);
 	return 0;
 }
 subsys_initcall(arm64_init_rmi);
