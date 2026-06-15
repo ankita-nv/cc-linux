@@ -116,6 +116,12 @@ static void cca_viommu_destroy(struct iommufd_viommu *viommu)
 {
 	struct cca_viommu *cca = to_cca_viommu(viommu);
 
+	/*
+	 * Tear down any VSMMU layered on this viommu first (no-op for the
+	 * PSMMU-only case), before dropping the PSMMU reference below.
+	 */
+	kvm_realm_unregister_vsmmu(viommu->kvm_file->private_data,
+				   viommu->obj.id);
 	if (cca->psmmu)
 		cca_psmmu_put(cca->psmmu);
 }
@@ -394,18 +400,31 @@ int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
 		    struct iommu_domain *parent,
 		    const struct iommu_user_data *user_data)
 {
+	struct iommu_viommu_arm_realm_vsmmuv3 arg = {};
 	struct arm_smmu_realm_params params;
 	struct cca_viommu *cca = to_cca_viommu(viommu);
 	struct cca_psmmu *psmmu;
 	struct kvm *kvm;
 	int ret;
 
-	(void)user_data;
-
 	if (viommu->type != IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3)
 		return -EOPNOTSUPP;
 	if (!viommu->kvm_file)
 		return -EINVAL;
+
+	/*
+	 * No user_data => PSMMU-only (VSMMU-off / no-iommu guest). With the
+	 * VSMMU flag set, a guest-visible VSMMU is layered on the PSMMU below.
+	 */
+	if (user_data) {
+		ret = iommu_copy_struct_from_user(&arg, user_data,
+						  IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3,
+						  idr);
+		if (ret)
+			return ret;
+	}
+	if (arg.flags & ~IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_VSMMU)
+		return -EOPNOTSUPP;
 	kvm = viommu->kvm_file->private_data;
 	ret = kvm_realm_ensure_created(kvm);
 	if (ret)
@@ -422,6 +441,36 @@ int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
 	psmmu = cca_psmmu_get(&params);
 	if (IS_ERR(psmmu))
 		return PTR_ERR(psmmu);
+
+	/*
+	 * PSMMU is now active for this device. If the guest wants a VSMMU,
+	 * create it on top (per-viommu, keyed by viommu->obj.id). On failure,
+	 * drop the PSMMU reference taken above.
+	 */
+	if (arg.flags & IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_VSMMU) {
+		struct rmi_vsmmu_params *vparams;
+		int i;
+
+		vparams = (struct rmi_vsmmu_params *)get_zeroed_page(GFP_KERNEL);
+		if (!vparams) {
+			ret = -ENOMEM;
+		} else {
+			vparams->reg_base = arg.reg_base;
+			vparams->reg_top = arg.reg_top;
+			vparams->aidr = arg.aidr;
+			for (i = 0; i < ARRAY_SIZE(vparams->idr); i++)
+				vparams->idr[i] = arg.idr[i];
+
+			ret = kvm_realm_register_vsmmu(kvm, viommu->obj.id,
+						       vparams);
+			free_page((unsigned long)vparams);
+		}
+		if (ret) {
+			cca_psmmu_put(psmmu);
+			return ret;
+		}
+	}
+
 	cca->psmmu = psmmu;
 	viommu->ops = &cca_viommu_ops;
 	return 0;
