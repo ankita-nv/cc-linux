@@ -52,6 +52,8 @@
 #define SMC_RMI_RTT_SET_RIPAS			SMC_RMI_CALL(0x0169)
 #define SMC_RMI_VSMMU_CREATE			SMC_RMI_CALL(0x016a)
 #define SMC_RMI_VSMMU_DESTROY			SMC_RMI_CALL(0x016b)
+#define SMC_RMI_VSMMU_MAP			SMC_RMI_CALL(0x016c)
+#define SMC_RMI_VSMMU_UNMAP			SMC_RMI_CALL(0x016d)
 
 #define SMC_RMI_RMM_CONFIG_SET			SMC_RMI_CALL(0x016e)
 #define SMC_RMI_PSMMU_IRQ_NOTIFY		SMC_RMI_CALL(0x016f)
@@ -837,6 +839,19 @@ static_assert(offsetof(struct rmi_psmmu_params, gerr_addr) == 0x08);
 static_assert(offsetof(struct rmi_psmmu_params, eventq_addr) == 0x18);
 static_assert(offsetof(struct rmi_psmmu_params, priq_data) == 0x30);
 static_assert(sizeof(struct rmi_psmmu_params) == SZ_4K);
+
+struct rmi_vsmmu_params {
+	union {
+		struct {
+			u64 flags;
+			u64 reg_base;
+			u64 reg_top;
+			u64 aidr;
+			u64 idr[7];
+		};
+		u8 padding0[0x1000];
+	};
+};
 
 enum rmi_vdev_state {
 	RMI_VDEV_NEW,

@@ -2227,6 +2227,61 @@ int rmi_init_device_gpt_range(phys_addr_t phys, unsigned long size)
 	return ret;
 }
 
+static int rmi_direct_call(struct arm_smccc_1_2_regs *regs,
+			   unsigned long *rmi_ret)
+{
+	struct arm_smccc_1_2_regs res;
+
+	rmi_smccc_invoke(regs, &res);
+	*rmi_ret = res.a0;
+	return 0;
+}
+
+int rmi_vsmmu_create(unsigned long rd_phys, unsigned long vsmmu_phys,
+		     unsigned long params_phys, unsigned long *rmi_ret)
+{
+	struct arm_smccc_1_2_regs regs = {
+		SMC_RMI_VSMMU_CREATE, rd_phys, vsmmu_phys, params_phys
+	};
+
+	return rmi_direct_call(&regs, rmi_ret);
+}
+EXPORT_SYMBOL_GPL(rmi_vsmmu_create);
+
+int rmi_vsmmu_destroy(unsigned long rd_phys, unsigned long vsmmu_phys,
+		      unsigned long *rmi_ret)
+{
+	struct arm_smccc_1_2_regs regs = {
+		SMC_RMI_VSMMU_DESTROY, rd_phys, vsmmu_phys
+	};
+
+	return rmi_direct_call(&regs, rmi_ret);
+}
+EXPORT_SYMBOL_GPL(rmi_vsmmu_destroy);
+
+int rmi_vsmmu_map(unsigned long rd_phys, unsigned long vsmmu_phys,
+		  unsigned long ipa, unsigned long level,
+		  unsigned long *rmi_ret)
+{
+	struct arm_smccc_1_2_regs regs = {
+		SMC_RMI_VSMMU_MAP, rd_phys, vsmmu_phys, ipa, level
+	};
+
+	return rmi_direct_call(&regs, rmi_ret);
+}
+EXPORT_SYMBOL_GPL(rmi_vsmmu_map);
+
+int rmi_vsmmu_unmap(unsigned long rd_phys, unsigned long ipa,
+		    unsigned long vsmmu_phys, unsigned long *rmi_ret)
+{
+	struct arm_smccc_1_2_regs regs = {
+		SMC_RMI_VSMMU_UNMAP, rd_phys, ipa, vsmmu_phys
+	};
+
+	return rmi_direct_call(&regs, rmi_ret);
+}
+EXPORT_SYMBOL_GPL(rmi_vsmmu_unmap);
+
 bool is_rmi_available(void)
 {
 	return arm64_rmi_is_available;

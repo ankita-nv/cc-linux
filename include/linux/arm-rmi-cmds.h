@@ -87,6 +87,15 @@ long rmi_undelegate_range(phys_addr_t phys, unsigned long size,
 
 int rmi_init_device_tracking(phys_addr_t phys, unsigned long size);
 int rmi_init_device_gpt_range(phys_addr_t phys, unsigned long size);
+int rmi_vsmmu_create(unsigned long rd_phys, unsigned long vsmmu_phys,
+		     unsigned long params_phys, unsigned long *rmi_ret);
+int rmi_vsmmu_destroy(unsigned long rd_phys, unsigned long vsmmu_phys,
+		      unsigned long *rmi_ret);
+int rmi_vsmmu_map(unsigned long rd_phys, unsigned long vsmmu_phys,
+		  unsigned long ipa, unsigned long level,
+		  unsigned long *rmi_ret);
+int rmi_vsmmu_unmap(unsigned long rd_phys, unsigned long ipa,
+		    unsigned long vsmmu_phys, unsigned long *rmi_ret);
 
 int rmi_sro_topup_node(struct rmi_sro_state *sro, unsigned long capacity,
 		       unsigned long min, int nid);
