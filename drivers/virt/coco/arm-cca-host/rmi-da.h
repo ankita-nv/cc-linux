@@ -153,6 +153,8 @@ struct cca_host_tdi {
 	void *rmm_vdev;
 	/* Protected by the PCI TSM PF0 lock. */
 	enum rmi_vdev_state state;
+	/* Realm VSMMU this TDI is bound to (NULL if none); holds a kref */
+	struct realm_vsmmu *vsmmu;
 	/* DPT L1 regions created for this TDI's mappings, PF0 lock. */
 	struct list_head dpt_regions;
 	/* protected by cca_host_pdev_dsc.object_lock */
@@ -257,7 +259,7 @@ int cca_pdev_disconnect_stream(struct pci_dev *pdev1,
 		struct pci_dev *pdev2, unsigned long stream_handle);
 void *cca_vdev_create(struct cca_host_tdi *host_tdi, struct realm *realm,
 		      struct pci_dev *pdev, struct pci_dev *pf0_dev,
-		      u32 guest_rid);
+		      u32 guest_rid, u32 viommu_id);
 int cca_pdev_refresh_stream_key(struct pci_dev *pdev1,
 		struct pci_dev *pdev2, unsigned long stream_handle);
 int cca_pdev_purge_stream_key(struct pci_dev *pdev1,

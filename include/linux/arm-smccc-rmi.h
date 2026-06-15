@@ -864,6 +864,9 @@ enum rmi_vdev_state {
 };
 
 #define MAX_VDEV_ADDR_RANGE 8
+
+#define RMI_VDEV_PARAMS_USE_VSMMU (1 << 0)
+
 struct rmi_vdev_params {
 	union {
 		struct {

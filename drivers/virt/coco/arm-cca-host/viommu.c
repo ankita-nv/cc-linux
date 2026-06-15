@@ -174,6 +174,13 @@ static void cca_vdevice_destroy(struct iommufd_vdevice *vdev)
 
 	scoped_guard(mutex, &pf0->lock) {
 		cca_vdev_destroy(host_tdi, realm, pdev, dsm_dev);
+		/*
+		 * RMM dropped its reference to the VSMMU when the vdev was
+		 * destroyed above; drop the reference held since
+		 * cca_vdev_create().
+		 */
+		kvm_realm_put_vsmmu(host_tdi->vsmmu);
+		host_tdi->vsmmu = NULL;
 		kvfree(host_tdi->interface_report);
 		kvfree(host_tdi->measurements);
 		cca_psmmu_destroy_l2(cca->psmmu, cca_vdev->l2_sid, dev);
@@ -234,7 +241,8 @@ static int cca_vdevice_init(struct iommufd_vdevice *vdev)
 		ret = cca_psmmu_create_l2(psmmu, params.l2_sid);
 		if (!ret) {
 			rmm_vdev = cca_vdev_create(host_tdi, &kvm->arch.realm,
-						   pdev, dsm_dev, vdev->virt_id);
+						   pdev, dsm_dev, vdev->virt_id,
+						   vdev->viommu->obj.id);
 			if (IS_ERR_OR_NULL(rmm_vdev)) {
 				ret = rmm_vdev ? PTR_ERR(rmm_vdev) : -ENOMEM;
 				cca_psmmu_destroy_l2(psmmu, params.l2_sid, dev);

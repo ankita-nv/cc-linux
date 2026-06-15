@@ -1143,11 +1143,12 @@ static int cca_vdev_unlock_for_destroy(struct cca_host_tdi *host_tdi,
 
 void *cca_vdev_create(struct cca_host_tdi *host_tdi, struct realm *realm,
 		      struct pci_dev *pdev, struct pci_dev *pf0_dev,
-		      u32 guest_rid)
+		      u32 guest_rid, u32 viommu_id)
 {
 	phys_addr_t rd_phys = virt_to_phys(realm->rd);
 	struct rmi_vdev_params *params = NULL;
 	struct cca_host_pdev_dsc *pdev_dsc;
+	struct realm_vsmmu *vsmmu = NULL;
 	phys_addr_t rmm_pdev_phys;
 	phys_addr_t rmm_vdev_phys;
 	bool should_free = true;
@@ -1186,6 +1187,23 @@ void *cca_vdev_create(struct cca_host_tdi *host_tdi, struct realm *realm,
 	params->vdev_id = guest_rid;
 	params->tdi_id = pci_get_tdi_id(pdev);
 
+	/*
+	 * If the vdevice is associated with a Realm VSMMU, hand the VSMMU's
+	 * RMM-side handle and the guest StreamID (== full virtual RID, NOT
+	 * truncated) to RMI_VDEV_CREATE so the vdev is wired to that VSMMU.
+	 * The kref is held until the vdevice is destroyed. A Realm viommu
+	 * always has an object ID, including the PSMMU-only case; if no VSMMU
+	 * is registered under that ID, USE_VSMMU stays clear.
+	 */
+	if (viommu_id) {
+		vsmmu = kvm_realm_get_vsmmu(host_tdi->kvm, viommu_id);
+		if (vsmmu) {
+			params->flags |= RMI_VDEV_PARAMS_USE_VSMMU;
+			params->vsmmu_addr = kvm_realm_vsmmu_phys(vsmmu);
+			params->vsid = guest_rid;
+		}
+	}
+
 	init_vdev_params_mmio_range(pdev, params);
 
 	rmm_pdev_phys = virt_to_phys(pdev_dsc->rmm_pdev);
@@ -1207,6 +1225,9 @@ void *cca_vdev_create(struct cca_host_tdi *host_tdi, struct realm *realm,
 	if (ret)
 		goto err_vdev_comm;
 	host_tdi->state = RMI_VDEV_UNLOCKED;
+
+	/* Create succeeded: transfer the VSMMU kref to host_tdi (else freed below). */
+	host_tdi->vsmmu = vsmmu;
 
 	free_page((unsigned long)params);
 	return rmm_vdev;
@@ -1232,6 +1253,8 @@ err_granule_delegate:
 	if (should_free)
 		free_page((unsigned long)rmm_vdev);
 err_out:
+	/* On any failure the kref was not transferred to host_tdi; drop it. */
+	kvm_realm_put_vsmmu(vsmmu);
 	return ERR_PTR(ret);
 }
 
