@@ -3593,6 +3593,216 @@ void kvm_complete_dev_empty_change(struct kvm_vcpu *vcpu,
 	}
 }
 
+static int realm_vsmmu_unmap_pages(struct realm_vsmmu *vsmmu, size_t npages)
+{
+	phys_addr_t rd_phys = virt_to_phys(vsmmu->kvm->arch.realm.rd);
+	phys_addr_t vsmmu_phys = virt_to_phys(vsmmu->vsmmu_page);
+	unsigned long rmi_ret;
+	int first_err = 0;
+	size_t i;
+
+	for (i = 0; i < npages; i++) {
+		unsigned long ipa = vsmmu->params->reg_base + i * PAGE_SIZE;
+		int ret;
+
+		ret = rmi_vsmmu_unmap(rd_phys, ipa, vsmmu_phys, &rmi_ret);
+		if (WARN_ONCE(ret || RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS,
+			      "RMI: vSMMU unmap failed: ret=%d rmi=%lx\n", ret,
+			      rmi_ret)) {
+			if (!first_err)
+				first_err = ret ?: -EIO;
+		}
+	}
+
+	return first_err;
+}
+
+static bool realm_vsmmu_destroy_object(struct realm_vsmmu *vsmmu)
+{
+	phys_addr_t rd_phys = virt_to_phys(vsmmu->kvm->arch.realm.rd);
+	phys_addr_t vsmmu_phys = virt_to_phys(vsmmu->vsmmu_page);
+	unsigned long rmi_ret;
+	int ret;
+
+	ret = rmi_vsmmu_destroy(rd_phys, vsmmu_phys, &rmi_ret);
+	if (WARN_ONCE(ret || RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS,
+		      "RMI: vSMMU destroy failed: ret=%d rmi=%lx\n", ret,
+		      rmi_ret))
+		return false;
+
+	return true;
+}
+
+static void realm_vsmmu_release(struct kref *kref)
+{
+	struct realm_vsmmu *vsmmu =
+		container_of(kref, struct realm_vsmmu, kref);
+	phys_addr_t vsmmu_phys = virt_to_phys(vsmmu->vsmmu_page);
+	size_t npages;
+
+	npages = (vsmmu->params->reg_top - vsmmu->params->reg_base) / PAGE_SIZE;
+	realm_vsmmu_unmap_pages(vsmmu, npages);
+	if (realm_vsmmu_destroy_object(vsmmu))
+		realm_free_delegated_page(&vsmmu->kvm->arch.realm, vsmmu_phys);
+	else
+		WARN_ONCE(1, "RMI: leaking live vSMMU granule %pa\n",
+			  &vsmmu_phys);
+	free_page((unsigned long)vsmmu->params);
+	kvm_put_kvm(vsmmu->kvm);
+	kfree(vsmmu);
+}
+
+/*
+ * Register a Realm VSMMU. @vsmmu_id is the iommufd viommu object id; @params
+ * carries the guest VSMMU register values. The host delegates a granule that
+ * becomes the VSMMU handle for RMI_VSMMU_CREATE/DESTROY. VSMMU registration is
+ * independent of the realm PSMMU.
+ */
+int kvm_realm_register_vsmmu(struct kvm *kvm, u32 vsmmu_id,
+			     struct rmi_vsmmu_params *params)
+{
+	struct realm *realm = &kvm->arch.realm;
+	phys_addr_t rd_phys = virt_to_phys(realm->rd);
+	phys_addr_t vsmmu_phys;
+	struct realm_vsmmu *vsmmu, *old;
+	unsigned long rmi_ret = 0;
+	size_t mmio_size, npages, i;
+	int ret;
+
+	if (WARN_ON(!vsmmu_id))
+		return -ENXIO;
+	if (!PAGE_ALIGNED(params->reg_base) || !PAGE_ALIGNED(params->reg_top) ||
+	    params->reg_top <= params->reg_base)
+		return -EINVAL;
+
+	vsmmu = kzalloc_obj(*vsmmu);
+	if (!vsmmu)
+		return -ENOMEM;
+
+	kref_init(&vsmmu->kref);
+	kvm_get_kvm(kvm);
+	vsmmu->kvm = kvm;
+
+	vsmmu_phys = alloc_delegated_granule(realm, realm->sro, GFP_KERNEL);
+	if (vsmmu_phys == PHYS_ADDR_MAX) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	vsmmu->vsmmu_page = phys_to_virt(vsmmu_phys);
+
+	static_assert(sizeof(struct rmi_vsmmu_params) <= PAGE_SIZE);
+
+	vsmmu->params = (struct rmi_vsmmu_params *)get_zeroed_page(GFP_KERNEL);
+	if (!vsmmu->params) {
+		ret = -ENOMEM;
+		goto out_undelegate;
+	}
+	*vsmmu->params = *params;
+
+	ret = rmi_vsmmu_create(rd_phys, vsmmu_phys, virt_to_phys(vsmmu->params),
+			       &rmi_ret);
+	if (ret || RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS) {
+		ret = -EIO;
+		goto out_free_params;
+	}
+
+	mmio_size = params->reg_top - params->reg_base;
+	npages = mmio_size / PAGE_SIZE;
+	for (i = 0; i < npages; i++) {
+		unsigned long ipa = params->reg_base + i * PAGE_SIZE;
+		struct rtt_entry rtte;
+
+		ret = rmi_rtt_read_entry(rd_phys, ipa, RMM_RTT_MAX_LEVEL,
+					 &rtte);
+		if (ret)
+			goto out_unmap_vsmmu;
+
+		if (rtte.walk_level != RMM_RTT_MAX_LEVEL) {
+			ret = realm_create_rtt_levels(realm, ipa,
+						      rtte.walk_level,
+						      RMM_RTT_MAX_LEVEL,
+						      realm->sro);
+			if (ret)
+				goto out_unmap_vsmmu;
+		}
+
+		ret = rmi_vsmmu_map(rd_phys, vsmmu_phys, ipa, RMM_RTT_MAX_LEVEL,
+				    &rmi_ret);
+		if (ret || RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS) {
+			ret = ret ?: -EIO;
+			goto out_unmap_vsmmu;
+		}
+	}
+
+	/*
+	 * Publish only after the vsmmu is fully built, so a concurrent
+	 * kvm_realm_get_vsmmu() never observes a half-initialized object.
+	 */
+	old = xa_cmpxchg(&realm->vsmmus, vsmmu_id, NULL, vsmmu, GFP_KERNEL);
+	if (xa_is_err(old)) {
+		ret = xa_err(old);
+		goto out_unmap_vsmmu;
+	}
+	if (old) {
+		ret = -EEXIST;
+		goto out_unmap_vsmmu;
+	}
+	return 0;
+
+out_unmap_vsmmu:
+	realm_vsmmu_unmap_pages(vsmmu, i);
+	if (!realm_vsmmu_destroy_object(vsmmu)) {
+		WARN_ONCE(1, "RMI: leaking live vSMMU granule %pa\n",
+			  &vsmmu_phys);
+		goto out_free_params_leak;
+	}
+out_free_params:
+	free_page((unsigned long)vsmmu->params);
+out_undelegate:
+	realm_free_delegated_page(realm, vsmmu_phys);
+	goto out_free;
+out_free_params_leak:
+	free_page((unsigned long)vsmmu->params);
+out_free:
+	kvm_put_kvm(vsmmu->kvm);
+	kfree(vsmmu);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kvm_realm_register_vsmmu);
+
+void kvm_realm_unregister_vsmmu(struct kvm *kvm, u32 vsmmu_id)
+{
+	struct realm_vsmmu *vsmmu;
+
+	vsmmu = xa_erase(&kvm->arch.realm.vsmmus, vsmmu_id);
+	if (!vsmmu)
+		return;
+	/* Drop the alloc-time ref; teardown runs once the last ref is put. */
+	kref_put(&vsmmu->kref, realm_vsmmu_release);
+}
+EXPORT_SYMBOL_GPL(kvm_realm_unregister_vsmmu);
+
+struct realm_vsmmu *kvm_realm_get_vsmmu(struct kvm *kvm, u32 vsmmu_id)
+{
+	struct xarray *xa = &kvm->arch.realm.vsmmus;
+	struct realm_vsmmu *vsmmu;
+
+	xa_lock(xa);
+	vsmmu = xa_load(xa, vsmmu_id);
+	if (vsmmu)
+		kref_get(&vsmmu->kref);
+	xa_unlock(xa);
+	return vsmmu;
+}
+EXPORT_SYMBOL_GPL(kvm_realm_get_vsmmu);
+
+void kvm_realm_put_vsmmu(struct realm_vsmmu *vsmmu)
+{
+	if (vsmmu)
+		kref_put(&vsmmu->kref, realm_vsmmu_release);
+}
+EXPORT_SYMBOL_GPL(kvm_realm_put_vsmmu);
+
 static int kvm_complete_vdev_map_validate(struct kvm_vcpu *vcpu)
 {
 	struct kvm *kvm = vcpu->kvm;
@@ -3959,6 +4169,11 @@ out_free_host:
 	 * above bailed out and intentionally leaked the Realm-owned (delegated)
 	 * granules. realm_free_unmap_desc_buf() is idempotent.
 	 */
+	/*
+	 * Registered vsmmus each hold a kvm_get_kvm() reference, so by VM
+	 * teardown the xarray is empty; free its internal radix nodes.
+	 */
+	xa_destroy(&realm->vsmmus);
 	realm_free_unmap_desc_buf(realm);
 	realm_free_sro(realm);
 	realm_dev_mappings_free(realm);
@@ -3977,6 +4192,8 @@ int kvm_init_realm(struct kvm *kvm)
 		if (trackid < 0)
 			return trackid;
 	}
+
+	xa_init(&realm->vsmmus);
 
 	ret = realm_alloc_sro(realm, trackid);
 	if (ret) {

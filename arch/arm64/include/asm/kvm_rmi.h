@@ -86,6 +86,24 @@ struct realm {
 	unsigned long *unmap_desc_buf;
 	phys_addr_t unmap_desc_pa;
 	unsigned long unmap_desc_cap;
+	/* Realm VSMMUs layered on the realm PSMMU, indexed by iommufd viommu id */
+	struct xarray vsmmus;
+};
+
+/**
+ * struct realm_vsmmu - Realm VSMMU registration state
+ * @vsmmu_page: host-delegated granule that is the VSMMU handle; passed to
+ *              RMI_VSMMU_CREATE and re-passed to RMI_VSMMU_DESTROY to identify
+ *              the VSMMU (see arch/arm64/kernel/rmi.c)
+ * @params: kept rmi_vsmmu_params page handed to RMI_VSMMU_CREATE
+ * @kref: lifetime; alloc holds one ref, each bound vdev holds one
+ * @kvm: owning realm (holds a kvm_get_kvm() reference)
+ */
+struct realm_vsmmu {
+	void *vsmmu_page;
+	struct rmi_vsmmu_params *params;
+	struct kref kref;
+	struct kvm *kvm;
 };
 
 /**
@@ -190,5 +208,21 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 		unsigned long end_ipa, unsigned long start_pa);
 int realm_dev_mem_unmap(struct kvm *kvm, unsigned long vdev_phys);
 void realm_destroy_dpt_l1(struct kvm *kvm, phys_addr_t base);
+
+int kvm_realm_register_vsmmu(struct kvm *kvm, u32 vsmmu_id,
+			     struct rmi_vsmmu_params *params);
+void kvm_realm_unregister_vsmmu(struct kvm *kvm, u32 vsmmu_id);
+struct realm_vsmmu *kvm_realm_get_vsmmu(struct kvm *kvm, u32 vsmmu_id);
+void kvm_realm_put_vsmmu(struct realm_vsmmu *vsmmu);
+
+/*
+ * Identifier handed to RMI_VDEV_CREATE (rmi_vdev_params.vsmmu_addr) to wire a
+ * vdev to this VSMMU: the delegated VSMMU granule, i.e. the same handle passed
+ * to RMI_VSMMU_CREATE/DESTROY.
+ */
+static inline phys_addr_t kvm_realm_vsmmu_phys(const struct realm_vsmmu *vsmmu)
+{
+	return virt_to_phys(vsmmu->vsmmu_page);
+}
 
 #endif /* __ASM_KVM_RMI_H */
