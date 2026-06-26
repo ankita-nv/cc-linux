@@ -16,6 +16,37 @@
 
 #define RMM_RTT_MAX_LEVEL	KVM_PGTABLE_LAST_LEVEL
 
+/*
+ * Track every granule the host delegates to the RMM in a global region tree and
+ * report the amount currently owned by the RMM when a Realm shuts down. This
+ * is a debug aid - it adds a maple-tree store/erase per RTT/RD/REC/PGD
+ * delegate-undelegate - so it is off by default and enabled via the module
+ * parameter when investigating ownership accounting.
+ *
+ * The value is sampled when a Realm is created. Runtime changes affect only
+ * subsequently created Realms.
+ */
+static bool realm_track_leaks;
+module_param(realm_track_leaks, bool, 0644);
+MODULE_PARM_DESC(realm_track_leaks,
+		 "Track RMM-owned memory for newly created Realms (debug)");
+
+static __always_inline void realm_region_track(struct realm *realm,
+					       phys_addr_t phys, unsigned long size,
+					       unsigned long fid, unsigned long ipa)
+{
+	if (unlikely(realm->sro && realm->sro->trackid))
+		rmi_region_track(realm->sro, phys, size, fid, ipa);
+}
+
+static __always_inline void realm_region_untrack(struct realm *realm,
+						 phys_addr_t phys,
+						 unsigned long size)
+{
+	if (unlikely(realm->sro && realm->sro->trackid))
+		rmi_region_untrack(realm->sro, phys, size);
+}
+
 static inline unsigned long rmi_rtt_level_mapsize(int level)
 {
 	if (WARN_ON(level > KVM_PGTABLE_LAST_LEVEL))
@@ -94,6 +125,158 @@ static int find_map_level(struct realm *realm,
 	return level;
 }
 
+static int find_aligned_map_level(struct realm *realm,
+				  unsigned long ipa,
+				  phys_addr_t phys,
+				  unsigned long end)
+{
+	int level = KVM_PGTABLE_LAST_LEVEL;
+
+	while (level > get_start_level(realm)) {
+		unsigned long map_size = rmi_rtt_level_mapsize(level - 1);
+
+		if (!IS_ALIGNED(ipa | phys, map_size) ||
+		    (ipa + map_size) > end)
+			break;
+
+		level--;
+	}
+
+	return level;
+}
+
+/* Report the amount of memory still attributed to this Track ID. */
+static u64 realm_report_owned_granules(struct realm *realm)
+{
+	u64 owned;
+
+	if (!realm->sro->trackid)
+		return 0;
+
+	owned = rmi_region_owned_bytes(realm->sro);
+	if (owned)
+		pr_err("realm: Track ID %u, RMM currently owns %llu pages\n",
+		       realm->sro->trackid, owned >> PAGE_SHIFT);
+
+	return owned;
+}
+
+static void realm_free_sro(struct realm *realm)
+{
+	if (realm->sro) {
+		u64 owned;
+
+		rmi_sro_free(realm->sro);
+		owned = realm_report_owned_granules(realm);
+		if (realm->sro->trackid && !owned)
+			rmi_trackid_free(realm->sro->trackid);
+		kfree(realm->sro);
+		realm->sro = NULL;
+	}
+}
+
+static int realm_alloc_sro(struct realm *realm, u16 trackid)
+{
+	if (WARN_ONCE(realm->sro, "RMI: Realm SRO already allocated: %d\n",
+		      -EEXIST))
+		return -EEXIST;
+
+	realm->sro = kzalloc_obj(*realm->sro, GFP_KERNEL_ACCOUNT);
+	if (!realm->sro)
+		return -ENOMEM;
+
+	/*
+	 * Track this Realm's SRO donations in the shared RMI tree. When
+	 * realm_track_leaks is off, Track ID remains zero and every track/report path is
+	 * a no-op.
+	 */
+	realm->sro->trackid = trackid;
+
+	return 0;
+}
+
+/*
+ * Delegate a PA range using caller-owned SRO state.
+ *
+ * RMI_GRANULE_RANGE_DELEGATE may make forward progress on only a prefix of
+ * the requested range. Return that delegated prefix to the caller so it can
+ * either consume the granules or undelegate exactly the granules that changed
+ * ownership.
+ */
+static long realm_delegate_range(struct realm *realm, phys_addr_t phys,
+				 unsigned long size,
+				 unsigned long *delegated_size)
+{
+	unsigned long done;
+	long ret;
+
+	ret = rmi_delegate_range(phys, size, &done);
+	if (delegated_size)
+		*delegated_size = done;
+
+	/*
+	 * The delegated prefix [phys, phys + done) is now RMM-owned, so record it as
+	 * donated (treat delegated as donated). On a partial failure the caller
+	 * undelegates the prefix, dropping it again via realm_undelegate_range();
+	 * otherwise it stays tracked until the Realm returns the memory.
+	 */
+	realm_region_track(realm, phys, done,
+			   SMC_RMI_GRANULE_RANGE_DELEGATE, 0);
+	return ret;
+}
+
+static long realm_undelegate_range(struct realm *realm, phys_addr_t phys,
+				   unsigned long size,
+				   unsigned long *undelegated_size)
+{
+	unsigned long done;
+	long ret;
+
+	ret = rmi_undelegate_range(phys, size, &done);
+	if (undelegated_size)
+		*undelegated_size = done;
+
+	/*
+	 * Drop the prefix returned to NS from the ownership tree. On an error,
+	 * any unprocessed suffix remains RMM-owned and tracked.
+	 */
+	realm_region_untrack(realm, phys, done);
+	return ret;
+}
+
+static int realm_rmi_to_errno(long ret)
+{
+	if (ret == RMI_SUCCESS)
+		return 0;
+
+	return ret < 0 ? (int)ret : -ENXIO;
+}
+
+static int realm_undelegate_map_range(struct realm *realm, phys_addr_t phys,
+				      unsigned long size)
+{
+	phys_addr_t addr;
+	phys_addr_t end = phys + size;
+	unsigned long undelegated_size = 0;
+	long ret;
+
+	if (!size)
+		return 0;
+
+	ret = realm_undelegate_range(realm, phys, size, &undelegated_size);
+	if (WARN_ONCE(ret != RMI_SUCCESS,
+		      "RMI: range undelegate failed: rmi=%ld err=%d\n",
+		      ret, -ENXIO)) {
+		/* Pages can't be returned to NS world so are lost */
+		for (addr = phys + undelegated_size; addr < end;
+		     addr += PAGE_SIZE)
+			get_page(phys_to_page(addr));
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
 static int rmi_addr_range_desc_decode(unsigned long desc,
 				      unsigned long expected_state,
 				      phys_addr_t *addr, unsigned long *size)
@@ -123,96 +306,11 @@ static int rmi_addr_range_desc_decode(unsigned long desc,
 	return 0;
 }
 
-static int find_aligned_map_level(struct realm *realm,
-				  unsigned long ipa,
-				  phys_addr_t phys,
-				  unsigned long end)
-{
-	int level = KVM_PGTABLE_LAST_LEVEL;
-
-	while (level > get_start_level(realm)) {
-		unsigned long map_size = rmi_rtt_level_mapsize(level - 1);
-
-		if (!IS_ALIGNED(ipa | phys, map_size) ||
-		    (ipa + map_size) > end)
-			break;
-
-		level--;
-	}
-
-	return level;
-}
-
-static void realm_free_sro(struct realm *realm)
-{
-	if (realm->sro) {
-		rmi_sro_free(realm->sro);
-		kfree(realm->sro);
-		realm->sro = NULL;
-	}
-}
-
-static int realm_alloc_sro(struct realm *realm)
-{
-	if (WARN_ON(realm->sro))
-		return -EEXIST;
-
-	realm->sro = kzalloc_obj(*realm->sro, GFP_KERNEL_ACCOUNT);
-	if (!realm->sro)
-		return -ENOMEM;
-
-	return 0;
-}
-
-/*
- * Delegate a PA range using caller-owned SRO state.
- *
- * RMI_GRANULE_RANGE_DELEGATE may make forward progress on only a prefix of
- * the requested range. Return that delegated prefix to the caller so it can
- * either consume the granules or undelegate exactly the granules that changed
- * ownership.
- */
-static int realm_delegate_range(phys_addr_t phys,
-				unsigned long size,
-				unsigned long *delegated_size)
-{
-	return rmi_delegate_range(phys, size, delegated_size);
-}
-
-static int realm_undelegate_range(phys_addr_t phys,
-				  unsigned long size,
-				  unsigned long *undelegated_size)
-{
-	return rmi_undelegate_range(phys, size, undelegated_size);
-}
-
-static int realm_undelegate_map_range(phys_addr_t phys,
-				      unsigned long size)
-{
-	phys_addr_t addr;
-	phys_addr_t end = phys + size;
-	unsigned long undelegated_size = 0;
-	int ret;
-
-	if (!size)
-		return 0;
-
-	ret = realm_undelegate_range(phys, size, &undelegated_size);
-	if (WARN_ON(ret != RMI_SUCCESS)) {
-		/* Pages can't be returned to NS world so are lost */
-		for (addr = phys + undelegated_size; addr < end;
-		     addr += PAGE_SIZE)
-			get_page(phys_to_page(addr));
-		return -ENXIO;
-	}
-
-	return 0;
-}
-
-static int undelegate_range_desc(unsigned long desc)
+static int undelegate_range_desc(struct realm *realm, unsigned long desc)
 {
 	unsigned long size;
 	phys_addr_t addr;
+	long rmi_ret;
 	int ret;
 
 	ret = rmi_addr_range_desc_decode(desc, RMI_OP_MEM_DELEGATED,
@@ -222,7 +320,8 @@ static int undelegate_range_desc(unsigned long desc)
 	if (!size)
 		return 0;
 
-	return realm_undelegate_range(addr, size, NULL);
+	rmi_ret = realm_undelegate_range(realm, addr, size, NULL);
+	return realm_rmi_to_errno(rmi_ret);
 }
 
 static int rmi_addr_range_desc_cmp(const void *a, const void *b)
@@ -237,11 +336,13 @@ static int rmi_addr_range_desc_cmp(const void *a, const void *b)
 	return 0;
 }
 
-static int undelegate_range_descs(unsigned long *descs, unsigned long count)
+static int undelegate_range_descs(struct realm *realm, unsigned long *descs,
+				  unsigned long count)
 {
 	unsigned long run_start = 0, run_end = 0;
 	bool have_run = false;
 	unsigned long i;
+	long rmi_ret;
 	int ret;
 
 	if (!count)
@@ -267,10 +368,10 @@ static int undelegate_range_descs(unsigned long *descs, unsigned long count)
 		}
 
 		if (have_run) {
-			ret = realm_undelegate_range(run_start,
-						     run_end - run_start, NULL);
-			if (ret)
-				return ret;
+			rmi_ret = realm_undelegate_range(realm, run_start,
+							 run_end - run_start, NULL);
+			if (rmi_ret)
+				return realm_rmi_to_errno(rmi_ret);
 		}
 
 		run_start = addr;
@@ -281,7 +382,9 @@ static int undelegate_range_descs(unsigned long *descs, unsigned long count)
 	if (!have_run)
 		return 0;
 
-	return realm_undelegate_range(run_start, run_end - run_start, NULL);
+	rmi_ret = realm_undelegate_range(realm, run_start,
+					 run_end - run_start, NULL);
+	return realm_rmi_to_errno(rmi_ret);
 }
 
 static void realm_alloc_unmap_desc_buf(struct realm *realm)
@@ -313,15 +416,32 @@ static void realm_free_unmap_desc_buf(struct realm *realm)
 	realm->unmap_desc_cap = 0;
 }
 
-static phys_addr_t alloc_delegated_granule(struct rmi_sro_state *sro,
+static phys_addr_t alloc_delegated_granule(struct realm *realm,
+					   struct rmi_sro_state *sro,
 					   gfp_t gfp)
 {
-	return rmi_sro_alloc(sro, gfp);
+	phys_addr_t phys = rmi_sro_alloc(sro, gfp);
+
+	/*
+	 * Account the granule handed to the Realm as RMM-owned in the Realm's
+	 * ownership tree for leak detection. The allocation @sro may be NULL (fresh
+	 * fallback alloc) or a per-REC SRO, so always track via realm->sro, whose
+	 * Track ID identifies the owning Realm.
+	 */
+	if (phys != PHYS_ADDR_MAX)
+		realm_region_track(realm, phys, PAGE_SIZE,
+				   SMC_RMI_GRANULE_RANGE_DELEGATE, 0);
+	return phys;
 }
 
-static int realm_free_delegated_page(phys_addr_t phys)
+static int realm_free_delegated_page(struct realm *realm, phys_addr_t phys)
 {
-	if (WARN_ON(realm_undelegate_range(phys, PAGE_SIZE, NULL))) {
+	long ret;
+
+	ret = realm_undelegate_range(realm, phys, PAGE_SIZE, NULL);
+	if (WARN_ONCE(ret,
+		      "RMI: page undelegate failed: rmi=%ld err=%d\n",
+		      ret, -EBUSY)) {
 		/* Undelegate failed: leak the page */
 		return -EBUSY;
 	}
@@ -330,9 +450,9 @@ static int realm_free_delegated_page(phys_addr_t phys)
 	return 0;
 }
 
-static phys_addr_t alloc_rtt(struct rmi_sro_state *sro)
+static phys_addr_t alloc_rtt(struct realm *realm, struct rmi_sro_state *sro)
 {
-	phys_addr_t phys = alloc_delegated_granule(sro, GFP_ATOMIC);
+	phys_addr_t phys = alloc_delegated_granule(realm, sro, GFP_ATOMIC);
 
 	if (phys != PHYS_ADDR_MAX)
 		kvm_account_pgtable_pages(phys_to_virt(phys), 1);
@@ -340,9 +460,9 @@ static phys_addr_t alloc_rtt(struct rmi_sro_state *sro)
 	return phys;
 }
 
-static void free_rtt(phys_addr_t phys)
+static void free_rtt(struct realm *realm, phys_addr_t phys)
 {
-	if (realm_free_delegated_page(phys))
+	if (realm_free_delegated_page(realm, phys))
 		return;
 
 	kvm_account_pgtable_pages(phys_to_virt(phys), -1);
@@ -426,7 +546,7 @@ static int realm_create_rtt_levels(struct realm *realm,
 				   struct rmi_sro_state *sro)
 {
 	while (level++ < max_level) {
-		phys_addr_t rtt = alloc_rtt(sro);
+		phys_addr_t rtt = alloc_rtt(realm, sro);
 		int ret;
 
 		if (rtt == PHYS_ADDR_MAX)
@@ -435,7 +555,7 @@ static int realm_create_rtt_levels(struct realm *realm,
 		ret = realm_rtt_create(realm, ipa, level, rtt);
 		if ((ret >= 0) &&
 		    (RMI_RETURN_STATUS(ret) == RMI_BLOCKED)) {
-			free_rtt(rtt);
+			free_rtt(realm, rtt);
 			return -EAGAIN;
 		}
 
@@ -443,16 +563,19 @@ static int realm_create_rtt_levels(struct realm *realm,
 		    (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) &&
 		    RMI_RETURN_INDEX(ret) == level - 1) {
 			/* The RTT already exists, continue */
-			free_rtt(rtt);
+			free_rtt(realm, rtt);
 			continue;
 		}
 
 		if (ret) {
 			WARN(1, "Failed to create RTT at level %d: %d\n",
 			     level, ret);
-			free_rtt(rtt);
+			free_rtt(realm, rtt);
 			return -ENXIO;
 		}
+
+		realm_region_track(realm, rtt, PAGE_SIZE,
+				   SMC_RMI_RTT_CREATE, ipa);
 	}
 
 	return 0;
@@ -464,7 +587,8 @@ static int realm_tear_down_rtt_level(struct realm *realm, int level,
 	ssize_t map_size;
 	unsigned long addr, next_addr;
 
-	if (WARN_ON(level > KVM_PGTABLE_LAST_LEVEL))
+	if (WARN_ONCE(level > KVM_PGTABLE_LAST_LEVEL,
+		      "RMI: invalid teardown level %d: %d\n", level, -EINVAL))
 		return -EINVAL;
 
 	map_size = rmi_rtt_level_mapsize(level - 1);
@@ -495,7 +619,9 @@ static int realm_tear_down_rtt_level(struct realm *realm, int level,
 
 		switch (RMI_RETURN_STATUS(ret)) {
 		case RMI_SUCCESS:
-			free_rtt(rtt_granule);
+			realm_region_track(realm, rtt_granule, PAGE_SIZE,
+					   SMC_RMI_RTT_DESTROY, addr);
+			free_rtt(realm, rtt_granule);
 			break;
 		case RMI_ERROR_RTT:
 			if (next_addr > addr) {
@@ -510,9 +636,13 @@ static int realm_tear_down_rtt_level(struct realm *realm, int level,
 			 * to the requested level. e.g., a block mapping
 			 * exists at L1 or L2.
 			 */
-			if (WARN_ON(RMI_RETURN_INDEX(ret) != level))
+			if (WARN_ONCE(RMI_RETURN_INDEX(ret) != level,
+				      "RMI: RTT destroy level mismatch %#x: %d\n",
+				      ret, -EBUSY))
 				return -EBUSY;
-			if (WARN_ON(level == KVM_PGTABLE_LAST_LEVEL))
+			if (WARN_ONCE(level == KVM_PGTABLE_LAST_LEVEL,
+				      "RMI: live terminal RTT %#x: %d\n",
+				      ret, -EBUSY))
 				return -EBUSY;
 
 			/*
@@ -533,7 +663,8 @@ static int realm_tear_down_rtt_level(struct realm *realm, int level,
 			next_addr = addr;
 			break;
 		default:
-			WARN_ON(1);
+			WARN_ONCE(1, "RMI: RTT destroy failed %#x: %d\n",
+				  ret, -ENXIO);
 			return -ENXIO;
 		}
 	}
@@ -602,7 +733,7 @@ static bool realm_fold_rtt_level(struct kvm *kvm, int level,
 
 		switch (RMI_RETURN_STATUS(ret)) {
 		case RMI_SUCCESS:
-			free_rtt(rtt_granule);
+			free_rtt(realm, rtt_granule);
 			probe_parent = true;
 			break;
 		case RMI_ERROR_RTT:
@@ -710,17 +841,23 @@ retry:
 		ret = rmi_rtt_unprot_unmap(rd, addr, end,
 					   RMI_ADDR_TYPE_SINGLE, 0,
 					   &next_addr, &out_range, NULL);
-		if (WARN_ON(ret < 0))
-			return;
 		switch (RMI_RETURN_STATUS(ret)) {
 		case RMI_SUCCESS: {
-			unsigned long count = RMI_ADDR_RANGE_COUNT(out_range);
+			unsigned long range_size;
+			phys_addr_t range_addr;
 
 			if (WARN_ON(next_addr <= addr || next_addr > end))
 				return;
-			if (count)
+			ret = rmi_addr_range_desc_decode(
+				out_range, RMI_OP_MEM_UNDELEGATED,
+				&range_addr, &range_size);
+			if (WARN_ON_ONCE(ret))
+				return;
+			if (range_size) {
+				realm_region_untrack(realm, range_addr, range_size);
 				realm_fold_rtt_level(kvm, RMM_RTT_MAX_LEVEL,
 						     addr, next_addr);
+			}
 			break;
 		}
 		case RMI_ERROR_RTT: {
@@ -806,11 +943,13 @@ static int realm_create_rd(struct kvm *kvm)
 	unsigned long pgd_delegated_size = 0;
 	u64 dfr0 = kvm_read_vm_id_reg(kvm, SYS_ID_AA64DFR0_EL1);
 	long rmi_ret;
+	long cleanup_ret;
 	int r;
 
 	realm->ia_bits = VTCR_EL2_IPA(kvm->arch.mmu.vtcr);
 
-	if (WARN_ON(realm->rd))
+	if (WARN_ONCE(realm->rd,
+		      "RMI: invalid Realm create state: %d\n", -EEXIST))
 		return -EEXIST;
 
 	params = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
@@ -826,14 +965,16 @@ static int realm_create_rd(struct kvm *kvm)
 	rmi_sro_topup(realm->sro, SZ_2M >> PAGE_SHIFT,
 		      kvm_mmu_cache_min_pages(&kvm->arch.mmu));
 
-	rd_phys = alloc_delegated_granule(realm->sro, GFP_KERNEL_ACCOUNT);
+	rd_phys = alloc_delegated_granule(realm, realm->sro,
+					  GFP_KERNEL_ACCOUNT);
 	if (rd_phys == PHYS_ADDR_MAX)
 		return -ENOMEM;
 	rd = phys_to_virt(rd_phys);
 
-	if (realm_delegate_range(kvm->arch.mmu.pgd_phys,
-				 pgd_size, &pgd_delegated_size)) {
-		r = -ENXIO;
+	rmi_ret = realm_delegate_range(realm, kvm->arch.mmu.pgd_phys,
+				       pgd_size, &pgd_delegated_size);
+	if (rmi_ret) {
+		r = realm_rmi_to_errno(rmi_ret);
 		goto out_undelegate_tables;
 	}
 
@@ -869,14 +1010,18 @@ static int realm_create_rd(struct kvm *kvm)
 	return 0;
 
 out_undelegate_tables:
-	if (pgd_delegated_size &&
-	    WARN_ON(realm_undelegate_range(kvm->arch.mmu.pgd_phys,
-					   pgd_delegated_size, NULL))) {
-		/* Leak the pages if they cannot be returned */
-		kvm->arch.mmu.pgt = NULL;
+	if (pgd_delegated_size) {
+		cleanup_ret = realm_undelegate_range(realm,
+						     kvm->arch.mmu.pgd_phys,
+						     pgd_delegated_size, NULL);
+		if (WARN_ONCE(cleanup_ret,
+			      "RMI: Realm PGD undelegate failed: %ld\n",
+			      cleanup_ret))
+			/* Leak the pages if they cannot be returned */
+			kvm->arch.mmu.pgt = NULL;
 	}
 	/* Undelegate + free (leaks on undelegate failure). */
-	realm_free_delegated_page(rd_phys);
+	realm_free_delegated_page(realm, rd_phys);
 	return r;
 }
 
@@ -899,8 +1044,6 @@ static void realm_unmap_private_range_single(struct kvm *kvm,
 retry:
 		ret = rmi_rtt_data_unmap(rd, addr, end, flags, 0,
 					 &next_addr, &out_range, NULL);
-		if (WARN_ON(ret < 0))
-			return;
 
 		switch (RMI_RETURN_STATUS(ret)) {
 		case RMI_SUCCESS:
@@ -944,8 +1087,10 @@ retry:
 			realm->stage2_unmap_failed = true;
 			return;
 		}
-		ret = undelegate_range_desc(out_range);
-		if (WARN_ON(ret))
+
+		ret = undelegate_range_desc(realm, out_range);
+		if (WARN_ONCE(ret, "RMI: descriptor undelegate failed: %d\n",
+			      ret))
 			break;
 
 		if (may_block)
@@ -1033,7 +1178,8 @@ retry:
 			return;
 		}
 
-		ret = undelegate_range_descs(realm->unmap_desc_buf, out_count);
+		ret = undelegate_range_descs(realm, realm->unmap_desc_buf,
+					     out_count);
 		if (WARN_ONCE(ret,
 			      "RMI: descriptor list undelegate failed: %d\n",
 			      ret))
@@ -1095,6 +1241,9 @@ static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
 
 	if (ret)
 		return -ENXIO;
+
+	realm_region_track(realm, dst_phys, PAGE_SIZE,
+			   SMC_RMI_RTT_DATA_MAP_INIT, ipa);
 
 	return 0;
 }
@@ -1317,6 +1466,7 @@ static int realm_prepare_protected_map(struct realm *realm, unsigned long ipa,
 {
 	phys_addr_t rd = virt_to_phys(realm->rd);
 	unsigned long next_ipa;
+	long rmi_ret;
 	int map_level;
 	int ret;
 
@@ -1324,12 +1474,11 @@ static int realm_prepare_protected_map(struct realm *realm, unsigned long ipa,
 		unsigned long request_size = ipa_top - ipa;
 		unsigned long delegated_size;
 		bool skipped = false;
-		int delegate_status;
 
 retry_delegate:
 		delegated_size = 0;
-		ret = realm_delegate_range(phys, request_size,
-					   &delegated_size);
+		rmi_ret = realm_delegate_range(realm, phys, request_size,
+					       &delegated_size);
 		if (delegated_size) {
 			/*
 			 * Hand back the delegated prefix as the run to map. It may
@@ -1343,21 +1492,18 @@ retry_delegate:
 			return 0;
 		}
 
-		if (ret < 0)
-			return ret;
-		if (RMI_RETURN_STATUS(ret) == RMI_BUSY ||
-		    RMI_RETURN_STATUS(ret) == RMI_BLOCKED)
+		if (rmi_ret < 0)
+			return realm_rmi_to_errno(rmi_ret);
+		if (RMI_RETURN_STATUS(rmi_ret) == RMI_BUSY ||
+		    RMI_RETURN_STATUS(rmi_ret) == RMI_BLOCKED)
 			return -EAGAIN;
-
-		/* The RTT walk below reuses @ret, so keep the delegate status. */
-		delegate_status = RMI_RETURN_STATUS(ret);
 
 		/*
 		 * A failed range made no state change. Let the fault handler retry
 		 * only the fault-containing subrange.
 		 */
 		if (allow_fault_fallback && (request_size > PAGE_SIZE) &&
-		    (delegate_status == RMI_ERROR_INPUT))
+		    (RMI_RETURN_STATUS(rmi_ret) == RMI_ERROR_INPUT))
 			return -E2BIG;
 
 		/*
@@ -1424,7 +1570,7 @@ retry_check:
 			 * failure carries no usable progress, so bound the
 			 * request to [ipa, next_ipa), which no RTTE maps.
 			 */
-			if ((delegate_status == RMI_ERROR_INPUT) &&
+			if ((RMI_RETURN_STATUS(rmi_ret) == RMI_ERROR_INPUT) &&
 			    ((next_ipa - ipa) < request_size)) {
 				request_size = next_ipa - ipa;
 				goto retry_delegate;
@@ -1460,8 +1606,8 @@ static int realm_map_delegated_range(struct realm *realm,
 	while (ipa < ipa_top) {
 		unsigned long block_size;
 		unsigned long chunk_size;
-		unsigned long range_desc;
 		unsigned long flags;
+		unsigned long range_desc;
 		unsigned long out_top;
 
 		map_level = find_aligned_map_level(realm, ipa, phys, ipa_top);
@@ -1548,7 +1694,9 @@ retry_chunk:
 				goto retry_chunk;
 			}
 
-			if (WARN_ON_ONCE(1))
+			if (WARN_ONCE(1,
+				      "RMI: DATA_MAP unresolved RTT error %#x: %d\n",
+				      ret, -ENXIO))
 				return -ENXIO;
 		}
 
@@ -1556,9 +1704,14 @@ retry_chunk:
 		if (ret)
 			return ret;
 
-		if (WARN_ON(out_top <= ipa || out_top > ipa + chunk_size ||
-			    !IS_ALIGNED(out_top - ipa, block_size)))
+		if (WARN_ONCE(out_top <= ipa || out_top > ipa + chunk_size ||
+			      !IS_ALIGNED(out_top - ipa, block_size),
+			      "RMI: DATA_MAP invalid progress %#lx: %d\n",
+			      out_top, -ENXIO))
 			return -ENXIO;
+
+		realm_region_track(realm, phys, out_top - ipa,
+				   SMC_RMI_RTT_DATA_MAP, ipa);
 
 		phys += out_top - ipa;
 		ipa = out_top;
@@ -1580,7 +1733,9 @@ static int __realm_map_protected(struct kvm *kvm, unsigned long ipa,
 
 	lockdep_assert_held(&kvm->mmu_lock);
 
-	if (WARN_ON(!IS_ALIGNED(map_size | ipa, PAGE_SIZE)))
+	if (WARN_ONCE(!IS_ALIGNED(map_size | ipa, PAGE_SIZE),
+		      "RMI: unaligned protected map %#lx/%#lx: %d\n",
+		      ipa, map_size, -EINVAL))
 		return -EINVAL;
 
 	/*
@@ -1692,7 +1847,8 @@ retry:
 
 		/* No RTTE maps this part of the failed range. */
 		if (recovery != REALM_MAP_RECOVER_RETRY) {
-			ret = realm_undelegate_map_range(phys, next_ipa - ipa);
+			ret = realm_undelegate_map_range(realm, phys,
+							 next_ipa - ipa);
 			if (ret) {
 				pr_warn_ratelimited("RMI: DATA_MAP cleanup failed ret=%d status=%ld err=%d\n",
 						    map_ret,
@@ -1794,7 +1950,9 @@ int realm_map_non_secure(struct kvm *kvm,
 
 	lockdep_assert_held(&kvm->mmu_lock);
 
-	if (WARN_ON(!IS_ALIGNED(size | ipa, PAGE_SIZE)))
+	if (WARN_ONCE(!IS_ALIGNED(size | ipa, PAGE_SIZE),
+		      "RMI: unaligned unprotected map %#lx/%#lx: %d\n",
+		      ipa, size, -EINVAL))
 		return -EINVAL;
 
 	switch (prot & (KVM_PGTABLE_PROT_DEVICE | KVM_PGTABLE_PROT_NORMAL_NC)) {
@@ -1848,7 +2006,9 @@ retry_chunk:
 			int level = RMI_RETURN_INDEX(ret);
 			int state;
 
-			if (WARN_ON(level > KVM_PGTABLE_LAST_LEVEL))
+			if (WARN_ONCE(level > KVM_PGTABLE_LAST_LEVEL,
+				      "RMI: UNPROT_MAP invalid RTT level %d: %d\n",
+				      level, -ENXIO))
 				return -ENXIO;
 
 			/*
@@ -1909,16 +2069,25 @@ retry_chunk:
 				goto retry_chunk;
 			}
 
-			if (WARN_ON_ONCE(1))
+			if (WARN_ONCE(1,
+				      "RMI: UNPROT_MAP unresolved RTT error %#x: %d\n",
+				      ret, -ENXIO))
 				return -ENXIO;
 		}
 
-		if (WARN_ON(ret))
+		if (WARN_ONCE(ret,
+			      "RMI: unprotected map failed: rmi=%d err=%d\n",
+			      ret, ret < 0 ? ret : -ENXIO))
 			return ret < 0 ? ret : -ENXIO;
 
-		if (WARN_ON(out_top <= ipa || out_top > ipa + chunk_size ||
-			    !IS_ALIGNED(out_top - ipa, block_size)))
+		if (WARN_ONCE(out_top <= ipa || out_top > ipa + chunk_size ||
+			      !IS_ALIGNED(out_top - ipa, block_size),
+			      "RMI: UNPROT_MAP invalid progress %#lx: %d\n",
+			      out_top, -ENXIO))
 			return -ENXIO;
+
+		realm_region_track(realm, phys, out_top - ipa,
+				   SMC_RMI_RTT_UNPROT_MAP, ipa);
 
 		phys += out_top - ipa;
 		ipa = out_top;
@@ -1930,10 +2099,12 @@ retry_chunk:
 static int populate_region_cb(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,
 			      struct page *src_page, void *opaque)
 {
+	struct realm *realm = &kvm->arch.realm;
 	unsigned long *data_flags = opaque;
 	unsigned long delegated_size = 0;
 	phys_addr_t phys = __pfn_to_phys(pfn);
 	phys_addr_t ipa = gfn_to_gpa(gfn);
+	long rmi_ret;
 	int ret;
 
 	if (!src_page)
@@ -1945,22 +2116,25 @@ static int populate_region_cb(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,
 	 * delegated across callbacks, as a concurrent hole punch may remove
 	 * those pages before their DATA_INIT mappings are installed.
 	 */
-	ret = realm_delegate_range(phys, PAGE_SIZE, &delegated_size);
-	if (ret) {
+	rmi_ret = realm_delegate_range(realm, phys, PAGE_SIZE,
+				       &delegated_size);
+	if (rmi_ret) {
 		if (delegated_size)
-			realm_undelegate_map_range(phys, delegated_size);
-		return ret > 0 ? -ENXIO : ret;
+			realm_undelegate_map_range(realm, phys, delegated_size);
+		return realm_rmi_to_errno(rmi_ret);
 	}
 
-	if (WARN_ON(delegated_size != PAGE_SIZE)) {
-		realm_undelegate_map_range(phys, delegated_size);
+	if (WARN_ONCE(delegated_size != PAGE_SIZE,
+		      "RMI: DATA_MAP_INIT delegated %#lx bytes: %d\n",
+		      delegated_size, -ENXIO)) {
+		realm_undelegate_map_range(realm, phys, delegated_size);
 		return -ENXIO;
 	}
 
 	ret = realm_data_map_init(kvm, ipa, pfn, page_to_pfn(src_page),
 				  *data_flags);
 	if (ret)
-		realm_undelegate_map_range(phys, PAGE_SIZE);
+		realm_undelegate_map_range(realm, phys, PAGE_SIZE);
 
 	return ret;
 }
@@ -2026,7 +2200,9 @@ static int ripas_change(struct kvm *kvm,
 
 		switch (RMI_RETURN_STATUS(ret)) {
 		case RMI_SUCCESS:
-			if (WARN_ON((next <= ipa) || (next > end))) {
+			if (WARN_ONCE((next <= ipa) || (next > end),
+				      "RMI: RIPAS invalid progress %#lx: %d\n",
+				      next, -ENXIO)) {
 				if (top_ipa)
 					*top_ipa = ipa;
 				return -ENXIO;
@@ -2066,7 +2242,8 @@ static int ripas_change(struct kvm *kvm,
 			break;
 		}
 		default:
-			WARN_ON(1);
+			WARN_ONCE(1, "RMI: RIPAS command failed %#x: %d\n",
+				  ret, -ENXIO);
 			if (top_ipa)
 				*top_ipa = ipa;
 			return -ENXIO;
@@ -2413,6 +2590,12 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 	rec->run_phys = virt_to_phys(rec->run);
 
 	/*
+	 * Attach this REC's SRO to the shared tree with the Track ID so its
+	 * auxiliary granules are attributed to the same Realm.
+	 */
+	rec->sro->trackid = realm->sro->trackid;
+
+	/*
 	 * Pre-warm the SRO hot list (process context, outside mmu_lock) so the
 	 * REC page and the aux granules donated by RMI_REC_CREATE are served
 	 * from pre-delegated entries. Best-effort: a failure just leaves the
@@ -2422,7 +2605,7 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 		      kvm_mmu_cache_min_pages(&vcpu->kvm->arch.mmu));
 
 	/* Pre-delegated granule for the RMM-private REC page (or fallback). */
-	rec_page_phys = alloc_delegated_granule(rec->sro, GFP_KERNEL);
+	rec_page_phys = alloc_delegated_granule(realm, rec->sro, GFP_KERNEL);
 	if (rec_page_phys == PHYS_ADDR_MAX) {
 		r = -ENOMEM;
 		goto out_free_pages;
@@ -2453,7 +2636,7 @@ static int kvm_create_rec(struct kvm_vcpu *vcpu)
 
 out_free_rec_page:
 	/* Undelegate + free (leaks on undelegate failure). */
-	realm_free_delegated_page(rec_page_phys);
+	realm_free_delegated_page(realm, rec_page_phys);
 	rec->rec_page = NULL;
 out_free_pages:
 	free_page((unsigned long)rec->run);
@@ -2472,6 +2655,7 @@ void kvm_destroy_rec(struct kvm_vcpu *vcpu)
 {
 	struct realm_rec *rec = &vcpu->arch.rec;
 	unsigned long rec_page_phys;
+	int ret;
 
 	if (!vcpu_is_rec(vcpu))
 		return;
@@ -2505,14 +2689,15 @@ void kvm_destroy_rec(struct kvm_vcpu *vcpu)
 
 	rec_page_phys = virt_to_phys(rec->rec_page);
 
-	if (WARN_ON(rmi_rec_destroy(rec_page_phys, rec->sro)))
+	ret = rmi_rec_destroy(rec_page_phys, rec->sro);
+	if (WARN_ONCE(ret, "RMI: REC destroy failed: %d\n", ret))
 		return;
 
 	free_page((unsigned long)rec->run);
 	rec->run = NULL;
 	rec->run_phys = 0;
 
-	realm_free_delegated_page(rec_page_phys);
+	realm_free_delegated_page(&vcpu->kvm->arch.realm, rec_page_phys);
 	rec->rec_page = NULL;
 	rec->rec_phys = 0;
 
@@ -2570,6 +2755,8 @@ void kvm_destroy_realm(struct kvm *kvm)
 {
 	struct realm *realm = &kvm->arch.realm;
 	size_t pgd_size = kvm_pgtable_stage2_pgd_size(kvm->arch.mmu.vtcr);
+	long rmi_ret;
+	int ret;
 
 	guard(mutex)(&kvm->arch.config_lock);
 
@@ -2586,20 +2773,25 @@ void kvm_destroy_realm(struct kvm *kvm)
 	if (realm->rd) {
 		phys_addr_t rd_phys = virt_to_phys(realm->rd);
 
-		if (WARN_ON(rmi_realm_terminate(rd_phys)))
+		ret = rmi_realm_terminate(rd_phys);
+		if (WARN_ONCE(ret, "RMI: Realm terminate failed: %d\n", ret))
 			goto out_free_host;
 
-		if (WARN_ON(realm_destroy_rtts(kvm)))
+		ret = realm_destroy_rtts(kvm);
+		if (WARN_ONCE(ret, "RMI: Realm RTT destroy failed: %d\n", ret))
 			goto out_free_host;
 
-		if (WARN_ON(rmi_realm_destroy(rd_phys, realm->sro)))
+		ret = rmi_realm_destroy(rd_phys, realm->sro);
+		if (WARN_ONCE(ret, "RMI: Realm destroy failed: %d\n", ret))
 			goto out_free_host;
-		realm_free_delegated_page(rd_phys);
+		realm_free_delegated_page(realm, rd_phys);
 		realm->rd = NULL;
 	}
 
-	if (WARN_ON(realm_undelegate_range(kvm->arch.mmu.pgd_phys,
-					   pgd_size, NULL)))
+	rmi_ret = realm_undelegate_range(realm, kvm->arch.mmu.pgd_phys,
+					 pgd_size, NULL);
+	if (WARN_ONCE(rmi_ret, "RMI: Realm PGD undelegate failed: %ld\n",
+		      rmi_ret))
 		goto out_free_host;
 
 	kvm_set_realm_state(kvm, REALM_STATE_DEAD);
@@ -2621,10 +2813,18 @@ out_free_host:
 int kvm_init_realm(struct kvm *kvm)
 {
 	struct realm *realm = &kvm->arch.realm;
+	int trackid = 0;
 	int ret;
 
-	ret = realm_alloc_sro(realm);
+	if (READ_ONCE(realm_track_leaks)) {
+		trackid = rmi_trackid_alloc();
+		if (trackid < 0)
+			return trackid;
+	}
+
+	ret = realm_alloc_sro(realm, trackid);
 	if (ret) {
+		rmi_trackid_free(trackid);
 		realm_free_sro(realm);
 		return ret;
 	}

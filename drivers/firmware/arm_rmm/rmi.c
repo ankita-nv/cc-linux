@@ -8,7 +8,9 @@
 #include <linux/cpufeature.h>
 #include <linux/crash_dump.h>
 #include <linux/debugfs.h>
+#include <linux/idr.h>
 #include <linux/kexec.h>
+#include <linux/kstrtox.h>
 #include <linux/maple_tree.h>
 #include <linux/memblock.h>
 #include <linux/mm.h>
@@ -22,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
 #include <linux/xarray.h>
 
 #include <asm/memory.h>
@@ -279,25 +282,48 @@ int rmi_sro_topup_node(struct rmi_sro_state *sro, unsigned long capacity,
 #define RMI_MT_IPA_MASK		GENMASK_ULL(47, 12)
 #define RMI_MT_SLOT_MASK		GENMASK_ULL(11, 4)
 
+#define RMI_TRACKID_MAX		0x7fff
 #define RMI_TRACKID_GLOBAL	1
+#define RMI_TRACKID_REALM_MIN	(RMI_TRACKID_GLOBAL + 1)
 
 static DEFINE_MTREE(rmi_mt);
+static DEFINE_IDA(realm_trackid_ida);
 static bool rmi_sro_donate_tracking_failed;
 
 /* Boot SRO for global RMI allocations. */
 static struct rmi_sro_state *rmi_sro;
+
+int rmi_trackid_alloc(void)
+{
+	return ida_alloc_range(&realm_trackid_ida, RMI_TRACKID_REALM_MIN,
+			       RMI_TRACKID_MAX, GFP_KERNEL);
+}
+
+void rmi_trackid_free(unsigned int trackid)
+{
+	if (trackid)
+		ida_free(&realm_trackid_ida, trackid);
+}
+
+static inline u16 rmi_sro_trackid(struct rmi_sro_state *sro)
+{
+	if (!sro)
+		return 0;
+
+	return sro == rmi_sro ? RMI_TRACKID_GLOBAL : sro->trackid;
+}
 
 static void rmi_region_store(struct rmi_sro_state *sro, phys_addr_t phys,
 			     unsigned long size, void *entry)
 {
 	int ret;
 
-	if (sro != rmi_sro || !size)
+	if (!rmi_sro_trackid(sro) || !size)
 		return;
 
 	ret = mtree_store_range(&rmi_mt, phys, phys + size - 1,
 				entry, GFP_ATOMIC);
-	if (ret && entry)
+	if (ret && entry && sro == rmi_sro)
 		WRITE_ONCE(rmi_sro_donate_tracking_failed, true);
 
 	WARN_ONCE(ret, "RMI: ownership tracking update failed: %d\n", ret);
@@ -308,11 +334,12 @@ void rmi_region_track(struct rmi_sro_state *sro, phys_addr_t phys,
 		      unsigned long ipa)
 {
 	unsigned long mark;
+	u16 trackid = rmi_sro_trackid(sro);
 
-	if (sro != rmi_sro || !size)
+	if (!trackid || !size)
 		return;
 
-	mark = FIELD_PREP(RMI_MT_TRACKID_MASK, RMI_TRACKID_GLOBAL) |
+	mark = FIELD_PREP(RMI_MT_TRACKID_MASK, trackid) |
 	       (ipa & RMI_MT_IPA_MASK) |
 	       FIELD_PREP(RMI_MT_SLOT_MASK, RMI_SMC_SLOT_IDX(fid));
 
@@ -347,10 +374,12 @@ static u64 rmi_mt_owned_bytes(int trackid)
 
 u64 rmi_region_owned_bytes(struct rmi_sro_state *sro)
 {
-	if (sro != rmi_sro)
+	u16 trackid = rmi_sro_trackid(sro);
+
+	if (!trackid)
 		return 0;
 
-	return rmi_mt_owned_bytes(RMI_TRACKID_GLOBAL);
+	return rmi_mt_owned_bytes(trackid);
 }
 
 /*
@@ -2284,11 +2313,195 @@ static const struct file_operations rmi_smc_counters_fops = {
 	.write		= rmi_smc_counters_write,
 };
 
+#define RMI_MT_FILTER_TRACKID_MASK	GENMASK(14, 0)
+#define RMI_MT_FILTER_TRACKID_VALID	BIT(15)
+#define RMI_MT_FILTER_SLOT_MASK		GENMASK(23, 16)
+#define RMI_MT_FILTER_SLOT_VALID		BIT(24)
+
+/* Zero selects all Track IDs and RMI commands. */
+static u32 rmi_mt_filter;
+
+static bool rmi_mt_filter_match(unsigned long mark, u32 filter)
+{
+	if ((filter & RMI_MT_FILTER_TRACKID_VALID) &&
+	    FIELD_GET(RMI_MT_TRACKID_MASK, mark) !=
+	    FIELD_GET(RMI_MT_FILTER_TRACKID_MASK, filter))
+		return false;
+
+	if ((filter & RMI_MT_FILTER_SLOT_VALID) &&
+	    FIELD_GET(RMI_MT_SLOT_MASK, mark) !=
+	    FIELD_GET(RMI_MT_FILTER_SLOT_MASK, filter))
+		return false;
+
+	return true;
+}
+
+static int rmi_mt_show(struct seq_file *m, void *v)
+{
+	MA_STATE(mas, &rmi_mt, 0, 0);
+	phys_addr_t run_base, run_end, run_limit;
+	unsigned long run_mark, mark;
+	unsigned long entry_index = 0;
+	unsigned long range_count = 0;
+	u64 total_pages = 0;
+	u32 filter = READ_ONCE(rmi_mt_filter);
+	void *entry;
+
+	seq_printf(m, "%-16s  %-7s  %-14s  %-14s  %6s  %s\n",
+		   "IDX+COUNT", "TRACKID", "PHYS", "IPA", "PAGES", "RMI_CMD");
+
+	/* Coalesce matching adjacent entries without crossing PMD boundaries. */
+	rcu_read_lock();
+	entry = mas_find(&mas, ULONG_MAX);
+	while (entry) {
+		unsigned long first_index, run_entries;
+		unsigned long slot;
+		const char *name;
+		char index[48];
+		u16 trackid;
+		u64 run_ipa;
+		u64 pages;
+
+		mark = xa_to_value(entry);
+		trackid = FIELD_GET(RMI_MT_TRACKID_MASK, mark);
+		if (!rmi_mt_filter_match(mark, filter)) {
+			entry = mas_find(&mas, ULONG_MAX);
+			continue;
+		}
+
+		run_base = mas.index;
+		run_end = mas.last + 1;
+		run_limit = ALIGN(run_base + 1, PMD_SIZE);
+		run_mark = mark;
+		run_ipa = run_mark & RMI_MT_IPA_MASK;
+		first_index = ++entry_index;
+		run_entries = 1;
+
+		while ((entry = mas_find(&mas, ULONG_MAX)) != NULL) {
+			u64 next_ipa;
+
+			mark = xa_to_value(entry);
+			if (!rmi_mt_filter_match(mark, filter))
+				break;
+
+			next_ipa = mark & RMI_MT_IPA_MASK;
+			if (mas.index != run_end || mas.last >= run_limit ||
+			    (mark & (RMI_MT_TRACKID_MASK | RMI_MT_SLOT_MASK)) !=
+			    (run_mark &
+			     (RMI_MT_TRACKID_MASK | RMI_MT_SLOT_MASK)) ||
+			    ((run_ipa || next_ipa) &&
+			     next_ipa != run_ipa + (run_end - run_base)))
+				break;
+
+			run_end = mas.last + 1;
+			entry_index++;
+			run_entries++;
+		}
+
+		scnprintf(index, sizeof(index), "0x%lx+%lu",
+			  first_index, run_entries);
+		pages = (run_end - run_base) >> PAGE_SHIFT;
+		range_count++;
+		total_pages += pages;
+		slot = FIELD_GET(RMI_MT_SLOT_MASK, run_mark);
+		name = rmi_smc_slots[slot].name;
+		seq_printf(m,
+			   "%-16s  0x%04x   0x%012llx  0x%012llx  %6llu  %s\n",
+			   index, trackid, (u64)run_base, run_ipa, pages,
+			   name ?: "UNKNOWN");
+	}
+	rcu_read_unlock();
+
+	seq_printf(m, "\nTOTAL %lu ranges, %llu pages\n",
+		   range_count, total_pages);
+	return 0;
+}
+
+static int rmi_mt_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, rmi_mt_show, NULL);
+}
+
+static int rmi_mt_slot_from_name(const char *name)
+{
+	for (unsigned int slot = 0; slot < ARRAY_SIZE(rmi_smc_slots); slot++) {
+		if (rmi_smc_slots[slot].name &&
+		    !strcmp(name, rmi_smc_slots[slot].name))
+			return slot;
+	}
+
+	return -EINVAL;
+}
+
+/* Accept "<trackid>", "<RMI_CMD>", or "<trackid> <RMI_CMD>". */
+static ssize_t rmi_mt_write(struct file *file, const char __user *ubuf,
+			    size_t len, loff_t *ppos)
+{
+	char **argv __free(argv_free) = NULL;
+	char buf[64], *command = NULL;
+	u32 filter = 0;
+	int trackid = -1;
+	int slot = -1;
+	int argc;
+	int ret;
+
+	if (!len)
+		return -EINVAL;
+	if (len >= sizeof(buf))
+		return -E2BIG;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	argv = argv_split(GFP_KERNEL, buf, &argc);
+	if (!argv)
+		return -ENOMEM;
+	if (argc < 1 || argc > 2)
+		return -EINVAL;
+
+	ret = kstrtoint(argv[0], 0, &trackid);
+	if (!ret) {
+		if (trackid < -1 || trackid > RMI_TRACKID_MAX)
+			return -ERANGE;
+		command = argc == 2 ? argv[1] : NULL;
+	} else {
+		if (argc != 1)
+			return -EINVAL;
+		command = argv[0];
+	}
+
+	if (command) {
+		slot = rmi_mt_slot_from_name(command);
+		if (slot < 0)
+			return slot;
+	}
+
+	if (trackid >= 0)
+		filter |= RMI_MT_FILTER_TRACKID_VALID |
+			  FIELD_PREP(RMI_MT_FILTER_TRACKID_MASK, trackid);
+	if (slot >= 0)
+		filter |= RMI_MT_FILTER_SLOT_VALID |
+			  FIELD_PREP(RMI_MT_FILTER_SLOT_MASK, slot);
+
+	WRITE_ONCE(rmi_mt_filter, filter);
+	return len;
+}
+
+static const struct file_operations rmi_mt_fops = {
+	.owner		= THIS_MODULE,
+	.open		= rmi_mt_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= rmi_mt_write,
+};
+
 static int __init rmi_debugfs_init(void)
 {
 	if (!is_rmi_available())
 		return 0;
 
+	debugfs_create_file("rmi_mt", 0600, NULL, NULL, &rmi_mt_fops);
 	debugfs_create_file("rmi_smc_counters", 0600, NULL, NULL,
 			    &rmi_smc_counters_fops);
 	return 0;

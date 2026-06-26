@@ -93,7 +93,9 @@ static inline int rmi_sro_topup(struct rmi_sro_state *sro,
 
 phys_addr_t rmi_sro_alloc(struct rmi_sro_state *sro, gfp_t gfp);
 
-/* Track global RMM-owned physical ranges. */
+/* Manage diagnostic Track IDs and RMM-owned physical ranges. */
+int rmi_trackid_alloc(void);
+void rmi_trackid_free(unsigned int trackid);
 void rmi_region_track(struct rmi_sro_state *sro, phys_addr_t phys,
 		      unsigned long size, unsigned long fid,
 		      unsigned long ipa);
