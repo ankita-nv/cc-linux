@@ -10,13 +10,6 @@
 #include <linux/arm-smccc-rmi.h>
 #include <linux/processor.h>
 
-/* Retry temporary RMI_BUSY results, but return RMI_BLOCKED to the caller. */
-#define rmi_smccc(...) do {						\
-	arm_smccc_1_1_invoke(__VA_ARGS__);				\
-	if (RMI_RETURN_STATUS(res.a0) == RMI_BUSY)			\
-		cpu_relax();						\
-} while (RMI_RETURN_STATUS(res.a0) == RMI_BUSY)
-
 struct rtt_entry {
 	unsigned long walk_level;
 	unsigned long desc;
@@ -180,7 +173,7 @@ static inline long rmi_realm_activate(unsigned long rd)
 {
 	struct arm_smccc_res res;
 
-	arm_smccc_1_1_invoke(SMC_RMI_REALM_ACTIVATE, rd, &res);
+	rmi_smccc_invoke_v1_1(SMC_RMI_REALM_ACTIVATE, rd, &res);
 
 	return res.a0;
 }
@@ -297,7 +290,7 @@ static inline long rmi_rec_enter(unsigned long rec, unsigned long run_ptr)
 {
 	struct arm_smccc_res res;
 
-	arm_smccc_1_1_invoke(SMC_RMI_REC_ENTER, rec, run_ptr, &res);
+	rmi_smccc_invoke_v1_1(SMC_RMI_REC_ENTER, rec, run_ptr, &res);
 
 	return res.a0;
 }

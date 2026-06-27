@@ -1348,7 +1348,7 @@ static int rmi_check_version(void)
 	if (cpuid_feature_extract_unsigned_field(aa64pfr0, ID_AA64PFR0_EL1_RME_SHIFT) == 0)
 		return -ENXIO;
 
-	arm_smccc_1_1_invoke(SMC_RMI_VERSION, host_version, &res);
+	rmi_smccc_invoke_v1_1(SMC_RMI_VERSION, host_version, &res);
 
 	if (res.a0 == SMCCC_RET_NOT_SUPPORTED)
 		return -ENXIO;

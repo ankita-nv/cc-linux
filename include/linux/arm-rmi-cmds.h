@@ -9,6 +9,7 @@
 #include <linux/arm-smccc-rmi.h>
 #include <linux/bug.h>
 #include <linux/numa.h>
+#include <linux/processor.h>
 #include <linux/types.h>
 
 #include <asm/page.h>
@@ -25,6 +26,25 @@ struct rmi_sro_state {
 	unsigned long addr_list[RMI_MAX_ADDR_LIST];
 	u16 trackid;
 };
+
+/* Issue one SMCCC 1.1 RMI call without retrying the returned status. */
+#define rmi_smccc_invoke_v1_1(fid, ...)					\
+	do {								\
+		unsigned long __fid = (fid);				\
+		arm_smccc_1_1_invoke(__fid, __VA_ARGS__);		\
+	} while (0)
+
+/* Retry temporary RMI_BUSY results, but return RMI_BLOCKED to the caller. */
+#define rmi_smccc(fid, ...) do {						\
+	unsigned long __fid = (fid);					\
+	unsigned long __status;						\
+	do {								\
+		arm_smccc_1_1_invoke(__fid, ##__VA_ARGS__);		\
+		__status = RMI_RETURN_STATUS(res.a0);			\
+		if (__status == RMI_BUSY)				\
+			cpu_relax();					\
+	} while (__status == RMI_BUSY);				\
+} while (0)
 
 unsigned long rmi_feat_reg(unsigned long id);
 
@@ -81,7 +101,7 @@ static inline int rmi_rmm_config_set(unsigned long cfg_ptr)
 {
 	struct arm_smccc_res res;
 
-	arm_smccc_1_1_invoke(SMC_RMI_RMM_CONFIG_SET, cfg_ptr, &res);
+	rmi_smccc_invoke_v1_1(SMC_RMI_RMM_CONFIG_SET, cfg_ptr, &res);
 
 	return res.a0;
 }
@@ -130,7 +150,7 @@ static inline int rmi_granule_tracking_get(unsigned long start,
 {
 	struct arm_smccc_res res;
 
-	arm_smccc_1_1_invoke(SMC_RMI_GRANULE_TRACKING_GET, start, end, &res);
+	rmi_smccc_invoke_v1_1(SMC_RMI_GRANULE_TRACKING_GET, start, end, &res);
 
 	if (res.a0 == RMI_SUCCESS) {
 		if (out_category)
@@ -179,7 +199,7 @@ static inline int rmi_gpt_info(unsigned long base, unsigned long top,
 {
 	struct arm_smccc_res res;
 
-	arm_smccc_1_1_invoke(SMC_RMI_GPT_INFO, base, top, &res);
+	rmi_smccc_invoke_v1_1(SMC_RMI_GPT_INFO, base, top, &res);
 
 	if (res.a0 == RMI_SUCCESS) {
 		if (out_top)
@@ -229,7 +249,7 @@ static inline int rmi_features(unsigned long index, unsigned long *out)
 {
 	struct arm_smccc_res res;
 
-	arm_smccc_1_1_invoke(SMC_RMI_FEATURES, index, &res);
+	rmi_smccc_invoke_v1_1(SMC_RMI_FEATURES, index, &res);
 
 	if (res.a0 == RMI_SUCCESS && out)
 		*out = res.a1;
