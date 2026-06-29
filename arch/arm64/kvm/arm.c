@@ -428,6 +428,16 @@ static bool kvm_has_full_ptr_auth(void)
 		(apa + api + apa3) == 1);
 }
 
+/*
+ * KVM doesn't yet support initializing guest_memfd memory as shared for VMs
+ * with private memory. Private vs. shared tracking must first be moved into
+ * guest_memfd.
+ */
+bool kvm_arch_supports_gmem_init_shared(struct kvm *kvm)
+{
+	return !kvm_arch_has_private_mem(kvm);
+}
+
 int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 {
 	int r;
