@@ -217,6 +217,7 @@ static struct page *its_alloc_pages_node(int node, gfp_t gfp,
 	struct page *page;
 	int ret = 0;
 
+	order = get_order(mem_cc_align_to_shared_granule(PAGE_SIZE << order));
 	page = alloc_pages_node(node, (gfp & ~__GFP_ZERO) | gfp_flags_quirk,
 				order);
 
@@ -246,6 +247,8 @@ static struct page *its_alloc_pages(gfp_t gfp, unsigned int order)
 
 static void its_free_pages(void *addr, unsigned int order)
 {
+
+	order = get_order(mem_cc_align_to_shared_granule(PAGE_SIZE << order));
 	/*
 	 * If the memory cannot be encrypted again then we must leak the pages.
 	 * set_memory_encrypted() will already have WARNed.
@@ -277,7 +280,8 @@ static void *itt_alloc_pool(int node, int size)
 		if (!page)
 			break;
 
-		gen_pool_add(itt_pool, (unsigned long)page_address(page), PAGE_SIZE, node);
+		gen_pool_add(itt_pool, (unsigned long)page_address(page),
+			     mem_cc_align_to_shared_granule(PAGE_SIZE), node);
 	} while (!addr);
 
 	return (void *)addr;
