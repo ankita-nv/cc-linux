@@ -11,6 +11,8 @@
 #define __MEM_ENCRYPT_H__
 
 #ifndef __ASSEMBLY__
+#include <linux/align.h>
+#include <vdso/page.h>
 
 #ifdef CONFIG_ARCH_HAS_MEM_ENCRYPT
 
@@ -53,6 +55,18 @@
 #ifndef dma_addr_canonical
 #define dma_addr_canonical(x)		(x)
 #endif
+
+#ifndef mem_cc_shared_granule_size
+static inline size_t mem_cc_shared_granule_size(void)
+{
+	return PAGE_SIZE;
+}
+#endif
+
+static inline size_t mem_cc_align_to_shared_granule(size_t size)
+{
+	return ALIGN(size, mem_cc_shared_granule_size());
+}
 
 #endif	/* __ASSEMBLY__ */
 
