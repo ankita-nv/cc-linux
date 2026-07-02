@@ -17,8 +17,7 @@
 #include <linux/compiler.h>
 #include <linux/err.h>
 #include <linux/mm.h>
-
-#include <asm/mem_encrypt.h>
+#include <linux/mem_encrypt.h>
 
 static const struct arm64_mem_crypt_ops *crypt_ops;
 
@@ -33,8 +32,16 @@ int arm64_mem_crypt_ops_register(const struct arm64_mem_crypt_ops *ops)
 
 int set_memory_encrypted(unsigned long addr, int numpages)
 {
-	if (likely(!crypt_ops) || WARN_ON(!PAGE_ALIGNED(addr)))
+	unsigned long size = (unsigned long)numpages << PAGE_SHIFT;
+
+	if (likely(!crypt_ops))
 		return 0;
+
+	if (WARN_ON(!IS_ALIGNED(addr, mem_cc_shared_granule_size())))
+		return -EINVAL;
+
+	if (WARN_ON(!IS_ALIGNED(size, mem_cc_shared_granule_size())))
+		return -EINVAL;
 
 	return crypt_ops->encrypt(addr, numpages);
 }
@@ -42,9 +49,26 @@ EXPORT_SYMBOL_GPL(set_memory_encrypted);
 
 int set_memory_decrypted(unsigned long addr, int numpages)
 {
-	if (likely(!crypt_ops) || WARN_ON(!PAGE_ALIGNED(addr)))
+	unsigned long size = (unsigned long)numpages << PAGE_SHIFT;
+
+	if (likely(!crypt_ops))
 		return 0;
+
+	if (WARN_ON(!IS_ALIGNED(addr, mem_cc_shared_granule_size())))
+		return -EINVAL;
+
+	if (WARN_ON(!IS_ALIGNED(size, mem_cc_shared_granule_size())))
+		return -EINVAL;
 
 	return crypt_ops->decrypt(addr, numpages);
 }
 EXPORT_SYMBOL_GPL(set_memory_decrypted);
+
+size_t mem_cc_shared_granule_size(void)
+{
+	if (likely(!crypt_ops) || !crypt_ops->cc_shared_granule_size)
+		return PAGE_SIZE;
+
+	return crypt_ops->cc_shared_granule_size();
+}
+EXPORT_SYMBOL_GPL(mem_cc_shared_granule_size);
