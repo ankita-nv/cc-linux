@@ -285,6 +285,9 @@ void *dma_direct_alloc(struct device *dev, size_t size,
 		return NULL;
 	}
 
+	if (mark_mem_decrypt)
+		size = mem_cc_align_to_shared_granule(size);
+
 	/* we always manually zero the memory once we are done */
 	page = __dma_direct_alloc_pages(dev, size, gfp & ~__GFP_ZERO,
 					allow_highmem, attrs);
@@ -407,6 +410,9 @@ void dma_direct_free(struct device *dev, size_t size,
 		/* Swiotlb doesn't need a page attribute update on free */
 		mark_mem_encrypted = false;
 
+	if (mark_mem_encrypted && force_dma_unencrypted(dev))
+		size = mem_cc_align_to_shared_granule(size);
+
 	if (is_vmalloc_addr(cpu_addr)) {
 		vunmap(cpu_addr);
 	} else {
@@ -453,6 +459,9 @@ struct page *dma_direct_alloc_pages(struct device *dev, size_t size,
 		goto setup_page;
 	}
 
+	if (attrs & __DMA_ATTR_ALLOC_CC_SHARED)
+		size = mem_cc_align_to_shared_granule(size);
+
 	page = __dma_direct_alloc_pages(dev, size, gfp, false, attrs);
 	if (!page)
 		return NULL;
@@ -493,8 +502,11 @@ void dma_direct_free_pages(struct device *dev, size_t size,
 	if (swiotlb_pool)
 		mark_mem_encrypted = false;
 
-	if (mark_mem_encrypted && dma_set_encrypted(dev, vaddr, size))
-		return;
+	if (mark_mem_encrypted) {
+		size = mem_cc_align_to_shared_granule(size);
+		if (dma_set_encrypted(dev, vaddr, size))
+			return;
+	}
 
 	if (swiotlb_pool)
 		swiotlb_free_from_pool(dev, phys, swiotlb_pool);
