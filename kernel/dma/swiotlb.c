@@ -2037,6 +2037,20 @@ static int rmem_swiotlb_device_init(struct reserved_mem *rmem,
 		 * if platform supports memory encryption,
 		 * restricted mem pool is shared by default
 		 */
+		if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT)) {
+			size_t cc_shared_granule_size = mem_cc_shared_granule_size();
+
+			if (!IS_ALIGNED(rmem->base, cc_shared_granule_size) ||
+			    !IS_ALIGNED(rmem->size, cc_shared_granule_size)) {
+				dev_err(dev, "Restricted DMA pool must be aligned to %#zx bytes for memory encryption\n",
+					cc_shared_granule_size);
+				kfree(pool->areas);
+				kfree(pool->slots);
+				kfree(mem);
+				return -EINVAL;
+			}
+		}
+
 		if (cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
 			int ret;
 
