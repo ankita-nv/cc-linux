@@ -55,7 +55,6 @@ struct dma_heap_attachment {
 #define HIGH_ORDER_GFP  (((GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN \
 				| __GFP_NORETRY) & ~__GFP_RECLAIM) \
 				| __GFP_COMP)
-static gfp_t order_flags[] = {HIGH_ORDER_GFP, HIGH_ORDER_GFP, LOW_ORDER_GFP};
 /*
  * The selection of the orders used for allocation (1MB, 64K, 4K) is designed
  * to match with the sizes often found in IOMMUs. Using order 4 pages instead
@@ -375,30 +374,49 @@ static const struct dma_buf_ops system_heap_buf_ops = {
 	.release = system_heap_dma_buf_release,
 };
 
+static struct page *system_heap_alloc_order(unsigned int order,
+					    bool defer_zero)
+{
+	gfp_t flags = order ? HIGH_ORDER_GFP : LOW_ORDER_GFP;
+
+	/* Decryption can change the contents, so clear it afterwards. */
+	if (defer_zero)
+		flags &= ~__GFP_ZERO;
+	if (mem_accounting)
+		flags |= __GFP_ACCOUNT;
+
+	return alloc_pages(flags, order);
+}
+
 static struct page *alloc_largest_available(unsigned long size,
 					    unsigned int max_order,
+					    unsigned int min_order,
 					    bool defer_zero)
 {
 	struct page *page;
 	int i;
-	gfp_t flags;
 
 	for (i = 0; i < NUM_ORDERS; i++) {
 		if (size <  (PAGE_SIZE << orders[i]))
 			continue;
-		if (max_order < orders[i])
+
+		if (max_order < orders[i] || orders[i] < min_order)
 			continue;
-		flags = order_flags[i];
-		/* Decryption can change the contents, so clear it afterwards. */
-		if (defer_zero)
-			flags &= ~__GFP_ZERO;
-		if (mem_accounting)
-			flags |= __GFP_ACCOUNT;
-		page = alloc_pages(flags, orders[i]);
+
+		page = system_heap_alloc_order(orders[i], defer_zero);
 		if (!page)
 			continue;
 		return page;
 	}
+	/*
+	 * The required minimum order might not be one of the preferred heap
+	 * orders. Allocate exactly min_order when it does not exceed the
+	 * remaining size.
+	 */
+	if (min_order && min_order <= max_order &&
+	    size >= (PAGE_SIZE << min_order))
+		return system_heap_alloc_order(min_order, defer_zero);
+
 	return NULL;
 }
 
@@ -413,6 +431,8 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 	unsigned int max_order = orders[0];
 	struct system_heap_priv *priv = dma_heap_get_drvdata(heap);
 	bool cc_shared = priv->cc_shared;
+	unsigned int min_order = 0;
+	size_t cc_granule_size;
 	struct dma_buf *dmabuf;
 	struct sg_table *table;
 	struct scatterlist *sg;
@@ -430,6 +450,18 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 	buffer->heap = heap;
 	buffer->len = len;
 	buffer->cc_shared = cc_shared;
+	if (cc_shared_buffer(buffer)) {
+		cc_granule_size = mem_cc_shared_granule_size();
+		if (!IS_ALIGNED(len, cc_granule_size)) {
+			ret = -EINVAL;
+			goto free_buffer;
+		}
+		min_order = get_order(cc_granule_size);
+		if (min_order > max_order) {
+			ret = -EINVAL;
+			goto free_buffer;
+		}
+	}
 
 	INIT_LIST_HEAD(&pages);
 	i = 0;
@@ -444,6 +476,7 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 		}
 
 		page = alloc_largest_available(size_remaining, max_order,
+					       min_order,
 					       cc_shared_buffer(buffer));
 		if (!page)
 			goto free_buffer;
