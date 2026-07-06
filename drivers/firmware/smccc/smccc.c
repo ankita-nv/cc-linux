@@ -81,6 +81,18 @@ bool arm_smccc_hypervisor_has_uuid(const uuid_t *hyp_uuid)
 }
 EXPORT_SYMBOL_GPL(arm_smccc_hypervisor_has_uuid);
 
+static bool __init smccc_lfa_available(void)
+{
+	struct arm_smccc_res res;
+
+	if (smccc_conduit == SMCCC_CONDUIT_NONE)
+		return false;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_LFA_GET_VERSION, &res);
+
+	return (s32)res.a0 != SMCCC_RET_NOT_SUPPORTED;
+}
+
 static int __init smccc_devices_init(void)
 {
 	struct platform_device *pdev;
@@ -90,6 +102,14 @@ static int __init smccc_devices_init(void)
 						       NULL, 0);
 		if (IS_ERR(pdev))
 			pr_err("smccc_trng: could not register device: %ld\n",
+			       PTR_ERR(pdev));
+	}
+
+	if (smccc_lfa_available()) {
+		pdev = platform_device_register_simple("arm-smccc-lfa", -1,
+						       NULL, 0);
+		if (IS_ERR(pdev))
+			pr_err("arm-smccc-lfa: could not register device: %ld\n",
 			       PTR_ERR(pdev));
 	}
 
