@@ -34,6 +34,7 @@
 #include <asm/dma.h>
 #include <linux/aer.h>
 #include <linux/bitfield.h>
+#include <linux/pci-tsm.h>
 #include <linux/suspend.h>
 #include "pci.h"
 
@@ -4394,6 +4395,7 @@ EXPORT_SYMBOL(pci_wait_for_pending_transaction);
  */
 int pcie_flr(struct pci_dev *dev)
 {
+	struct tsm_dev *tsm_dev = NULL;
 	int ret;
 
 	if (!pci_dev_config_accessible(dev, "FLR"))
@@ -4402,11 +4404,16 @@ int pcie_flr(struct pci_dev *dev)
 	if (!pci_wait_for_pending_transaction(dev))
 		pci_err(dev, "timed out waiting for pending transaction; performing function level reset anyway\n");
 
+	/* FLR wipes IDE/SPDM state; drop the TSM session, or -EBUSY if bound */
+	ret = pci_tsm_reset_prepare(dev, &tsm_dev);
+	if (ret)
+		return ret;
+
 	/* Have to call it after waiting for pending DMA transaction */
 	ret = pci_dev_reset_iommu_prepare(dev);
 	if (ret) {
 		pci_err(dev, "failed to stop IOMMU for a PCI reset: %d\n", ret);
-		return ret;
+		goto done_tsm;
 	}
 
 	pcie_capability_set_word(dev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_BCR_FLR);
@@ -4424,6 +4431,9 @@ int pcie_flr(struct pci_dev *dev)
 	ret = pci_dev_wait(dev, "FLR", PCIE_RESET_READY_POLL_MS);
 done:
 	pci_dev_reset_iommu_done(dev);
+done_tsm:
+	/* device is back from the FLR: rebuild the TSM session transparently */
+	pci_tsm_reset_done(dev, tsm_dev);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(pcie_flr);

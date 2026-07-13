@@ -9,6 +9,7 @@
 #define dev_fmt(fmt) "PCI/TSM: " fmt
 
 #include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/ioport.h>
 #include <linux/pci.h>
 #include <linux/pci-doe.h>
@@ -473,6 +474,109 @@ static int pci_tsm_disconnect(struct pci_dev *pdev)
 	pm_runtime_put(&pdev->dev);
 	return 0;
 }
+
+/* Time budget to keep retrying the reconnect after an FLR. */
+static unsigned int reset_timeout_ms = 5000;
+module_param(reset_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(reset_timeout_ms,
+	"msecs to keep retrying the TSM reconnect after an FLR");
+
+/*
+ * A vdevice holds a TSM context for its lifetime. Resetting PF0 drops the
+ * session every function's context depends on, while resetting any other
+ * function only affects a vdevice bound to that function.
+ */
+static bool pci_tsm_reset_is_bound(struct pci_dev *pdev)
+{
+	struct pci_tsm_pf0 *pf0 = to_pci_tsm_pf0(pdev->tsm);
+	struct pci_tsm_context *context;
+
+	guard(mutex)(&pf0->lock);
+	if (is_pci_tsm_pf0(pdev))
+		return pf0->context_users;
+
+	list_for_each_entry(context, &pf0->bound_contexts, bound_node)
+		if (context->pdev == pdev)
+			return true;
+	return false;
+}
+
+/**
+ * pci_tsm_reset_prepare() - drop the TSM session before an FLR
+ * @pdev: device about to be reset
+ * @tsm_dev_out: TSM to reconnect in reset_done() (ref taken), or NULL
+ *
+ * FLR wipes IDE/SPDM state, so disconnect here. Return -EBUSY if the device is
+ * bound to a TVM.
+ *
+ * Return: 0 to proceed, -EBUSY if bound, else -errno.
+ */
+int pci_tsm_reset_prepare(struct pci_dev *pdev, struct tsm_dev **tsm_dev_out)
+{
+	struct tsm_dev *tsm_dev;
+	int rc;
+
+	*tsm_dev_out = NULL;
+
+	/* disconnect() runs under pci_tsm_rwsem held for write */
+	ACQUIRE(rwsem_write_kill, lock)(&pci_tsm_rwsem);
+	if ((rc = ACQUIRE_ERR(rwsem_write_kill, &lock)))
+		return rc;
+
+	if (!pdev->tsm || !is_link_tsm(pdev->tsm->tsm_dev))
+		return 0;		/* not TSM-managed */
+
+	if (pci_tsm_reset_is_bound(pdev)) {
+		pci_info(pdev, "tsm-reset: bound to TVM (vdevice present), blocking reset\n");
+		return -EBUSY;
+	}
+
+	/* The TSM session lives on PF0; resetting another function keeps it */
+	if (!is_pci_tsm_pf0(pdev))
+		return 0;
+
+	/* connected, not bound: disconnect and stash the TSM for reset_done() */
+	tsm_dev = pdev->tsm->tsm_dev;
+	get_device(&tsm_dev->dev);
+
+	pci_dbg(pdev, "tsm-reset: tearing down TSM session before reset\n");
+	rc = pci_tsm_disconnect(pdev);
+	if (rc) {
+		put_device(&tsm_dev->dev);
+		return rc;
+	}
+	*tsm_dev_out = tsm_dev;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pci_tsm_reset_prepare);
+
+#define PCI_TSM_RECONNECT_PACING_MS 500
+
+void pci_tsm_reset_done(struct pci_dev *pdev, struct tsm_dev *tsm_dev)
+{
+	unsigned long deadline;
+	int rc;
+
+	if (!tsm_dev)
+		return;			/* was not connected, nothing to rebuild */
+
+	/* device settles after the FLR at its own pace; retry connect until it takes */
+	deadline = jiffies + msecs_to_jiffies(reset_timeout_ms);
+	for (;;) {
+		scoped_guard(rwsem_write, &pci_tsm_rwsem)
+			rc = pdev->tsm ? 0 : pci_tsm_connect(pdev, tsm_dev);
+		if (!rc)
+			break;			/* rebuilt */
+		if (time_after(jiffies, deadline)) {
+			pci_warn(pdev, "tsm-reset: reconnect after FLR failed (%d)\n", rc);
+			break;
+		}
+		msleep(PCI_TSM_RECONNECT_PACING_MS);
+	}
+	put_device(&tsm_dev->dev);
+}
+EXPORT_SYMBOL_GPL(pci_tsm_reset_done);
 
 static ssize_t disconnect_store(struct device *dev,
 				struct device_attribute *attr, const char *buf,
