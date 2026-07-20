@@ -13,6 +13,7 @@
 #include <linux/pci.h>
 #include <linux/pci-doe.h>
 #include <linux/pci-tsm.h>
+#include <linux/pm_runtime.h>
 #include <linux/sysfs.h>
 #include <linux/tsm.h>
 #include <linux/unaligned.h>
@@ -217,17 +218,26 @@ static int pci_tsm_connect(struct pci_dev *pdev, struct tsm_dev *tsm_dev)
 	if (!pci_tsm)
 		return -ENXIO;
 
+	/*
+	 * Keep the DSM out of runtime D3 while connected. Entering low power
+	 * can wipe negotiated IDE keys / TDISP security state and force
+	 * re-authentication. Dropped in pci_tsm_disconnect().
+	 */
+	rc = pm_runtime_resume_and_get(&pdev->dev);
+	if (rc)
+		return rc;
+
 	pdev->tsm = pci_tsm;
 	tsm_pf0 = to_pci_tsm_pf0(pdev->tsm);
 
 	/* mutex_intr assumes connect() is always sysfs/user driven */
 	ACQUIRE(mutex_intr, lock)(&tsm_pf0->lock);
 	if ((rc = ACQUIRE_ERR(mutex_intr, &lock)))
-		return rc;
+		goto err_pm;
 
 	rc = ops->connect(pdev);
 	if (rc)
-		return rc;
+		goto err_pm;
 
 	pdev->tsm = no_free_ptr(pci_tsm);
 
@@ -246,6 +256,10 @@ static int pci_tsm_connect(struct pci_dev *pdev, struct tsm_dev *tsm_dev)
 	if (has_tee(pdev))
 		pci_tsm_walk_fns(pdev, probe_fn, pdev);
 	return 0;
+
+err_pm:
+	pm_runtime_put(&pdev->dev);
+	return rc;
 }
 
 static ssize_t connect_show(struct device *dev, struct device_attribute *attr,
@@ -455,6 +469,8 @@ static int pci_tsm_disconnect(struct pci_dev *pdev)
 	if (ret)
 		return ret;
 	tsm_remove(pdev->tsm);
+	/* Drop the runtime PM reference acquired in pci_tsm_connect() */
+	pm_runtime_put(&pdev->dev);
 	return 0;
 }
 

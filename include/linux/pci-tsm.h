@@ -39,6 +39,9 @@ struct pci_tsm_ops {
 	 * mutual exclusion of @connect and @disconnect. @connect and
 	 * @disconnect additionally run under the DSM lock (struct
 	 * pci_tsm_pf0::lock) as well as @probe and @remove of the subfunctions.
+	 * The core holds a runtime PM reference on the DSM for the connected
+	 * lifetime so the device cannot runtime-suspend into a state that
+	 * would invalidate IDE / TDISP security context.
 	 */
 	struct_group_tagged(pci_tsm_link_ops, link_ops,
 		struct pci_tsm *(*probe)(struct tsm_dev *tsm_dev,
