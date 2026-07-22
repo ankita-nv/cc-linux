@@ -345,6 +345,26 @@ void __init arch_mm_preinit(void)
 	bool cc_guest = is_realm_world();
 
 	if (cc_guest) {
+		/*
+		 * For CCA, all DMA must occur via shared/unencrypted pages.
+		 * The kernel uses SWIOTLB to make this happen without changing
+		 * device drivers. However, depending on the workload being run,
+		 * the default 64MB of SWIOTLB may not be enough and SWIOTLB may
+		 * run out of buffers for DMA, resulting in I/O errors and/or
+		 * performance degradation especially with high I/O workloads.
+		 *
+		 * Adjust the default size of SWIOTLB using a percentage of guest
+		 * memory for SWIOTLB buffers, similar to what x86 does for
+		 * SEV/TDX guests (see x86 commit e998879d4fb79).
+		 *
+		 * Use 6% of guest memory, clamped between 64MB and 1GB.
+		 */
+		phys_addr_t total_mem = memblock_phys_mem_size();
+		unsigned long size = total_mem * 6 / 100;
+
+		size = clamp_val(size, IO_TLB_DEFAULT_SIZE, SZ_1G);
+		swiotlb_adjust_size(size);
+
 		flags |= SWIOTLB_ANY;
 		swiotlb_mark_default_cc_shared();
 	} else if (!limited_addressing) {
