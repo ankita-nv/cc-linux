@@ -384,6 +384,7 @@ int cca_device_accept(struct pci_dev *pdev, unsigned long lock_seq)
 {
 	int ret;
 	struct pci_tsm_mmio *tsm_mmio;
+	u16 cmd;
 	int vdev_id = rsi_vdev_id(pdev);
 	struct cca_guest_dsc *dsc = to_cca_guest_dsc(pdev);
 
@@ -415,6 +416,26 @@ int cca_device_accept(struct pci_dev *pdev, unsigned long lock_seq)
 	 * iomem and RSI mapping state are reverted before returning.
 	 */
 	dsc->pci.mmio = tsm_mmio;
+
+	/*
+	 * Accept runs with no driver bound, so nothing has enabled memory
+	 * decode on the device. Set PCI_COMMAND_MEMORY so the assigned device's
+	 * BARs respond to memory accesses.
+	 *
+	 * The host does not trust a guest-supplied PA for the protected
+	 * mapping: it derives the PA itself by faulting in the VMM's mapping of
+	 * the IPA (realm_dev_faultin_pfn() -> __kvm_faultin_pfn()) and rejects
+	 * anything that is not device MMIO the VMM already mapped (no memslot,
+	 * poisoned pages, or ordinary system RAM), then requires the whole
+	 * range to be physically contiguous (realm_dev_verify_run()). That
+	 * faultin only succeeds while the device decodes memory: vfio-pci gates
+	 * it on __vfio_pci_memory_enabled(), so with MSE clear
+	 * vfio_pci_vmf_insert_pfn() returns VM_FAULT_SIGBUS, the host resolves
+	 * no PFN, and the mapping below fails.
+	 */
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	if (!(cmd & PCI_COMMAND_MEMORY))
+		pci_write_config_word(pdev, PCI_COMMAND, cmd | PCI_COMMAND_MEMORY);
 
 	ret = cca_map_evidence_report_range(pdev, dsc->pci.mmio);
 	if (ret) {
