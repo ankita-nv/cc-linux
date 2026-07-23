@@ -3199,6 +3199,104 @@ void realm_destroy_dpt_l1(struct kvm *kvm, phys_addr_t base)
 }
 EXPORT_SYMBOL_GPL(realm_destroy_dpt_l1);
 
+/* IPA span mapped per mmu_lock hold, between cond_resched() points. */
+#define REALM_DEV_CHUNK_SIZE		SZ_1G
+
+/* Per-run budget for mmu-notifier invalidation retries; then -EAGAIN. */
+#define REALM_DEV_MAP_MAX_RETRIES	16
+
+/*
+ * Resolve device IPA @ipa to the host PFN backing it in the VMM's mapping,
+ * returning it in @pfnp. Returns 0 on success, or -EINVAL if @ipa has no
+ * memslot or does not resolve to device MMIO (system RAM and poisoned pages
+ * are rejected, so only what the VMM mapped can be made protected).
+ */
+static int realm_dev_faultin_pfn(struct kvm *kvm, unsigned long ipa,
+				 kvm_pfn_t *pfnp)
+{
+	gfn_t gfn = kvm_gpa_from_fault(kvm, ipa) >> PAGE_SHIFT;
+	struct kvm_memory_slot *memslot = gfn_to_memslot(kvm, gfn);
+	struct page *page = NULL;
+	bool writable;
+	kvm_pfn_t pfn;
+
+	if (!memslot) {
+		kvm_err("realm dev map: ipa %#lx has no memslot\n", ipa);
+		return -EINVAL;
+	}
+
+	pfn = __kvm_faultin_pfn(memslot, gfn, FOLL_WRITE, &writable, &page);
+
+	/*
+	 * Classify @pfn from most-specific to most-general. HWPOISON is a
+	 * specific error pfn whose bits are a subset of is_error_noslot_pfn()'s
+	 * mask, so it must be tested first or it would be misreported as a
+	 * generic fault. pfn_is_map_memory() is only meaningful once @pfn is
+	 * known to be a valid pfn, so it comes last.
+	 */
+	if (pfn == KVM_PFN_ERR_HWPOISON) {
+		kvm_err("realm dev map: ipa %#lx backed by a poisoned page\n",
+			ipa);
+		kvm_release_page_clean(page);
+		return -EINVAL;
+	}
+	if (is_error_noslot_pfn(pfn)) {
+		kvm_err("realm dev map: ipa %#lx not faultable in VMM (pfn %#llx); is device MMIO decode (PCI_COMMAND_MEMORY) enabled?\n",
+			ipa, pfn);
+		kvm_release_page_clean(page);
+		return -EINVAL;
+	}
+	if (pfn_is_map_memory(pfn)) {
+		kvm_err("realm dev map: ipa %#lx resolves to system RAM (pfn %#llx), not device MMIO\n",
+			ipa, pfn);
+		kvm_release_page_clean(page);
+		return -EINVAL;
+	}
+
+	/* Accepted MMIO is PFNMAP: @page is NULL, so this is a no-op. */
+	kvm_release_page_clean(page);
+	*pfnp = pfn;
+	return 0;
+}
+
+/*
+ * Verify every page of [start_ipa, end_ipa) is backed by device MMIO in the
+ * VMM's mapping and is physically contiguous starting at @phys. The API maps a
+ * single contiguous PA range, so a hole, a non-device page, or any discontinuity
+ * is a malformed request. Returns 0 on success, -EINVAL on mismatch, or -EINTR
+ * on a fatal signal.
+ */
+static int realm_dev_verify_run(struct kvm *kvm, unsigned long start_ipa,
+				unsigned long end_ipa, phys_addr_t phys)
+{
+	kvm_pfn_t base_pfn = __phys_to_pfn(phys);
+	unsigned long ipa;
+
+	for (ipa = start_ipa; ipa < end_ipa; ipa += PAGE_SIZE) {
+		kvm_pfn_t pfn;
+		int ret;
+
+		/* Keep a multi-GiB scan preemptible and killable. */
+		cond_resched();
+		if (fatal_signal_pending(current))
+			return -EINTR;
+
+		ret = realm_dev_faultin_pfn(kvm, ipa, &pfn);
+		if (ret)
+			return ret;
+
+		if (pfn != base_pfn + ((ipa - start_ipa) >> PAGE_SHIFT)) {
+			kvm_err("realm dev map: ipa %#lx pfn %#llx not contiguous with expected pfn %#llx (pa_base %#llx); non-contiguous PA or wrong start_pa\n",
+				ipa, pfn,
+				(u64)(base_pfn + ((ipa - start_ipa) >> PAGE_SHIFT)),
+				(u64)__pfn_to_phys(base_pfn));
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 		unsigned long vdev_phys, unsigned long start_ipa,
 		unsigned long end_ipa, unsigned long start_pa)
@@ -3209,6 +3307,7 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 	int ret = 0;
 	unsigned long top_ipa;
 	unsigned long base_ipa = start_ipa;
+	unsigned int seq_retries = 0;
 	struct realm *realm = &kvm->arch.realm;
 	struct kvm_s2_mmu *mmu = &kvm->arch.mmu;
 
@@ -3222,7 +3321,11 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 
 	realm_create_dpt_l1_range(sro, start_pa, end_ipa - start_ipa);
 
-	do {
+	while (start_ipa < end_ipa) {
+		phys_addr_t chunk_phys = start_pa + (start_ipa - base_ipa);
+		unsigned long mmu_seq;
+		unsigned long chunk_end;
+
 		mapping = kmalloc_obj(*mapping);
 		if (!mapping) {
 			ret = -ENOMEM;
@@ -3237,14 +3340,43 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 			break;
 		}
 
+		/* Snapshot before resolving; rechecked under mmu_lock below. */
+		mmu_seq = kvm->mmu_invalidate_seq;
+		smp_rmb();
+
+		/*
+		 * Throttle mappings to at most CHUNK bytes. The top is always
+		 * aligned to the next CHUNK boundary to keep block mapping
+		 * optimizations functional.
+		 */
+		chunk_end = min(end_ipa,
+				ALIGN_DOWN(start_ipa, REALM_DEV_CHUNK_SIZE) +
+				REALM_DEV_CHUNK_SIZE);
+
+		ret = realm_dev_verify_run(kvm, start_ipa, chunk_end, chunk_phys);
+		if (ret) {
+			kfree(mapping);
+			break;
+		}
+
 		write_lock(&kvm->mmu_lock);
-		if (realm_dev_mapping_overlaps(realm, start_ipa, end_ipa)) {
+		if (mmu_invalidate_retry(kvm, mmu_seq)) {
+			/* Mapping changed while resolving: retry the run. */
+			write_unlock(&kvm->mmu_lock);
+			kfree(mapping);
+			if (++seq_retries > REALM_DEV_MAP_MAX_RETRIES) {
+				ret = -EAGAIN;
+				break;
+			}
+			continue;
+		}
+		if (realm_dev_mapping_overlaps(realm, start_ipa, chunk_end)) {
 			ret = -EEXIST;
 			top_ipa = start_ipa;
 		} else {
 			ret = __realm_dev_mem_map(kvm, sro, pdev_phys,
-						  vdev_phys, start_ipa, end_ipa,
-						  start_pa, &top_ipa);
+						  vdev_phys, start_ipa, chunk_end,
+						  chunk_phys, &top_ipa);
 			if (top_ipa > start_ipa) {
 				mapping->vdev_phys = vdev_phys;
 				mapping->start = start_ipa;
@@ -3258,12 +3390,15 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 		if (!mapping_added)
 			kfree(mapping);
 
-		/* update base before we break out of loop*/
-		start_pa += top_ipa - start_ipa;
+		/* Forward progress resets the retry budget. */
+		if (top_ipa != start_ipa)
+			seq_retries = 0;
 		start_ipa = top_ipa;
 		if (ret && ret != -ENOMEM && ret != -EAGAIN)
 			break;
-	} while (start_ipa < end_ipa);
+
+		cond_resched();
+	}
 
 	rmi_sro_free(sro);
 	kfree(sro);
