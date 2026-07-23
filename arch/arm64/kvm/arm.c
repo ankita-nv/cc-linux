@@ -125,6 +125,12 @@ static bool vgic_present, kvm_arm_initialised;
 
 static DEFINE_PER_CPU(unsigned char, kvm_hyp_initialized);
 
+static bool kvm_arm_rmi_supported(void)
+{
+	return static_key_enabled(&kvm_rmi_is_available) &&
+	       cpus_have_final_cap(ARM64_HAS_ICH_HCR_EL2_TDIR);
+}
+
 bool is_kvm_arm_initialised(void)
 {
 	return kvm_arm_initialised;
@@ -271,7 +277,7 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 		return -EINVAL;
 
 	if (type & KVM_VM_TYPE_ARM_REALM) {
-		if (!static_branch_unlikely(&kvm_rmi_is_available))
+		if (!kvm_arm_rmi_supported())
 			return -EINVAL;
 		kvm_set_realm_state(kvm, REALM_STATE_NONE);
 		kvm->arch.is_realm = true;
@@ -551,7 +557,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 			r = kvm_supports_cacheable_pfnmap();
 		break;
 	case KVM_CAP_ARM_RMI:
-		r = static_key_enabled(&kvm_rmi_is_available);
+		r = kvm_arm_rmi_supported();
 		break;
 
 	default:
