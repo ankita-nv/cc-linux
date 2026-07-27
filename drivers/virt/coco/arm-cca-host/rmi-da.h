@@ -88,6 +88,7 @@ struct cca_host_pdev_dsc {
  * @pdev: pdev communication context
  * @sel_stream: Selective IDE Stream descriptor
  * @rmi_stream_handle_ncoh: stream handle for non-coherent stream registration
+ * @rmi_stream_handle_coh: stream handle for coherent stream registration
  * @rmi_stream_handle_link: stream handle for link IDE (NON_TEE), if connected
  * @rp_dsc: root port PDEV referenced by the endpoint streams
  * @link_stream_id: IDE stream id of the link IDE stream
@@ -100,6 +101,7 @@ struct cca_host_pf0_ep_dsc {
 	struct cca_host_pdev_dsc pdev;
 	struct pci_ide *sel_stream;
 	unsigned long rmi_stream_handle_ncoh;
+	unsigned long rmi_stream_handle_coh;
 	unsigned long rmi_stream_handle_link;
 	struct cca_host_rp_dsc *rp_dsc;
 	int link_stream_id;

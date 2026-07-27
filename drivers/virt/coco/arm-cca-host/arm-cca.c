@@ -214,9 +214,20 @@ static int cca_root_port_pdev_get(struct pci_dev *pdev)
 	return 0;
 }
 
-static int pci_dev_addr_range(struct pci_dev *pdev, struct rmi_addr_range *pdev_addr)
+static int pci_dev_addr_range(struct pci_dev *pdev,
+			      struct rmi_addr_range *pdev_addr,
+			      enum rmi_pdev_stream_type stream_type)
 {
 	int naddr = 0;
+
+	/*
+	 * A coherent stream describes memory that is not covered by the PCI
+	 * BARs. No range is published for it yet, so hand back an empty list
+	 * and let the caller skip the stream.
+	 */
+	if (stream_type == RMI_PDEV_STREAM_COH ||
+	    stream_type == RMI_PDEV_STREAM_COH_SYS)
+		return 0;
 
 	for (int i = 0; i <= PCI_STD_RESOURCE_END && naddr < MAX_STREAM_ADDR_RANGE; i++) {
 		struct resource *res = &pdev->resource[i];
@@ -259,11 +270,63 @@ static int cca_pdev_create_ncoh_stream(struct pci_dev *pdev, unsigned long strea
 	params->pdev_1 = virt_to_phys(pf0_ep_dsc->pdev.rmm_pdev);
 	params->pdev_2 = virt_to_phys(rp_dsc->pdev.rmm_pdev);
 	params->ide_sid = stream_id;
-	params->num_addr_range = pci_dev_addr_range(pdev, params->addr_range);
+	params->num_addr_range = pci_dev_addr_range(pdev, params->addr_range,
+						    params->stream_type);
 
 	ret = cca_pdev_stream_connect(pdev, rp, params, &stream_handle);
 	if (!ret)
 		pf0_ep_dsc->rmi_stream_handle_ncoh = stream_handle;
+
+	free_page((unsigned long)params);
+	return ret;
+}
+
+static int cca_pdev_create_coh_stream(struct pci_dev *pdev, unsigned long stream_id)
+{
+	int ret;
+	long stream_handle;
+	struct rmi_pdev_stream_params *params;
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	struct cca_host_pf0_ep_dsc *pf0_ep_dsc = to_cca_pf0_ep_dsc(pdev);
+	struct cca_host_rp_dsc *rp_dsc;
+
+	if (!rp)
+		return -EINVAL;
+	rp_dsc = to_cca_rp_dsc(rp);
+	if (!rp_dsc)
+		return -EINVAL;
+
+	params = (struct rmi_pdev_stream_params *)get_zeroed_page(GFP_KERNEL);
+	if (!params)
+		return -ENOMEM;
+
+	params->flags = 0;
+	params->stream_type = RMI_PDEV_STREAM_COH;
+	params->pdev_1 = virt_to_phys(pf0_ep_dsc->pdev.rmm_pdev);
+	params->pdev_2 = virt_to_phys(rp_dsc->pdev.rmm_pdev);
+	params->ide_sid = stream_id;
+	params->num_addr_range = pci_dev_addr_range(pdev, params->addr_range,
+						    params->stream_type);
+	if (!params->num_addr_range) {
+		free_page((unsigned long)params);
+		return 0;
+	}
+
+	/*
+	 * Coherent device memory can only be assigned over a COH stream. If
+	 * the RMM does not advertise DA_COH there is no fallback for it, so
+	 * fail the connect rather than silently drop the ranges.
+	 */
+	if (!rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_DA_COH)) {
+		pci_err(pdev,
+			"coherent device memory present but RMM lacks DA_COH support\n");
+		free_page((unsigned long)params);
+		return -EOPNOTSUPP;
+	}
+
+	ret = cca_pdev_stream_connect(pdev, rp, params, &stream_handle);
+	if (!ret)
+		pf0_ep_dsc->rmi_stream_handle_coh = stream_handle;
 
 	free_page((unsigned long)params);
 	return ret;
@@ -331,7 +394,8 @@ static int cca_pdev_create_ncoh_sys_stream(struct pci_dev *pdev)
 	params->pdev_1 = virt_to_phys(pf0_ep_dsc->pdev.rmm_pdev);
 	params->pdev_2 = 0; /* ignored */
 	params->ide_sid = 0; /* ignored */
-	params->num_addr_range = pci_dev_addr_range(pdev, params->addr_range);
+	params->num_addr_range = pci_dev_addr_range(pdev, params->addr_range,
+						    params->stream_type);
 
 	ret = cca_pdev_stream_connect(pdev, NULL, params, &stream_handle);
 	if (!ret)
@@ -347,19 +411,26 @@ static int cca_pdev_create_ncoh_sys_stream(struct pci_dev *pdev)
  */
 static int cca_pdev_init_device_tracking(struct pci_dev *pdev)
 {
+	static const enum rmi_pdev_stream_type types[] = {
+		RMI_PDEV_STREAM_NCOH,	/* MMIO BARs */
+		RMI_PDEV_STREAM_COH,	/* coherent device memory */
+	};
 	struct rmi_addr_range ranges[MAX_STREAM_ADDR_RANGE];
-	int naddr = pci_dev_addr_range(pdev, ranges);
 
-	for (int i = 0; i < naddr; i++) {
-		int ret;
+	for (unsigned int t = 0; t < ARRAY_SIZE(types); t++) {
+		int naddr = pci_dev_addr_range(pdev, ranges, types[t]);
 
-		ret = rmi_init_device_tracking(ranges[i].base,
-					       ranges[i].top - ranges[i].base);
-		if (ret) {
-			pci_err(pdev,
-				"failed to configure RMM tracking for %#llx-%#llx: %d\n",
-				ranges[i].base, ranges[i].top, ret);
-			return ret;
+		for (int i = 0; i < naddr; i++) {
+			int ret;
+
+			ret = rmi_init_device_tracking(ranges[i].base,
+						       ranges[i].top - ranges[i].base);
+			if (ret) {
+				pci_err(pdev,
+					"failed to configure RMM tracking for %#llx-%#llx: %d\n",
+					ranges[i].base, ranges[i].top, ret);
+				return ret;
+			}
 		}
 	}
 
@@ -379,6 +450,11 @@ static void cca_pdev_disconnect_streams(struct pci_dev *pdev)
 		return;
 
 	rp_dsc = pf0_ep_dsc->rp_dsc;
+
+	if (pf0_ep_dsc->rmi_stream_handle_coh) {
+		cca_pdev_disconnect_stream(pdev, rp, pf0_ep_dsc->rmi_stream_handle_coh);
+		pf0_ep_dsc->rmi_stream_handle_coh = 0;
+	}
 
 	if (pf0_ep_dsc->rmi_stream_handle_link) {
 		cca_pdev_disconnect_stream(pdev, rp, pf0_ep_dsc->rmi_stream_handle_link);
@@ -440,6 +516,13 @@ static int cca_pdev_create_streams(struct pci_dev *pdev, unsigned long stream_id
 				if (ret)
 					goto err_disconnect;
 			}
+		}
+
+		/* The COH stream shares the NCOH stream's IDE configuration. */
+		if (create_ncoh) {
+			ret = cca_pdev_create_coh_stream(pdev, stream_id);
+			if (ret)
+				goto err_disconnect;
 		}
 
 		return 0;

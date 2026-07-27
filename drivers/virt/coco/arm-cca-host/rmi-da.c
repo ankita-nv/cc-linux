@@ -1460,6 +1460,16 @@ static int cca_pdev_for_each_ide_stream(struct pci_dev *pdev,
 			return ret;
 	}
 
+	if (pf0_ep_dsc->rmi_stream_handle_coh) {
+		ret = cca_pdev_stream_uses_ide(pdev, rp,
+					       pf0_ep_dsc->rmi_stream_handle_coh);
+		if (ret > 0)
+			ret = stream_op(pdev, rp,
+					pf0_ep_dsc->rmi_stream_handle_coh);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 
