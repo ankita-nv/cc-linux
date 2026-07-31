@@ -408,6 +408,126 @@ static ssize_t write_cache_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(write_cache);
 
+static ssize_t pmem_cache_store(struct device *dev, const char *buf,
+				size_t len, bool invalidate)
+{
+	struct gendisk *disk = dev_to_disk(dev);
+	struct pmem_device *pmem = disk->private_data;
+	struct block_device *part;
+	sector_t start, nr_sectors;
+	unsigned int memflags;
+	unsigned int partno;
+	int rc;
+
+	rc = kstrtouint(buf, 0, &partno);
+	if (rc)
+		return rc;
+	if (!partno)
+		return -EINVAL;
+
+	mutex_lock(&disk->open_mutex);
+	part = xa_load(&disk->part_tbl, partno);
+	if (!part) {
+		rc = -ENODEV;
+		goto out_unlock;
+	}
+	if (atomic_read(&part->bd_openers)) {
+		rc = -EBUSY;
+		goto out_unlock;
+	}
+
+	start = get_start_sect(part);
+	nr_sectors = bdev_nr_sectors(part);
+	if (!nr_sectors || nr_sectors > (SIZE_MAX >> SECTOR_SHIFT)) {
+		rc = -E2BIG;
+		goto out_unlock;
+	}
+
+	memflags = blk_mq_freeze_queue(disk->queue);
+	if (invalidate)
+		arch_invalidate_pmem(pmem->virt_addr + pmem->data_offset +
+				     (start << SECTOR_SHIFT),
+				     nr_sectors << SECTOR_SHIFT);
+	else
+		arch_wb_cache_pmem(pmem->virt_addr + pmem->data_offset +
+				   (start << SECTOR_SHIFT),
+				   nr_sectors << SECTOR_SHIFT);
+	blk_mq_unfreeze_queue(disk->queue, memflags);
+	rc = len;
+
+out_unlock:
+	mutex_unlock(&disk->open_mutex);
+	return rc;
+}
+
+/*
+ * /sys/block/pmemX/flush_cache
+ *
+ * Write a partition number before the backdoor load starts. Userspace must
+ * first unmount the partition and flush its block cache. This cleans dirty
+ * CPU cache lines to persistent memory so they cannot overwrite data loaded
+ * through the backdoor.
+ */
+static ssize_t flush_cache_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t len)
+{
+	return pmem_cache_store(dev, buf, len, false);
+}
+static DEVICE_ATTR_WO(flush_cache);
+
+/*
+ * /sys/block/pmemX/invalidate_cache
+ *
+ * Write a partition number after the backdoor load completes. The partition
+ * must be unused. Userspace must use BLKFLSBUF again before accessing the
+ * modified data.
+ */
+static ssize_t invalidate_cache_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t len)
+{
+	return pmem_cache_store(dev, buf, len, true);
+}
+static DEVICE_ATTR_WO(invalidate_cache);
+
+/*
+ * /sys/block/pmemX/partition_ranges
+ *
+ * Read to list each partition with the following header and format:
+ *
+ *     partition start size
+ *     <partition-number> <physical-start-address> <size-in-bytes>
+ *
+ * The physical address and size are reported in hexadecimal.
+ */
+static ssize_t partition_ranges_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct gendisk *disk = dev_to_disk(dev);
+	struct pmem_device *pmem = disk->private_data;
+	struct block_device *part;
+	unsigned long partno;
+	ssize_t len;
+
+	len = sysfs_emit(buf, "%-9s %-18s %s\n",
+			 "partition", "start", "size");
+
+	mutex_lock(&disk->open_mutex);
+	xa_for_each_start(&disk->part_tbl, partno, part, 1) {
+		phys_addr_t start = pmem->phys_addr + pmem->data_offset +
+			(get_start_sect(part) << SECTOR_SHIFT);
+		u64 size = bdev_nr_sectors(part) << SECTOR_SHIFT;
+
+		len += sysfs_emit_at(buf, len, "%-9lu %pa %#llx\n", partno,
+				     &start, size);
+	}
+	mutex_unlock(&disk->open_mutex);
+
+	return len;
+}
+static DEVICE_ATTR_RO(partition_ranges);
+
 static umode_t dax_visible(struct kobject *kobj, struct attribute *a, int n)
 {
 #ifndef CONFIG_ARCH_HAS_PMEM_API
@@ -428,8 +548,30 @@ static const struct attribute_group dax_attribute_group = {
 	.is_visible	= dax_visible,
 };
 
+static struct attribute *pmem_attributes[] = {
+	&dev_attr_flush_cache.attr,
+	&dev_attr_invalidate_cache.attr,
+	&dev_attr_partition_ranges.attr,
+	NULL,
+};
+
+static umode_t pmem_visible(struct kobject *kobj, struct attribute *a, int n)
+{
+#ifndef CONFIG_ARCH_HAS_PMEM_API
+	return 0;
+#else
+	return a->mode;
+#endif
+}
+
+static const struct attribute_group pmem_attribute_group = {
+	.attrs		= pmem_attributes,
+	.is_visible	= pmem_visible,
+};
+
 static const struct attribute_group *pmem_attribute_groups[] = {
 	&dax_attribute_group,
+	&pmem_attribute_group,
 	NULL,
 };
 
