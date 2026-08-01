@@ -257,6 +257,17 @@ config BLK_DEV_RAM_SIZE
 	  The default value is 4096 kilobytes. Only change this if you know
 	  what you are doing.
 
+config BLK_DEV_BDRAM
+	tristate "Contiguous RAM block device for backdoor loading"
+	depends on ARM64 && CONTIG_ALLOC && ARCH_HAS_PMEM_API
+	help
+	  Create a block device backed by physically contiguous system RAM.
+	  The device can be created and destroyed at runtime through a module
+	  parameter. Its physical address is reported through sysfs so a
+	  platform backdoor can load an image into it.
+
+	  Large allocations may fail after memory becomes fragmented.
+
 config ATA_OVER_ETH
 	tristate "ATA over Ethernet support"
 	depends on NET
