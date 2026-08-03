@@ -13,6 +13,13 @@
 
 #include "arm-smmu-v3.h"
 
+/*
+ * An RMI PSMMU L2 stream table occupies one RMI granule, so it holds
+ * fewer STEs than the STRTAB_NUM_L2_STES this driver uses for its own
+ * stream tables. The RMM sizes it the same way, with STRTAB_SPLIT = 6.
+ */
+#define RMI_STRTAB_NUM_L2_STES (PAGE_SIZE / sizeof(struct arm_smmu_ste))
+
 #define	RMI_PSMMU_IRQ_PEND_GERROR	BIT(0)
 #define	RMI_PSMMU_IRQ_PEND_EVENTQ	BIT(1)
 #define	RMI_PSMMU_IRQ_PEND_PRIQ		BIT(2)
@@ -204,7 +211,7 @@ int arm_smmu_get_realm_params(struct device *dev,
 	memset(params, 0, sizeof(*params));
 	params->psmmu_phys = smmu->base_phys;
 	params->l2_sid = ALIGN_DOWN(master->streams[0].id,
-				    STRTAB_NUM_L2_STES);
+				    RMI_STRTAB_NUM_L2_STES);
 
 	/*
 	 * Request ATS only if the SMMU, the RMM and the PSMMU all support it.

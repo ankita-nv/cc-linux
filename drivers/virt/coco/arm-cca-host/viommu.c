@@ -14,6 +14,7 @@
 #include <linux/pci-tsm.h>
 #include <linux/slab.h>
 #include <linux/tsm.h>
+#include <linux/xarray.h>
 
 #include <asm/kvm_emulate.h>
 #include <asm/rmi_cmds.h>
@@ -25,6 +26,8 @@ struct cca_psmmu {
 	struct list_head node;
 	phys_addr_t phys;
 	unsigned int users;
+	/* L2 stream tables created in the RMM, indexed by first SID */
+	struct xarray l2tables;
 };
 
 struct cca_viommu {
@@ -93,21 +96,57 @@ cca_psmmu_get(const struct arm_smmu_realm_params *params)
 
 	psmmu->phys = params->psmmu_phys;
 	psmmu->users = 1;
+	xa_init(&psmmu->l2tables);
 	list_add(&psmmu->node, &cca_psmmus);
 	return psmmu;
+}
+
+static int __cca_psmmu_destroy_l2(struct cca_psmmu *psmmu, u32 l2_sid)
+{
+	unsigned long rmi_ret = 0;
+	int ret;
+
+	lockdep_assert_held(&cca_psmmus_lock);
+	ret = rmi_psmmu_st_l2_destroy(psmmu->phys, l2_sid, &rmi_ret);
+	if (ret)
+		return ret;
+	if (!rmi_ret) {
+		xa_erase(&psmmu->l2tables, l2_sid);
+		return 0;
+	}
+	/* Another vdevice still has a live STE in this table. */
+	if (RMI_RETURN_STATUS(rmi_ret) == RMI_ERROR_PSMMU_ST &&
+	    RMI_RETURN_INDEX(rmi_ret) == 2)
+		return -EBUSY;
+	return -EIO;
 }
 
 static void cca_psmmu_put(struct cca_psmmu *psmmu)
 {
 	unsigned long rmi_ret = 0;
+	unsigned long l2_sid;
+	void *entry;
 
 	guard(mutex)(&cca_psmmus_lock);
 	if (--psmmu->users)
 		return;
+
+	/*
+	 * PSMMU_DEACTIVATE fails while an L1 entry points to an L2 table.
+	 * Every dependent vdevice is gone by now, so retry the tables left
+	 * behind by earlier busy or failed destroys. If any survive, keep the
+	 * PSMMU active and tracked so a later user can reuse it.
+	 */
+	xa_for_each(&psmmu->l2tables, l2_sid, entry)
+		__cca_psmmu_destroy_l2(psmmu, l2_sid);
+	if (WARN_ON(!xa_empty(&psmmu->l2tables)))
+		return;
+
 	if (rmi_psmmu_deactivate(psmmu->phys, &rmi_ret) || rmi_ret) {
 		pr_warn("failed to deactivate Realm pSMMU at %pa\n",
 			&psmmu->phys);
 	}
+	xa_destroy(&psmmu->l2tables);
 	list_del(&psmmu->node);
 	kfree(psmmu);
 }
@@ -132,29 +171,33 @@ static int cca_psmmu_create_l2(struct cca_psmmu *psmmu, u32 l2_sid)
 	int ret;
 
 	guard(mutex)(&cca_psmmus_lock);
+	/* Reuse a table another vdevice in the same L2 range created. */
+	ret = xa_insert(&psmmu->l2tables, l2_sid, xa_mk_value(1), GFP_KERNEL);
+	if (ret == -EBUSY)
+		return 0;
+	if (ret)
+		return ret;
+
 	ret = rmi_psmmu_st_l2_create(psmmu->phys, l2_sid, &rmi_ret);
 	if (!ret && !rmi_ret)
 		return 0;
+	/* An untracked table already exists; track it for teardown. */
 	if (RMI_RETURN_STATUS(rmi_ret) == RMI_ERROR_PSMMU_ST &&
 	    RMI_RETURN_INDEX(rmi_ret) == 2)
 		return 0;
+	xa_erase(&psmmu->l2tables, l2_sid);
 	return -EIO;
 }
 
 static void cca_psmmu_destroy_l2(struct cca_psmmu *psmmu, u32 l2_sid,
 				 struct device *dev)
 {
-	unsigned long rmi_ret = 0;
 	int ret;
 
 	guard(mutex)(&cca_psmmus_lock);
-	ret = rmi_psmmu_st_l2_destroy(psmmu->phys, l2_sid, &rmi_ret);
-	if (!ret && !rmi_ret)
-		return;
-	if (RMI_RETURN_STATUS(rmi_ret) == RMI_ERROR_PSMMU_ST &&
-	    RMI_RETURN_INDEX(rmi_ret) == 2)
-		return;
-	dev_warn(dev, "failed to destroy Realm stream mapping\n");
+	ret = __cca_psmmu_destroy_l2(psmmu, l2_sid);
+	if (ret && ret != -EBUSY)
+		dev_warn(dev, "failed to destroy Realm stream mapping\n");
 }
 
 static int cca_vdevice_unmap(struct cca_vdevice *cca_vdev)
