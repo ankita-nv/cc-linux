@@ -863,9 +863,20 @@ static void realm_unmap_stage2(struct kvm *kvm)
 
 int kvm_realm_teardown_stage2(struct kvm *kvm)
 {
+	struct realm *realm = &kvm->arch.realm;
+
 	lockdep_assert_held(&kvm->arch.config_lock);
 
 	realm_unmap_stage2(kvm);
+
+	/*
+	 * VSMMU mappings are owner-managed and remain until unregister. A
+	 * registered VSMMU pins the KVM, so final Realm destruction retries
+	 * RTT teardown after its release removes the architectural mappings.
+	 */
+	if (realm->stage2_unmapped && !xa_empty(&realm->vsmmus))
+		return 0;
+
 	return realm_destroy_rtts(kvm);
 }
 

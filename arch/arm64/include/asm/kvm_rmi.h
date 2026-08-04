@@ -59,7 +59,8 @@ enum realm_state {
  * @ia_bits: Number of valid Input Address bits in the IPA
  * @dev_mappings: RMM VDEV mapping ranges, protected by kvm->mmu_lock
  * @ripas_user_init: Userspace initialized RIPAS with KVM_ARM_RMI_INIT_RIPAS
- * @stage2_unmapped: The Realm stage-2 mappings have been removed
+ * @stage2_unmapped: Realm DATA and ordinary device mappings were removed;
+ *                   owner-managed VSMMU mappings may remain
  * @stage2_unmap_failed: An unmap could not be completed (retry required)
  * @rtts_destroyed: The non-root RTTs have been torn down
  * @unmap_desc_buf: Output address list used by range unmap commands
