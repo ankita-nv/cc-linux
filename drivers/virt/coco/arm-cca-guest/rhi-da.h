@@ -6,7 +6,7 @@
 #ifndef _VIRT_COCO_RHI_DA_H_
 #define _VIRT_COCO_RHI_DA_H_
 
-#include <asm/rhi.h>
+#include <linux/arm-smccc-rhi.h>
 
 struct pci_dev;
 bool rhi_has_da_support(void);
