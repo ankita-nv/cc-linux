@@ -387,13 +387,6 @@ static int do_dev_communicate(enum dev_comm_type type,
 		ret = _do_dev_communicate(type, tsm, host_tdi, stream_wait);
 	}
 	if (ret) {
-		if (type == PDEV_COMMUNICATE)
-			rmi_pdev_abort(virt_to_phys(pdev_dsc->rmm_pdev));
-		else
-			rmi_vdev_abort(virt_to_phys(host_tdi->realm->rd),
-				       virt_to_phys(pdev_dsc->rmm_pdev),
-				       virt_to_phys(host_tdi->rmm_vdev));
-
 		state = error_state;
 	} else {
 		/*
@@ -410,8 +403,21 @@ static int do_dev_communicate(enum dev_comm_type type,
 			state = error_state;
 	}
 
-	if (state == error_state)
+	if (state == error_state) {
+		/*
+		 * A successful communicate call can still leave the device in
+		 * an error state after an SPDM failure. Only abort returns the
+		 * communication state to idle so teardown can make progress.
+		 */
+		if (type == PDEV_COMMUNICATE)
+			rmi_pdev_abort(virt_to_phys(pdev_dsc->rmm_pdev));
+		else
+			rmi_vdev_abort(virt_to_phys(host_tdi->realm->rd),
+				       virt_to_phys(pdev_dsc->rmm_pdev),
+				       virt_to_phys(host_tdi->rmm_vdev));
+
 		pci_err(tsm->pdev, "device communication error\n");
+	}
 
 	return state;
 }
