@@ -3895,6 +3895,59 @@ static int kvm_complete_vdev_map_validate(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+static int kvm_complete_vsmmu_command(struct kvm_vcpu *vcpu)
+{
+	struct realm *realm = &vcpu->kvm->arch.realm;
+	struct realm_rec *rec = &vcpu->arch.rec;
+	struct rmi_vsmmu_cmd_result cmd;
+	struct realm_vsmmu *vsmmu;
+	phys_addr_t rd, vsmmu_phys;
+	int ret = 0;
+
+	vsmmu = kvm_realm_get_vsmmu_by_base(vcpu->kvm, rec->run->exit.vsmmu);
+	if (!vsmmu) {
+		vcpu_err(vcpu, "Unknown VSMMU at IPA %#llx\n",
+			 rec->run->exit.vsmmu);
+		return -ENODEV;
+	}
+
+	rd = virt_to_phys(realm->rd);
+	vsmmu_phys = kvm_realm_vsmmu_phys(vsmmu);
+	do {
+		unsigned long rmi_ret;
+
+		rmi_ret = rmi_vsmmu_cmd_get(vsmmu_phys, rd, &cmd);
+		if (rmi_ret) {
+			vcpu_err(vcpu, "RMI_VSMMU_CMD_GET failed: %#lx\n",
+				 rmi_ret);
+			ret = -EIO;
+			break;
+		}
+
+		if (cmd.flags & RMI_VSMMU_CMD_FLAGS_CMD_COMPLETE) {
+			vcpu_err(vcpu,
+				 "VSMMU command requires unsupported PRI completion\n");
+			ret = -EOPNOTSUPP;
+			break;
+		}
+
+		if (cmd.flags & RMI_VSMMU_CMD_FLAGS_IRQ) {
+			ret = kvm_realm_inject_vsmmu_msi(vsmmu, cmd.msi_addr,
+							 cmd.msi_data);
+			if (ret < 0) {
+				vcpu_err(vcpu, "VSMMU MSI injection failed: %d\n",
+					 ret);
+				break;
+			}
+			ret = 0;
+		}
+		cond_resched();
+	} while (cmd.flags & RMI_VSMMU_CMD_FLAGS_PENDING);
+
+	kvm_realm_put_vsmmu(vsmmu);
+	return ret ?: 1;
+}
+
 int kvm_rec_handle_request(struct kvm_vcpu *vcpu)
 {
 	struct realm_rec *rec = &vcpu->arch.rec;
@@ -3931,6 +3984,8 @@ int kvm_rec_handle_request(struct kvm_vcpu *vcpu)
 		return kvm_complete_ripas_change(vcpu);
 	case RMI_EXIT_VDEV_VALIDATE_MAPPING:
 		return kvm_complete_vdev_map_validate(vcpu);
+	case RMI_EXIT_VSMMU_COMMAND:
+		return kvm_complete_vsmmu_command(vcpu);
 	default:
 		KVM_BUG(1, vcpu->kvm, "Unhandled realm exit_reason");
 		return -ENXIO;

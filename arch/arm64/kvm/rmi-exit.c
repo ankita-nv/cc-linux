@@ -242,6 +242,13 @@ int kvm_rec_exit(struct kvm_vcpu *vcpu, int rec_run_ret)
 		return ARM_EXCEPTION_TRAP;
 	case RMI_EXIT_VDEV_VALIDATE_MAPPING:
 		return rec_exit_vdev_validate_mapping(vcpu);
+	case RMI_EXIT_VSMMU_COMMAND:
+		/*
+		 * Draining the VSMMU commands may sleep, so complete it from
+		 * kvm_rec_handle_request() before the next REC entry.
+		 */
+		kvm_make_request(KVM_REQ_RMI, vcpu);
+		return ARM_EXCEPTION_IRQ;
 	}
 
 	return rec_exit_fatal(vcpu, "Unsupported Realm exit reason",
