@@ -523,8 +523,16 @@ int pci_tsm_reset_prepare(struct pci_dev *pdev, struct tsm_dev **tsm_dev_out)
 	if ((rc = ACQUIRE_ERR(rwsem_write_kill, &lock)))
 		return rc;
 
-	if (!pdev->tsm || !is_link_tsm(pdev->tsm->tsm_dev))
+	if (!pdev->tsm)
 		return 0;		/* not TSM-managed */
+
+	if (is_devsec_tsm(pdev->tsm->tsm_dev)) {
+		pci_info(pdev, "tsm-reset: devsec context active, blocking reset\n");
+		return -EBUSY;
+	}
+
+	if (!is_link_tsm(pdev->tsm->tsm_dev))
+		return 0;
 
 	if (pci_tsm_reset_is_bound(pdev)) {
 		pci_info(pdev, "tsm-reset: bound to TVM (vdevice present), blocking reset\n");
