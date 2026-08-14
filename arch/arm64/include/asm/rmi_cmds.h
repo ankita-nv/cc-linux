@@ -691,6 +691,62 @@ static inline unsigned long rmi_psmmu_event_consume(unsigned long psmmu_phys,
 	return res.a0;
 }
 
+struct rmi_vsmmu_event_result {
+	u64 flags;
+	u64 msi_addr;
+	u64 msi_data;
+	u64 fipa;
+	u64 syndrome;
+};
+
+static inline unsigned long
+rmi_vsmmu_event_handle(unsigned long psmmu_phys, unsigned long rd_phys,
+		       unsigned long vsmmu_phys, unsigned long pdev_phys,
+		       unsigned long vdev_phys,
+		       struct rmi_vsmmu_event_result *event)
+{
+	struct arm_smccc_1_2_regs regs = {
+		SMC_RMI_VSMMU_EVENT_HANDLE, psmmu_phys, rd_phys, vsmmu_phys,
+		pdev_phys, vdev_phys
+	};
+
+	arm_smccc_1_2_invoke(&regs, &regs);
+
+	event->flags = regs.a1;
+	event->msi_addr = regs.a2;
+	event->msi_data = regs.a3;
+	event->fipa = regs.a4;
+	event->syndrome = regs.a5;
+
+	return regs.a0;
+}
+
+struct rmi_vsmmu_cmd_result {
+	u64 flags;
+	u64 vsid;
+	u64 msi_addr;
+	u64 msi_data;
+};
+
+static inline unsigned long rmi_vsmmu_cmd_get(unsigned long vsmmu_phys,
+					      unsigned long rd_phys,
+					      struct rmi_vsmmu_cmd_result *cmd)
+{
+	struct arm_smccc_1_2_regs regs = {
+		SMC_RMI_VSMMU_CMD_GET, vsmmu_phys, rd_phys
+	};
+
+	arm_smccc_1_2_invoke(&regs, &regs);
+
+	cmd->flags = regs.a1;
+	cmd->vsid = regs.a2;
+	cmd->msi_addr = regs.a3;
+	cmd->msi_data = regs.a4;
+
+	return regs.a0;
+}
+
+
 static inline unsigned long rmi_vdev_communicate(unsigned long rd_phys,
 		unsigned long pdev_phys, unsigned long vdev_phys,
 		unsigned long vdev_comm_data_phys)
