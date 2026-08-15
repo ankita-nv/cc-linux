@@ -1045,6 +1045,9 @@ struct arm_smmu_master {
 	bool				ste_ats_enabled : 1;
 	bool				stall_enabled;
 	bool				ats_always_on;
+	bool				bad_cd_test_active;
+	ioasid_t			bad_cd_test_pasid;
+	struct arm_smmu_cd		bad_cd_test_cd;
 	unsigned int			ssid_bits;
 	unsigned int			iopf_refcount;
 	u16				partid;

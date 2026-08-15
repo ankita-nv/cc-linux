@@ -47,6 +47,13 @@ module_param(disable_msipolling, bool, 0444);
 MODULE_PARM_DESC(disable_msipolling,
 	"Disable MSI-based polling for CMD_SYNC completion.");
 
+static bool test_bad_cd;
+module_param(test_bad_cd, bool, 0444);
+MODULE_PARM_DESC(test_bad_cd,
+	"Inject C_BAD_CD on the first SVA PASID attachment");
+
+static atomic_t test_bad_cd_claimed = ATOMIC_INIT(0);
+
 static const struct iommu_ops arm_smmu_ops;
 static struct iommu_dirty_ops arm_smmu_dirty_ops;
 
@@ -2265,6 +2272,34 @@ static void arm_smmu_dump_event(struct arm_smmu_device *smmu, u64 *raw,
 	}
 }
 
+static void arm_smmu_test_bad_cd_complete(struct arm_smmu_event *event)
+{
+	struct arm_smmu_master *master;
+	struct arm_smmu_cd *cdptr;
+
+	if (event->id != EVT_ID_BAD_CD_CONFIG || !event->dev)
+		return;
+
+	master = dev_iommu_priv_get(event->dev);
+	if (!master || !READ_ONCE(master->bad_cd_test_active) || !event->ssv ||
+	    event->ssid != master->bad_cd_test_pasid)
+		return;
+
+	mutex_lock(&arm_smmu_asid_lock);
+	if (master->bad_cd_test_active) {
+		cdptr = arm_smmu_get_cd_ptr(master, master->bad_cd_test_pasid);
+		if (cdptr) {
+			arm_smmu_write_cd_entry(master,
+						master->bad_cd_test_pasid,
+						cdptr, &master->bad_cd_test_cd);
+			WRITE_ONCE(master->bad_cd_test_active, false);
+		}
+	}
+	mutex_unlock(&arm_smmu_asid_lock);
+
+	dev_alert(master->dev, "HACK: Inject a bad CD to test IRQ/EVENTQ\n");
+}
+
 static irqreturn_t arm_smmu_evtq_thread(int irq, void *dev)
 {
 	u64 evt[EVTQ_ENT_DWORDS];
@@ -2278,6 +2313,7 @@ static irqreturn_t arm_smmu_evtq_thread(int irq, void *dev)
 	do {
 		while (!queue_remove_raw(q, evt)) {
 			arm_smmu_decode_event(smmu, evt, &event);
+			arm_smmu_test_bad_cd_complete(&event);
 			if (arm_smmu_handle_event(smmu, evt, &event))
 				arm_smmu_dump_event(smmu, evt, &event, &rs);
 
@@ -3795,6 +3831,8 @@ int arm_smmu_set_pasid(struct arm_smmu_master *master,
 		.ssid = pasid,
 		.old_domain = old,
 	};
+	struct arm_smmu_cd invalid_cd = {};
+	bool inject_bad_cd = false;
 	struct arm_smmu_cd *cdptr;
 	int ret;
 
@@ -3825,8 +3863,19 @@ int arm_smmu_set_pasid(struct arm_smmu_master *master,
 	cd->data[0] |= cpu_to_le64(
 		FIELD_PREP(CTXDESC_CD_0_ASID, smmu_domain->cd.asid));
 
+	if (test_bad_cd && smmu_domain->domain.type == IOMMU_DOMAIN_SVA &&
+	    atomic_cmpxchg(&test_bad_cd_claimed, 0, 1) == 0) {
+		master->bad_cd_test_cd = *cd;
+		master->bad_cd_test_pasid = pasid;
+		inject_bad_cd = true;
+	}
+
 	arm_smmu_write_cd_entry(master, pasid, cdptr, cd);
 	arm_smmu_update_ste(master, sid_domain, state.ats_enabled);
+	if (inject_bad_cd) {
+		WRITE_ONCE(master->bad_cd_test_active, true);
+		arm_smmu_write_cd_entry(master, pasid, cdptr, &invalid_cd);
+	}
 
 	arm_smmu_attach_commit(&state);
 
@@ -3849,6 +3898,8 @@ static int arm_smmu_blocking_set_dev_pasid(struct iommu_domain *new_domain,
 
 	mutex_lock(&arm_smmu_asid_lock);
 	arm_smmu_attach_prepare_invs(&state, NULL);
+	if (master->bad_cd_test_active && master->bad_cd_test_pasid == pasid)
+		WRITE_ONCE(master->bad_cd_test_active, false);
 	arm_smmu_clear_cd(master, pasid);
 	if (master->ats_enabled)
 		arm_smmu_atc_inv_master(master, pasid);
