@@ -673,42 +673,124 @@ static int rmi_verify_memory_tracking(phys_addr_t start, phys_addr_t end)
 	return 0;
 }
 
+static unsigned long rmi_l0gpt_size(void)
+{
+	return 1UL << (30 + FIELD_GET(RMI_FEATURE_REGISTER_1_L0GPTSZ,
+				      rmi_feat_reg(1)));
+}
+
+static int rmi_query_gpt_info(phys_addr_t base, phys_addr_t top,
+			      phys_addr_t *out_top, unsigned long *state)
+{
+	unsigned long result_top, result_state;
+	unsigned long l0gpt_sz = rmi_l0gpt_size();
+	int ret;
+
+	ret = rmi_gpt_info(base, top, &result_top, &result_state);
+	if (ret != RMI_SUCCESS) {
+		pr_err("RMI: GPT info failed for [%pa, %pa): 0x%x\n",
+		       &base, &top, ret);
+		return -ENXIO;
+	}
+
+	if (result_top <= base || result_top > top ||
+	    !IS_ALIGNED(result_top, l0gpt_sz) ||
+	    result_state > RMI_GPT_PAR_HOST_CREATED) {
+		pr_err("RMI: invalid GPT info for [%pa, %pa): top=%#lx state=%#lx\n",
+		       &base, &top, result_top, result_state);
+		return -EPROTO;
+	}
+
+	*out_top = result_top;
+	*state = result_state;
+
+	return 0;
+}
+
+static int rmi_verify_host_memory_tracking(phys_addr_t start, phys_addr_t end)
+{
+	unsigned long l0gpt_sz = rmi_l0gpt_size();
+
+	start = ALIGN_DOWN(start, l0gpt_sz);
+	end = ALIGN(end, l0gpt_sz);
+
+	while (start < end) {
+		phys_addr_t state_top;
+		unsigned long state;
+		int ret;
+
+		ret = rmi_query_gpt_info(start, end, &state_top, &state);
+		if (ret)
+			return ret;
+
+		if (state == RMI_GPT_PAR_HOST_NOT_CREATED ||
+		    state == RMI_GPT_PAR_HOST_CREATED) {
+			ret = rmi_verify_memory_tracking(start, state_top);
+			if (ret)
+				return ret;
+		}
+
+		start = state_top;
+	}
+
+	return 0;
+}
+
 static int rmi_create_gpts(phys_addr_t start, phys_addr_t end)
 {
 	struct rmi_sro_state *sro;
-	unsigned long l0gpt_sz;
+	unsigned long l0gpt_sz = rmi_l0gpt_size();
+	int ret = 0;
 
 	sro = kmalloc_obj(*sro, GFP_KERNEL);
 	if (!sro)
 		return -ENOMEM;
 
-	l0gpt_sz = 1UL << (30 + FIELD_GET(RMI_FEATURE_REGISTER_1_L0GPTSZ,
-					  rmi_feat_reg(1)));
 	start = ALIGN_DOWN(start, l0gpt_sz);
 	end = ALIGN(end, l0gpt_sz);
 
 	while (start < end) {
-		long ret = rmi_gpt_l1_create(start, sro, GFP_KERNEL);
+		phys_addr_t state_top;
+		unsigned long state;
 
-		/*
-		 * Make sure the L1 GPT tables are created for the region.
-		 * RMI_ERROR_GPT indicates the L1 table already exists.
-		 */
-		if (ret < 0) {
-			kfree(sro);
-			return ret;
+		ret = rmi_query_gpt_info(start, end, &state_top, &state);
+		if (ret)
+			break;
+
+		switch (state) {
+		case RMI_GPT_PAR_RESERVED:
+		case RMI_GPT_PAR_PLAT:
+		case RMI_GPT_PAR_HOST_CREATED:
+			start = state_top;
+			continue;
+		case RMI_GPT_PAR_HOST_NOT_CREATED:
+			break;
+		default:
+			ret = -EPROTO;
+			goto out;
 		}
 
-		if (ret != RMI_SUCCESS && RMI_RETURN_STATUS(ret) != RMI_ERROR_GPT) {
-			pr_err("GPT Level1 table missing for %llx\n", start);
-			kfree(sro);
-			return -ENOMEM;
+		while (start < state_top) {
+			long rmi_ret;
+
+			rmi_ret = rmi_gpt_l1_create(start, sro, GFP_KERNEL);
+			if (rmi_ret < 0) {
+				ret = rmi_ret;
+				goto out;
+			}
+			if (RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS) {
+				pr_err("RMI: GPT L1 create failed for %pa: 0x%lx\n",
+				       &start, rmi_ret);
+				ret = -ENXIO;
+				goto out;
+			}
+			start += l0gpt_sz;
 		}
-		start += l0gpt_sz;
 	}
 
+out:
 	kfree(sro);
-	return 0;
+	return ret;
 }
 
 static int rmi_init_metadata(void)
@@ -716,6 +798,11 @@ static int rmi_init_metadata(void)
 	phys_addr_t start, end;
 	struct memblock_region *r;
 
+	/*
+	 * DEN0137 v2.0-bet3 requires L1 GPT creation to be independent of
+	 * Granule tracking. Create every required host L1 GPT before checking
+	 * that host memory uses fine-grained conventional tracking.
+	 */
 	for_each_mem_region(r) {
 		int ret;
 
@@ -725,10 +812,25 @@ static int rmi_init_metadata(void)
 
 		start = memblock_region_memory_base_pfn(r) << PAGE_SHIFT;
 		end = memblock_region_memory_end_pfn(r) << PAGE_SHIFT;
-		ret = rmi_verify_memory_tracking(start, end);
+		ret = rmi_create_gpts(start, end);
 		if (ret)
 			return ret;
-		ret = rmi_create_gpts(start, end);
+	}
+
+	/*
+	 * The current host implementation supports Realm memory only in
+	 * fine-grained conventional tracking regions. Validate that prerequisite
+	 * only after all required GPTs have been created.
+	 */
+	for_each_mem_region(r) {
+		int ret;
+
+		if (memblock_is_nomap(r))
+			continue;
+
+		start = memblock_region_memory_base_pfn(r) << PAGE_SHIFT;
+		end = memblock_region_memory_end_pfn(r) << PAGE_SHIFT;
+		ret = rmi_verify_host_memory_tracking(start, end);
 		if (ret)
 			return ret;
 	}

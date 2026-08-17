@@ -112,6 +112,32 @@ static inline int rmi_granule_tracking_get(unsigned long start,
 }
 
 /**
+ * rmi_gpt_info() - Query the L1 GPT state of a physical address range
+ * @base: L0GPTSZ-aligned base PA of the target range
+ * @top: L0GPTSZ-aligned top PA of the target range
+ * @out_top: Top PA of the first subrange with a uniform GPT PAR state
+ * @state: RmiGptParState of the returned subrange
+ *
+ * Return: RMI return code
+ */
+static inline int rmi_gpt_info(unsigned long base, unsigned long top,
+			       unsigned long *out_top, unsigned long *state)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(SMC_RMI_GPT_INFO, base, top, &res);
+
+	if (res.a0 == RMI_SUCCESS) {
+		if (out_top)
+			*out_top = res.a1;
+		if (state)
+			*state = res.a2;
+	}
+
+	return res.a0;
+}
+
+/**
  * rmi_gpt_l1_create() - Create a Level 1 GPT
  * @addr: Base of physical address region described by the L1GPT
  * @sro: Preallocated SRO context to be used
