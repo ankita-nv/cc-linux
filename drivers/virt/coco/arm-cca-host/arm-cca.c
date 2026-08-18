@@ -603,6 +603,7 @@ static struct pci_tsm_ops cca_link_pci_ops = {
 	.remove = cca_tsm_pci_remove,
 	.connect = cca_tsm_connect,
 	.disconnect = cca_tsm_disconnect,
+	.vsmmu_event = cca_vsmmu_event_handle,
 };
 
 static void cca_viommu_provider_release(void *data)

@@ -254,8 +254,10 @@ static int cca_vdevice_init(struct iommufd_vdevice *vdev)
 				cca_psmmu_destroy_l2(psmmu, params.l2_sid, dev);
 			}
 		}
-		if (!ret)
+		if (!ret) {
+			pci_tsm_context_set_data(context, host_tdi);
 			pci_tsm_context_mark_bound(context);
+		}
 	}
 	if (ret)
 		goto out_put_context;

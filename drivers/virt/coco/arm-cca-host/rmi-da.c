@@ -1301,6 +1301,49 @@ int cca_pdev_refresh_stream_key(struct pci_dev *pdev1,
 	return 0;
 }
 
+int cca_vsmmu_event_handle(struct pci_tsm_context *context, phys_addr_t psmmu)
+{
+	struct cca_host_tdi *host_tdi = pci_tsm_context_data(context);
+	struct pci_dev *dsm_dev = pci_tsm_context_dsm_dev(context);
+	struct cca_host_pdev_dsc *pdev_dsc;
+	struct rmi_vsmmu_event_result event;
+	phys_addr_t pdev, rd, vdev, vsmmu;
+	unsigned long ret;
+	int inject_ret;
+
+	if (!host_tdi || !host_tdi->realm || !host_tdi->vsmmu ||
+	    !host_tdi->rmm_vdev)
+		return -ENODEV;
+
+	pdev_dsc = to_cca_pdev_dsc(dsm_dev);
+	if (!pdev_dsc || !pdev_dsc->rmm_pdev)
+		return -ENODEV;
+
+	rd = virt_to_phys(host_tdi->realm->rd);
+	vsmmu = kvm_realm_vsmmu_phys(host_tdi->vsmmu);
+	pdev = virt_to_phys(pdev_dsc->rmm_pdev);
+	vdev = virt_to_phys(host_tdi->rmm_vdev);
+	ret = rmi_vsmmu_event_handle(psmmu, rd, vsmmu, pdev, vdev, &event);
+	if (ret)
+		return -EIO;
+
+	if (event.flags & RMI_VSMMU_EVENT_FLAGS_ABORT) {
+		pci_err(dsm_dev,
+			"VSMMU event injection aborted at IPA %#llx, syndrome %#llx\n",
+			event.fipa, event.syndrome);
+		return -EFAULT;
+	}
+
+	if (event.flags & RMI_VSMMU_EVENT_FLAGS_IRQ) {
+		inject_ret = kvm_realm_inject_vsmmu_msi(
+			host_tdi->vsmmu, event.msi_addr, event.msi_data);
+		if (inject_ret < 0)
+			pci_err(dsm_dev, "failed to inject VSMMU MSI: %d\n",
+				inject_ret);
+	}
+
+	return 0;
+}
 
 int cca_pdev_purge_stream_key(struct pci_dev *pdev1,
 		struct pci_dev *pdev2, unsigned long stream_handle)
