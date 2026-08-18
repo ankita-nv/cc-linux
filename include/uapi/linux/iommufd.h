@@ -1129,9 +1129,12 @@ struct iommu_viommu_tegra241_cmdqv {
  * enum iommu_viommu_arm_realm_vsmmuv3_flags - Flags for ARM SMMUv3 Realm
  * @IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_VSMMU: Indicates whether the Realm has
  *                                             a guest-visible VSMMU instance
+ * @IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_MSI_DEVID_VALID: Indicates whether
+ *                                                       @msi_devid is valid
  */
 enum iommu_viommu_arm_realm_vsmmuv3_flags {
 	IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_VSMMU = 1 << 0,
+	IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_MSI_DEVID_VALID = 1 << 1,
 };
 
 /**
@@ -1142,6 +1145,9 @@ enum iommu_viommu_arm_realm_vsmmuv3_flags {
  * @reg_top: MMIO top address of the VSMMU in the guest VM
  * @aidr: AIDR register value of the VSMMU in the guest VM
  * @idr: IDR register values of the VSMMU in the guest VM
+ * @msi_devid: DeviceID used by the VSMMU's MSI interrupts when
+ *             IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_MSI_DEVID_VALID is set
+ * @__reserved: Must be 0
  */
 struct iommu_viommu_arm_realm_vsmmuv3 {
 	__aligned_u64 flags;
@@ -1149,6 +1155,8 @@ struct iommu_viommu_arm_realm_vsmmuv3 {
 	__aligned_le64 reg_top;
 	__aligned_le64 aidr;
 	__aligned_le64 idr[7];
+	__u32 msi_devid;
+	__u32 __reserved;
 };
 
 /**

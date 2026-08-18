@@ -402,10 +402,14 @@ int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
 		    struct iommu_domain *parent,
 		    const struct iommu_user_data *user_data)
 {
+	const u32 SUPPORTED_FLAGS =
+		IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_VSMMU |
+		IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_MSI_DEVID_VALID;
 	struct iommu_viommu_arm_realm_vsmmuv3 arg = {};
 	struct arm_smmu_realm_params params;
 	struct cca_viommu *cca = to_cca_viommu(viommu);
 	struct cca_psmmu *psmmu;
+	bool msi_devid_valid;
 	struct kvm *kvm;
 	int ret;
 
@@ -424,9 +428,22 @@ int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
 						  idr);
 		if (ret)
 			return ret;
+		if (arg.__reserved)
+			return -EOPNOTSUPP;
 	}
-	if (arg.flags & ~IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_VSMMU)
+
+	if (arg.flags & ~(u64)SUPPORTED_FLAGS)
 		return -EOPNOTSUPP;
+
+	msi_devid_valid = arg.flags &
+			  IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_MSI_DEVID_VALID;
+	if (msi_devid_valid) {
+		if (!(arg.flags & IOMMU_VIOMMU_ARM_REALM_SMMUV3_FLAGS_VSMMU))
+			return -EINVAL;
+		if (user_data->len < offsetofend(typeof(arg), msi_devid))
+			return -EINVAL;
+	}
+
 	kvm = viommu->kvm_file->private_data;
 	ret = kvm_realm_ensure_created(kvm);
 	if (ret)
@@ -472,7 +489,8 @@ int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
 			vparams->iidr = arg.idr[ARRAY_SIZE(vparams->idr)];
 
 			ret = kvm_realm_register_vsmmu(kvm, viommu->obj.id,
-						       vparams, 0, false);
+						       vparams, arg.msi_devid,
+						       msi_devid_valid);
 			free_page((unsigned long)vparams);
 		}
 		if (ret) {
