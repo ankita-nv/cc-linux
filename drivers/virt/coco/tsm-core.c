@@ -188,6 +188,15 @@ void tsm_unregister(struct tsm_dev *tsm_dev)
 }
 EXPORT_SYMBOL_GPL(tsm_unregister);
 
+int tsm_vsmmu_event_handle(struct device *dev, phys_addr_t psmmu)
+{
+	if (!dev_is_pci(dev))
+		return -EINVAL;
+
+	return pci_tsm_vsmmu_event_handle(to_pci_dev(dev), psmmu);
+}
+EXPORT_SYMBOL_GPL(tsm_vsmmu_event_handle);
+
 static DEFINE_XARRAY(tsm_ide_streams);
 static DEFINE_MUTEX(tsm_ide_streams_lock);
 

@@ -34,11 +34,14 @@ struct pci_tsm_ops {
 	 * @connect: establish / validate a secure connection (e.g. IDE)
 	 *	     with the device
 	 * @disconnect: teardown the secure link
+	 * @vsmmu_event: route a physical IOMMU event to the TVM VSMMU of a
+	 *		 bound context
 	 * Context: @probe, @remove, @connect, and @disconnect run under
 	 * pci_tsm_rwsem held for write to sync with TSM unregistration and
 	 * mutual exclusion of @connect and @disconnect. @connect and
 	 * @disconnect additionally run under the DSM lock (struct
 	 * pci_tsm_pf0::lock) as well as @probe and @remove of the subfunctions.
+	 * @vsmmu_event runs under pci_tsm_rwsem held for read and the DSM lock.
 	 * The core holds a runtime PM reference on the DSM for the connected
 	 * lifetime so the device cannot runtime-suspend into a state that
 	 * would invalidate IDE / TDISP security context.
@@ -49,6 +52,8 @@ struct pci_tsm_ops {
 		void (*remove)(struct pci_tsm *tsm);
 		int (*connect)(struct pci_dev *pdev);
 		void (*disconnect)(struct pci_dev *pdev);
+		int (*vsmmu_event)(struct pci_tsm_context *context,
+				   phys_addr_t psmmu);
 	);
 
 	/*
@@ -261,6 +266,9 @@ bool pci_tsm_is_configured(struct pci_dev *pdev);
 struct pci_tsm_context *pci_tsm_context_get(struct pci_dev *pdev);
 void pci_tsm_context_put(struct pci_tsm_context *context);
 void pci_tsm_context_mark_bound(struct pci_tsm_context *context);
+void pci_tsm_context_set_data(struct pci_tsm_context *context, void *data);
+void *pci_tsm_context_data(struct pci_tsm_context *context);
+int pci_tsm_vsmmu_event_handle(struct pci_dev *pdev, phys_addr_t psmmu);
 struct tsm_dev *pci_tsm_context_tsm_dev(struct pci_tsm_context *context);
 struct pci_tsm_pf0 *pci_tsm_context_pf0(struct pci_tsm_context *context);
 struct pci_dev *pci_tsm_context_dsm_dev(struct pci_tsm_context *context);
@@ -309,6 +317,22 @@ static inline void pci_tsm_reset_done(struct pci_dev *pdev)
 
 static inline void pci_tsm_context_mark_bound(struct pci_tsm_context *context)
 {
+}
+
+static inline void pci_tsm_context_set_data(struct pci_tsm_context *context,
+					    void *data)
+{
+}
+
+static inline void *pci_tsm_context_data(struct pci_tsm_context *context)
+{
+	return NULL;
+}
+
+static inline int pci_tsm_vsmmu_event_handle(struct pci_dev *pdev,
+					     phys_addr_t psmmu)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline struct tsm_dev *

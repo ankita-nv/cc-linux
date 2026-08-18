@@ -143,6 +143,15 @@ int tsm_ide_stream_register(struct pci_ide *ide);
 void tsm_ide_stream_unregister(struct pci_ide *ide);
 
 #ifdef CONFIG_TSM
+int tsm_vsmmu_event_handle(struct device *dev, phys_addr_t psmmu);
+#else
+static inline int tsm_vsmmu_event_handle(struct device *dev, phys_addr_t psmmu)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+#ifdef CONFIG_TSM
 /**
  * struct tsm_guest_req_info - parameters for a guest-initiated TSM request
  * @op: operation for the guest-initiated request

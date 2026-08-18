@@ -343,6 +343,7 @@ struct pci_tsm_context {
 	struct pci_dev *dsm_dev;
 	struct tsm_dev *tsm_dev;
 	struct list_head bound_node;
+	void *data;
 };
 
 struct pci_tsm_context *pci_tsm_context_get(struct pci_dev *pdev)
@@ -411,6 +412,61 @@ void pci_tsm_context_mark_bound(struct pci_tsm_context *context)
 	list_add_tail(&context->bound_node, &context->pf0->bound_contexts);
 }
 EXPORT_SYMBOL_GPL(pci_tsm_context_mark_bound);
+
+/**
+ * pci_tsm_context_set_data() - Attach provider state to a context
+ * @context: context acquired for the PCI function
+ * @data: provider-private pointer handed back to context-based ops
+ *
+ * Context: Caller holds the context's pci_tsm_pf0::lock, before
+ * pci_tsm_context_mark_bound().
+ */
+void pci_tsm_context_set_data(struct pci_tsm_context *context, void *data)
+{
+	lockdep_assert_held(&context->pf0->lock);
+	context->data = data;
+}
+EXPORT_SYMBOL_GPL(pci_tsm_context_set_data);
+
+void *pci_tsm_context_data(struct pci_tsm_context *context)
+{
+	return context->data;
+}
+EXPORT_SYMBOL_GPL(pci_tsm_context_data);
+
+/**
+ * pci_tsm_vsmmu_event_handle() - Route a physical IOMMU event to a bound TVM
+ * @pdev: function the event's StreamID resolved to
+ * @psmmu: physical address of the SMMU that reported the event
+ *
+ * Return: 0 if the provider consumed the event, else -errno.
+ */
+int pci_tsm_vsmmu_event_handle(struct pci_dev *pdev, phys_addr_t psmmu)
+{
+	const struct pci_tsm_ops *ops;
+	struct pci_tsm_context *context;
+	struct pci_tsm_pf0 *pf0;
+
+	guard(rwsem_read)(&pci_tsm_rwsem);
+	if (!pdev->tsm || !is_link_tsm(pdev->tsm->tsm_dev))
+		return -ENODEV;
+
+	ops = to_pci_tsm_ops(pdev->tsm);
+	if (!ops->vsmmu_event)
+		return -EOPNOTSUPP;
+
+	pf0 = to_pci_tsm_pf0(pdev->tsm);
+	if (!pf0)
+		return -ENODEV;
+
+	guard(mutex)(&pf0->lock);
+	list_for_each_entry(context, &pf0->bound_contexts, bound_node)
+		if (context->pdev == pdev)
+			return ops->vsmmu_event(context, psmmu);
+
+	return -ENODEV;
+}
+EXPORT_SYMBOL_GPL(pci_tsm_vsmmu_event_handle);
 
 struct tsm_dev *pci_tsm_context_tsm_dev(struct pci_tsm_context *context)
 {
