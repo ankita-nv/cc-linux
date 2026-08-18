@@ -3659,7 +3659,8 @@ static void realm_vsmmu_release(struct kref *kref)
  * independent of the realm PSMMU.
  */
 int kvm_realm_register_vsmmu(struct kvm *kvm, u32 vsmmu_id,
-			     struct rmi_vsmmu_params *params)
+			     struct rmi_vsmmu_params *params, u32 msi_devid,
+			     bool msi_devid_valid)
 {
 	struct realm *realm = &kvm->arch.realm;
 	phys_addr_t rd_phys = virt_to_phys(realm->rd);
@@ -3682,6 +3683,8 @@ int kvm_realm_register_vsmmu(struct kvm *kvm, u32 vsmmu_id,
 	kref_init(&vsmmu->kref);
 	kvm_get_kvm(kvm);
 	vsmmu->kvm = kvm;
+	vsmmu->msi_devid = msi_devid;
+	vsmmu->msi_devid_valid = msi_devid_valid;
 
 	vsmmu_phys = alloc_delegated_granule(realm, realm->sro, GFP_KERNEL);
 	if (vsmmu_phys == PHYS_ADDR_MAX) {
@@ -3796,12 +3799,50 @@ struct realm_vsmmu *kvm_realm_get_vsmmu(struct kvm *kvm, u32 vsmmu_id)
 }
 EXPORT_SYMBOL_GPL(kvm_realm_get_vsmmu);
 
+struct realm_vsmmu *kvm_realm_get_vsmmu_by_base(struct kvm *kvm,
+						unsigned long reg_base)
+{
+	struct xarray *xa = &kvm->arch.realm.vsmmus;
+	struct realm_vsmmu *vsmmu;
+	unsigned long index;
+
+	xa_lock(xa);
+	xa_for_each(xa, index, vsmmu) {
+		if (vsmmu->params->reg_base != reg_base)
+			continue;
+		kref_get(&vsmmu->kref);
+		xa_unlock(xa);
+		return vsmmu;
+	}
+	xa_unlock(xa);
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(kvm_realm_get_vsmmu_by_base);
+
 void kvm_realm_put_vsmmu(struct realm_vsmmu *vsmmu)
 {
 	if (vsmmu)
 		kref_put(&vsmmu->kref, realm_vsmmu_release);
 }
 EXPORT_SYMBOL_GPL(kvm_realm_put_vsmmu);
+
+int kvm_realm_inject_vsmmu_msi(struct realm_vsmmu *vsmmu, u64 addr,
+			       u32 data)
+{
+	struct kvm_msi msi = {
+		.address_lo = lower_32_bits(addr),
+		.address_hi = upper_32_bits(addr),
+		.data = data,
+		.flags = KVM_MSI_VALID_DEVID,
+		.devid = vsmmu->msi_devid,
+	};
+
+	if (!vsmmu->msi_devid_valid)
+		return -EOPNOTSUPP;
+
+	return kvm_send_userspace_msi(vsmmu->kvm, &msi);
+}
+EXPORT_SYMBOL_GPL(kvm_realm_inject_vsmmu_msi);
 
 static int kvm_complete_vdev_map_validate(struct kvm_vcpu *vcpu)
 {

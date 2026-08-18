@@ -470,7 +470,7 @@ int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
 			vparams->iidr = arg.idr[ARRAY_SIZE(vparams->idr)];
 
 			ret = kvm_realm_register_vsmmu(kvm, viommu->obj.id,
-						       vparams);
+						       vparams, 0, false);
 			free_page((unsigned long)vparams);
 		}
 		if (ret) {

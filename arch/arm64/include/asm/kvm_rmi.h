@@ -98,12 +98,16 @@ struct realm {
  * @params: kept rmi_vsmmu_params page handed to RMI_VSMMU_CREATE
  * @kref: lifetime; alloc holds one ref, each bound vdev holds one
  * @kvm: owning realm (holds a kvm_get_kvm() reference)
+ * @msi_devid: DeviceID used to inject the VSMMU's virtual MSIs
+ * @msi_devid_valid: Whether @msi_devid contains a valid DeviceID
  */
 struct realm_vsmmu {
 	void *vsmmu_page;
 	struct rmi_vsmmu_params *params;
 	struct kref kref;
 	struct kvm *kvm;
+	u32 msi_devid;
+	bool msi_devid_valid;
 };
 
 /**
@@ -210,10 +214,15 @@ int realm_dev_mem_unmap(struct kvm *kvm, unsigned long vdev_phys);
 void realm_destroy_dpt_l1(struct kvm *kvm, phys_addr_t base);
 
 int kvm_realm_register_vsmmu(struct kvm *kvm, u32 vsmmu_id,
-			     struct rmi_vsmmu_params *params);
+			     struct rmi_vsmmu_params *params, u32 msi_devid,
+			     bool msi_devid_valid);
 void kvm_realm_unregister_vsmmu(struct kvm *kvm, u32 vsmmu_id);
 struct realm_vsmmu *kvm_realm_get_vsmmu(struct kvm *kvm, u32 vsmmu_id);
+struct realm_vsmmu *kvm_realm_get_vsmmu_by_base(struct kvm *kvm,
+						unsigned long reg_base);
 void kvm_realm_put_vsmmu(struct realm_vsmmu *vsmmu);
+int kvm_realm_inject_vsmmu_msi(struct realm_vsmmu *vsmmu, u64 addr,
+			       u32 data);
 
 /*
  * Identifier handed to RMI_VDEV_CREATE (rmi_vdev_params.vsmmu_addr) to wire a
