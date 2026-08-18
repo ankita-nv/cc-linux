@@ -7,6 +7,7 @@
 #include <linux/arm-smmu-v3.h>
 #include <linux/interrupt.h>
 #include <linux/msi.h>
+#include <linux/tsm.h>
 
 #include <asm/rmi_cmds.h>
 
@@ -30,12 +31,46 @@
 #define	RMI_PSMMU_IRQ_PRIQ	2
 #define	RMI_PSMMU_IRQ_CMDQ	3
 
+/*
+ * Return true if RMM did not consume the physical event and the caller must
+ * discard it explicitly.
+ */
+static bool arm_smmu_realm_handle_vsmmu_event(
+	struct arm_smmu_device *smmu, unsigned long event_irq,
+	const struct rmi_psmmu_event_details *event)
+{
+	struct device *master_dev = NULL;
+	struct arm_smmu_master *master;
+	int ret;
+
+	/* PRI support is added separately. */
+	if (event_irq != RMI_PSMMU_IRQ_EVENTQ)
+		return true;
+
+	mutex_lock(&smmu->streams_mutex);
+	master = arm_smmu_find_master(smmu, event->stream_id);
+	if (master)
+		master_dev = get_device(master->dev);
+	mutex_unlock(&smmu->streams_mutex);
+
+	if (!master_dev)
+		return true;
+
+	ret = tsm_vsmmu_event_handle(master_dev, smmu->base_phys);
+	if (ret)
+		dev_warn_ratelimited(smmu->dev, "VSMMU route failed: %d\n", ret);
+	put_device(master_dev);
+
+	return ret != 0;
+}
+
 static irqreturn_t arm_smmu_realm_notify_thread(int irq, void *dev)
 {
 	int rmi_psmmu_event;
 	unsigned long notify_flags, psmmu_irq;
 	struct arm_smmu_device *smmu = dev;
 	struct rmi_psmmu_event_details event;
+	bool consume;
 
 	if (irq == smmu->realm.evtq_irq) {
 		notify_flags =  RMI_PSMMU_IRQ_PEND_EVENTQ;
@@ -62,10 +97,11 @@ static irqreturn_t arm_smmu_realm_notify_thread(int irq, void *dev)
 				  RMI_PSMMU_IRQ_EVENT_SHIFT;
 		switch (rmi_psmmu_event) {
 		case RMI_PSMMU_IRQ_EVENT_NONE:
+			consume = false;
 			break;
 		case RMI_PSMMU_IRQ_EVENT_ERROR:
 			dev_warn(smmu->dev, "SMMU Error reported\n");
-			rmi_psmmu_event_consume(smmu->base_phys, psmmu_irq);
+			consume = true;
 			break;
 		case RMI_PSMMU_IRQ_EVENT_PSMMU:
 			dev_warn(smmu->dev,
@@ -73,15 +109,20 @@ static irqreturn_t arm_smmu_realm_notify_thread(int irq, void *dev)
 				 "fetch_addr 0x%llx input_addr 0x%llx) reported\n",
 				 event.event_num, event.syndrome,
 				 event.fetch_addr, event.input_addr);
-			rmi_psmmu_event_consume(smmu->base_phys, psmmu_irq);
+			consume = true;
 			break;
 		case RMI_PSMMU_IRQ_EVENT_VSMMU:
-			dev_warn(smmu->dev, "Wrong VSMMU event on stream 0x%llx, ignoring\n",
-				 event.stream_id);
-			rmi_psmmu_event_consume(smmu->base_phys, psmmu_irq);
+			consume = arm_smmu_realm_handle_vsmmu_event(
+				smmu, psmmu_irq, &event);
 			break;
 		}
 
+		if (consume &&
+		    rmi_psmmu_event_consume(smmu->base_phys, psmmu_irq)) {
+			dev_warn(smmu->dev,
+				 "failed to consume an RMM SMMU event\n");
+			return IRQ_HANDLED;
+		}
 	} while (event.flags & RMI_PSMMU_IRQ_EVENT_PENDING);
 
 	return IRQ_HANDLED;

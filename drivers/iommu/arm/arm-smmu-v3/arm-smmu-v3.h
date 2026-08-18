@@ -1051,6 +1051,9 @@ struct arm_smmu_master {
 	u8				pmg;
 };
 
+struct arm_smmu_master *arm_smmu_find_master(struct arm_smmu_device *smmu,
+					     u32 sid);
+
 /* SMMU private data for an IOMMU domain */
 enum arm_smmu_domain_stage {
 	ARM_SMMU_DOMAIN_S1 = 0,
