@@ -3064,8 +3064,11 @@ static long rmi_rtt_dev_validate(unsigned long rd_phys, unsigned long rec_phys,
 
 /*
  * The device range is delegated up front, then mapped with the largest
- * block size the IPA/PA alignment allows. A block which the RMM refuses at
- * that level is retried one level down.
+ * block size the IPA/PA alignment allows, down to L1 (1GiB) blocks. A block
+ * which the RMM refuses at that level is retried one level down. Whether an
+ * L1 block is reached is additionally bounded by realm_dev_map_chunk_size
+ * (the run is aligned down to it), so lowering that parameter below 1GiB
+ * caps device mappings at 2MiB without any code change.
  */
 static int __realm_dev_mem_map(struct kvm *kvm, struct rmi_sro_state *sro,
 		unsigned long pdev_phys, unsigned long vdev_phys,
@@ -3199,8 +3202,43 @@ void realm_destroy_dpt_l1(struct kvm *kvm, phys_addr_t base)
 }
 EXPORT_SYMBOL_GPL(realm_destroy_dpt_l1);
 
-/* IPA span mapped per mmu_lock hold, between cond_resched() points. */
-#define REALM_DEV_CHUNK_SIZE		SZ_1G
+/*
+ * IPA span processed per device-map iteration. It bounds the mmu_lock hold
+ * time between cond_resched() points, and because each run is aligned down to
+ * this size it also bounds the largest block the mapper can pick: a value
+ * >= SZ_1G lets 1GiB (PUD) device blocks form, while a smaller value throttles
+ * harder and effectively caps device mappings at that size (e.g. SZ_2M
+ * restores 2MiB-only device mappings). Must be a power of two and at least
+ * SZ_2M. Runtime changes affect subsequent mapping iterations.
+ */
+static unsigned long realm_dev_map_chunk_size = SZ_1G;
+
+static int realm_dev_map_chunk_size_set(const char *val,
+					const struct kernel_param *kp)
+{
+	unsigned long size;
+	int ret;
+
+	ret = kstrtoul(val, 0, &size);
+	if (ret)
+		return ret;
+
+	/* Power of two so ALIGN_DOWN() is valid; >= SZ_2M so a block still fits. */
+	if (size < SZ_2M || (size & (size - 1)))
+		return -EINVAL;
+
+	*(unsigned long *)kp->arg = size;
+	return 0;
+}
+
+static const struct kernel_param_ops realm_dev_map_chunk_size_ops = {
+	.set = realm_dev_map_chunk_size_set,
+	.get = param_get_ulong,
+};
+module_param_cb(realm_dev_map_chunk_size, &realm_dev_map_chunk_size_ops,
+		&realm_dev_map_chunk_size, 0644);
+MODULE_PARM_DESC(realm_dev_map_chunk_size,
+		 "Device-mapping throttle window in bytes (power of two, >= 2MiB); >= 1GiB enables 1GiB device blocks");
 
 /* Per-run budget for mmu-notifier invalidation retries; then -EAGAIN. */
 #define REALM_DEV_MAP_MAX_RETRIES	16
@@ -3325,6 +3363,7 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 		phys_addr_t chunk_phys = start_pa + (start_ipa - base_ipa);
 		unsigned long mmu_seq;
 		unsigned long chunk_end;
+		unsigned long chunk;
 
 		mapping = kmalloc_obj(*mapping);
 		if (!mapping) {
@@ -3345,13 +3384,13 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 		smp_rmb();
 
 		/*
-		 * Throttle mappings to at most CHUNK bytes. The top is always
-		 * aligned to the next CHUNK boundary to keep block mapping
-		 * optimizations functional.
+		 * Throttle mappings to at most @realm_dev_map_chunk_size bytes.
+		 * The top is always aligned to the next chunk boundary to keep
+		 * block mapping optimizations functional.
 		 */
+		chunk = READ_ONCE(realm_dev_map_chunk_size);
 		chunk_end = min(end_ipa,
-				ALIGN_DOWN(start_ipa, REALM_DEV_CHUNK_SIZE) +
-				REALM_DEV_CHUNK_SIZE);
+				ALIGN_DOWN(start_ipa, chunk) + chunk);
 
 		ret = realm_dev_verify_run(kvm, start_ipa, chunk_end, chunk_phys);
 		if (ret) {
