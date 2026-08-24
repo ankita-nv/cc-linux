@@ -833,7 +833,7 @@ retry:
 	}
 
 	if (!folio_test_uptodate(folio)) {
-		folio_zero_user(folio, vmf->address);
+		folio_zero_range(folio, 0, folio_size(folio));
 		folio_mark_uptodate(folio);
 	}
 
@@ -1753,7 +1753,7 @@ static struct folio *__kvm_gmem_get_pfn(struct file *file,
 	}
 
 	if (!folio_test_uptodate(folio)) {
-		folio_zero_user(folio, 0);
+		folio_zero_range(folio, 0, folio_size(folio));
 		folio_mark_uptodate(folio);
 	}
 
