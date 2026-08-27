@@ -319,12 +319,11 @@ static inline unsigned long rsi_arch_dev_activate(phys_addr_t base,
 }
 
 static inline unsigned long rsi_vdev_get_info(unsigned long vdev_id,
-					      unsigned long digest_phys)
+					      phys_addr_t info)
 {
 	struct arm_smccc_res res;
 
-	arm_smccc_1_1_invoke(SMC_RSI_VDEV_GET_INFO,
-			     vdev_id, digest_phys, &res);
+	arm_smccc_1_1_invoke(SMC_RSI_VDEV_GET_INFO, vdev_id, info, &res);
 
 	return res.a0;
 }

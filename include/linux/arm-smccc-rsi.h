@@ -7,6 +7,7 @@
 #define __LINUX_ARM_SMCCC_RSI_H_
 
 #include <linux/arm-smccc.h>
+#include <linux/bits.h>
 
 #define RSI_DEV_NAME "arm-rsi-dev"
 
@@ -245,7 +246,8 @@ struct rsi_vdevice_info {
 		};
 		u8 padding5[0x200 - 0x1c0];
 	};
-};
+} __aligned(0x200);
+
 static_assert(offsetof(struct rsi_vdevice_info, id_index) == 0x08);
 static_assert(offsetof(struct rsi_vdevice_info, hash_algo) == 0x10);
 static_assert(offsetof(struct rsi_vdevice_info, lock_seq) == 0x18);
@@ -306,4 +308,15 @@ struct rsi_host_call {
  * ret0 == Status / error
  */
 #define SMC_RSI_ARCH_DEV_ACTIVATE		SMC_RSI_FID(0x19B)
+
+#define RSI_VDEV_FLAGS_VSMMU			BIT(0)
+#define RSI_VDEV_FLAGS_PROTOCOL_DATA_SET	BIT(1)
+#define RSI_VDEV_FLAGS_PLATFORM_NONCE		BIT(2)
+
+/* State of a VDEV, only RSI_VDEV_STARTED issues T=1 traffic */
+#define RSI_VDEV_UNLOCKED	UL(0)
+#define RSI_VDEV_LOCKED		UL(1)
+#define RSI_VDEV_STARTED	UL(2)
+#define RSI_VDEV_ERROR		UL(3)
+
 #endif /* __LINUX_ARM_SMCCC_RSI_H_ */
