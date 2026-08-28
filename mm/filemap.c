@@ -176,8 +176,8 @@ static void filemap_unaccount_folio(struct address_space *mapping,
 		}
 	}
 
-	/* hugetlb folios do not participate in page cache accounting. */
-	if (folio_test_hugetlb(folio))
+	/* Some mappings, including restructured HugeTLB, are never accounted. */
+	if (folio_test_hugetlb(folio) || mapping_no_file_account(mapping))
 		return;
 
 	nr = folio_nr_pages(folio);
@@ -830,10 +830,10 @@ void replace_page_cache_folio(struct folio *old, struct folio *new)
 	xas_store(&xas, new);
 
 	old->mapping = NULL;
-	/* hugetlb pages do not participate in page cache accounting. */
-	if (!folio_test_hugetlb(old))
+	/* hugetlb and explicitly unaccounted mappings skip file accounting. */
+	if (!folio_test_hugetlb(old) && !mapping_no_file_account(mapping))
 		lruvec_stat_sub_folio(old, NR_FILE_PAGES);
-	if (!folio_test_hugetlb(new))
+	if (!folio_test_hugetlb(new) && !mapping_no_file_account(mapping))
 		lruvec_stat_add_folio(new, NR_FILE_PAGES);
 	if (folio_test_swapbacked(old))
 		lruvec_stat_sub_folio(old, NR_SHMEM);
@@ -861,7 +861,7 @@ noinline int __filemap_add_folio(struct address_space *mapping,
 	mapping_set_update(&xas, mapping);
 
 	VM_BUG_ON_FOLIO(index & (folio_nr_pages(folio) - 1), folio);
-	huge = folio_test_hugetlb(folio);
+	huge = folio_test_hugetlb(folio) || mapping_no_file_account(mapping);
 	nr = folio_nr_pages(folio);
 
 	gfp &= GFP_RECLAIM_MASK;
