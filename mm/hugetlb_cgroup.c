@@ -305,7 +305,14 @@ int hugetlb_cgroup_charge_cgroup_rsvd(int idx, unsigned long nr_pages,
 int hugetlb_cgroup_charge_cgroup_rsvd_for_order(u8 page_order,
 		unsigned long nr_pages, struct hugetlb_cgroup **ptr)
 {
-	int idx = hstate_index(hugetlb_order_to_hstate(page_order));
+	struct hstate *h = hugetlb_order_to_hstate(page_order);
+	int idx;
+
+	*ptr = NULL;
+	if (!h)
+		return -EINVAL;
+
+	idx = hstate_index(h);
 
 	return hugetlb_cgroup_charge_cgroup_rsvd(idx, nr_pages, ptr);
 }
@@ -424,7 +431,13 @@ void hugetlb_cgroup_uncharge_cgroup_rsvd(int idx, unsigned long nr_pages,
 void hugetlb_cgroup_uncharge_cgroup_rsvd_for_order(u8 page_order,
 		unsigned long nr_pages, struct hugetlb_cgroup *h_cg)
 {
-	int idx = hstate_index(hugetlb_order_to_hstate(page_order));
+	struct hstate *h = hugetlb_order_to_hstate(page_order);
+	int idx;
+
+	if (WARN_ON_ONCE(!h))
+		return;
+
+	idx = hstate_index(h);
 
 	hugetlb_cgroup_uncharge_cgroup_rsvd(idx, nr_pages, h_cg);
 }

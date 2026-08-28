@@ -224,6 +224,7 @@ static inline int hugetlb_cgroup_charge_cgroup_rsvd(int idx,
 static inline int hugetlb_cgroup_charge_cgroup_rsvd_for_order(u8 page_order,
 		unsigned long nr_pages, struct hugetlb_cgroup **ptr)
 {
+	*ptr = NULL;
 	return 0;
 }
 
