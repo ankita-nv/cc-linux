@@ -1920,7 +1920,7 @@ void *xa_store_order(struct xarray *xa, unsigned long index,
 		xas_unlock(&xas);
 	} while (xas_nomem(&xas, gfp));
 
-	return curr;
+	return xas_result(&xas, curr);
 }
 EXPORT_SYMBOL(xa_store_order);
 
