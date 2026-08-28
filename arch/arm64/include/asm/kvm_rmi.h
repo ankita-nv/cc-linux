@@ -137,6 +137,10 @@ void kvm_realm_unmap_range(struct kvm *kvm,
 			   unsigned long size,
 			   bool unmap_private,
 			   bool may_block);
+int kvm_realm_prepare_unmap_range(struct kvm *kvm,
+				  unsigned long ipa,
+				  unsigned long size,
+				  bool unmap_private);
 int realm_map_protected(struct kvm *kvm,
 			unsigned long base_ipa,
 			kvm_pfn_t pfn,

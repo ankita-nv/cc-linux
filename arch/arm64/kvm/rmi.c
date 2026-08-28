@@ -16,6 +16,9 @@
 
 #define RMM_RTT_MAX_LEVEL	KVM_PGTABLE_LAST_LEVEL
 
+/* Two RTT levels at each end of both the protected and shared IPA ranges. */
+#define REALM_UNMAP_RTT_RESERVE	(2 * 2 * (KVM_PGTABLE_LAST_LEVEL - 1))
+
 /*
  * Track every granule the host delegates to the RMM in a global region tree and
  * report the amount currently owned by the RMM when a Realm shuts down. This
@@ -809,10 +812,11 @@ int kvm_realm_teardown_stage2(struct kvm *kvm)
 	return realm_destroy_rtts(kvm);
 }
 
-static void realm_unmap_shared_range(struct kvm *kvm,
-				     unsigned long start,
-				     unsigned long end,
-				     bool may_block)
+static int realm_unmap_shared_range(struct kvm *kvm,
+				    unsigned long start,
+				    unsigned long end,
+				    bool may_block,
+				    struct rmi_sro_state *sro)
 {
 	struct realm *realm = &kvm->arch.realm;
 	unsigned long rd = virt_to_phys(realm->rd);
@@ -822,7 +826,7 @@ static void realm_unmap_shared_range(struct kvm *kvm,
 	lockdep_assert_held_write(&kvm->mmu_lock);
 
 	if (start >= end)
-		return;
+		return 0;
 
 	/*
 	 * Convert the private IPA interval to its shared alias. Use addition
@@ -847,12 +851,12 @@ retry:
 			phys_addr_t range_addr;
 
 			if (WARN_ON(next_addr <= addr || next_addr > end))
-				return;
+				return -EPROTO;
 			ret = rmi_addr_range_desc_decode(
 				out_range, RMI_OP_MEM_UNDELEGATED,
 				&range_addr, &range_size);
 			if (WARN_ON_ONCE(ret))
-				return;
+				return ret;
 			if (range_size) {
 				realm_region_untrack(realm, range_addr, range_size);
 				realm_fold_rtt_level(kvm, RMM_RTT_MAX_LEVEL,
@@ -865,7 +869,7 @@ retry:
 			int err_level = RMI_RETURN_INDEX(ret);
 
 			if (WARN_ON(err_level > KVM_PGTABLE_LAST_LEVEL))
-				return;
+				return -EPROTO;
 
 			map_size = rmi_rtt_level_mapsize(err_level);
 			if (err_level == KVM_PGTABLE_LAST_LEVEL ||
@@ -879,25 +883,21 @@ retry:
 			ret = realm_create_rtt_levels(realm,
 						      addr, err_level,
 						      err_level + 1,
-						      NULL);
-			if (ret) {
-				WARN_ONCE(1,
-					  "RMI: RTT split failed unmapping %#lx: %d\n",
-					  addr, ret);
-				realm->stage2_unmap_failed = true;
-				return;
-			}
+						      sro);
+			if (ret)
+				return ret;
 			goto retry;
 		}
 		default:
 			WARN_ON(1);
-			realm->stage2_unmap_failed = true;
-			return;
+			return ret < 0 ? ret : -ENXIO;
 		}
 
 		if (may_block)
 			cond_resched_rwlock_write(&kvm->mmu_lock);
 	}
+
+	return 0;
 }
 
 static int realm_init_sve_param(struct kvm *kvm, struct realm_params *params)
@@ -1025,10 +1025,11 @@ out_undelegate_tables:
 	return r;
 }
 
-static void realm_unmap_private_range_single(struct kvm *kvm,
-					     unsigned long start,
-					     unsigned long end,
-					     bool may_block)
+static int realm_unmap_private_range_single(struct kvm *kvm,
+					    unsigned long start,
+					    unsigned long end,
+					    bool may_block,
+					    struct rmi_sro_state *sro)
 {
 	struct realm *realm = &kvm->arch.realm;
 	unsigned long rd = virt_to_phys(realm->rd);
@@ -1048,7 +1049,7 @@ retry:
 		switch (RMI_RETURN_STATUS(ret)) {
 		case RMI_SUCCESS:
 			if (WARN_ON(next_addr <= addr || next_addr > end))
-				return;
+				return -EPROTO;
 			if (RMI_ADDR_RANGE_COUNT(out_range))
 				realm_fold_rtt_level(kvm, RMM_RTT_MAX_LEVEL,
 						     addr, next_addr);
@@ -1058,7 +1059,7 @@ retry:
 			int err_level = RMI_RETURN_INDEX(ret);
 
 			if (WARN_ON(err_level > KVM_PGTABLE_LAST_LEVEL))
-				return;
+				return -EPROTO;
 
 			map_size = rmi_rtt_level_mapsize(err_level);
 			if (err_level == KVM_PGTABLE_LAST_LEVEL ||
@@ -1072,36 +1073,33 @@ retry:
 			ret = realm_create_rtt_levels(realm,
 						      addr, err_level,
 						      err_level + 1,
-						      NULL);
-			if (ret) {
-				WARN_ONCE(1,
-					  "RMI: RTT split failed unmapping %#lx: %d\n",
-					  addr, ret);
-				realm->stage2_unmap_failed = true;
-				return;
-			}
+						      sro);
+			if (ret)
+				return ret;
 			goto retry;
 		}
 		default:
 			WARN_ON(1);
-			realm->stage2_unmap_failed = true;
-			return;
+			return ret < 0 ? ret : -ENXIO;
 		}
 
 		ret = undelegate_range_desc(realm, out_range);
 		if (WARN_ONCE(ret, "RMI: descriptor undelegate failed: %d\n",
 			      ret))
-			break;
+			return ret < 0 ? ret : -ENXIO;
 
 		if (may_block)
 			cond_resched_rwlock_write(&kvm->mmu_lock);
 	}
+
+	return 0;
 }
 
-static void realm_unmap_private_range(struct kvm *kvm,
-				      unsigned long start,
-				      unsigned long end,
-				      bool may_block)
+static int realm_unmap_private_range(struct kvm *kvm,
+				     unsigned long start,
+				     unsigned long end,
+				     bool may_block,
+				     struct rmi_sro_state *sro)
 {
 	struct realm *realm = &kvm->arch.realm;
 	unsigned long rd = virt_to_phys(realm->rd);
@@ -1115,8 +1113,8 @@ static void realm_unmap_private_range(struct kvm *kvm,
 	 * users of the buffer.
 	 */
 	if (!realm->unmap_desc_buf) {
-		realm_unmap_private_range_single(kvm, start, end, may_block);
-		return;
+		return realm_unmap_private_range_single(kvm, start, end,
+							may_block, sro);
 	}
 
 	lockdep_assert_held_write(&kvm->mmu_lock);
@@ -1136,9 +1134,9 @@ retry:
 		switch (RMI_RETURN_STATUS(ret)) {
 		case RMI_SUCCESS:
 			if (WARN_ON(next_addr <= addr || next_addr > end))
-				return;
+				return -EPROTO;
 			if (WARN_ON(out_count > realm->unmap_desc_cap))
-				return;
+				return -EPROTO;
 			if (out_count)
 				realm_fold_rtt_level(kvm, RMM_RTT_MAX_LEVEL,
 						     addr, next_addr);
@@ -1148,7 +1146,7 @@ retry:
 			int err_level = RMI_RETURN_INDEX(ret);
 
 			if (WARN_ON(err_level > KVM_PGTABLE_LAST_LEVEL))
-				return;
+				return -EPROTO;
 
 			map_size = rmi_rtt_level_mapsize(err_level);
 			if (err_level == KVM_PGTABLE_LAST_LEVEL ||
@@ -1162,20 +1160,14 @@ retry:
 			ret = realm_create_rtt_levels(realm,
 						      addr, err_level,
 						      err_level + 1,
-						      NULL);
-			if (ret) {
-				WARN_ONCE(1,
-					  "RMI: RTT split failed unmapping %#lx: %d\n",
-					  addr, ret);
-				realm->stage2_unmap_failed = true;
-				return;
-			}
+						      sro);
+			if (ret)
+				return ret;
 			goto retry;
 		}
 		default:
 			WARN_ON(1);
-			realm->stage2_unmap_failed = true;
-			return;
+			return ret < 0 ? ret : -ENXIO;
 		}
 
 		ret = undelegate_range_descs(realm, realm->unmap_desc_buf,
@@ -1183,28 +1175,87 @@ retry:
 		if (WARN_ONCE(ret,
 			      "RMI: descriptor list undelegate failed: %d\n",
 			      ret))
-			break;
+			return ret < 0 ? ret : -ENXIO;
 
 		if (may_block)
 			cond_resched_rwlock_write(&kvm->mmu_lock);
 	}
+
+	return 0;
+}
+
+static int __kvm_realm_unmap_range(struct kvm *kvm, unsigned long start,
+				   unsigned long size, bool unmap_private,
+				   bool may_block,
+				   struct rmi_sro_state *sro)
+{
+	unsigned long end = start + size;
+	struct realm *realm = &kvm->arch.realm;
+	int ret;
+
+	if (!kvm_realm_is_created(kvm))
+		return 0;
+
+	end = min(BIT(realm->ia_bits - 1), end);
+
+	ret = realm_unmap_shared_range(kvm, start, end, may_block, sro);
+	if (ret || !unmap_private)
+		return ret;
+
+	return realm_unmap_private_range(kvm, start, end, may_block, sro);
 }
 
 void kvm_realm_unmap_range(struct kvm *kvm, unsigned long start,
 			   unsigned long size, bool unmap_private,
 			   bool may_block)
 {
-	unsigned long end = start + size;
 	struct realm *realm = &kvm->arch.realm;
+	int ret;
+
+	ret = __kvm_realm_unmap_range(kvm, start, size, unmap_private,
+				      may_block, NULL);
+	if (ret) {
+		WARN_ONCE(1, "RMI: stage-2 unmap failed at %#lx: %d\n",
+			  start, ret);
+		realm->stage2_unmap_failed = true;
+	}
+}
+
+int kvm_realm_prepare_unmap_range(struct kvm *kvm, unsigned long start,
+				  unsigned long size, bool unmap_private)
+{
+	struct rmi_sro_state *sro;
+	unsigned long min;
+	int ret;
 
 	if (!kvm_realm_is_created(kvm))
-		return;
+		return 0;
 
-	end = min(BIT(realm->ia_bits - 1), end);
+	sro = kzalloc_obj(*sro, GFP_KERNEL_ACCOUNT);
+	if (!sro)
+		return -ENOMEM;
 
-	realm_unmap_shared_range(kvm, start, end, may_block);
-	if (unmap_private)
-		realm_unmap_private_range(kvm, start, end, may_block);
+	/*
+	 * A partial L1 block needs an L2 and an L3 RTT at each boundary.
+	 * Reserve for both boundaries and both IPA aliases before taking
+	 * mmu_lock.  Grow one page at a time so fragmented memory does not turn
+	 * a readily satisfiable order-0 reservation into an order-3 failure.
+	 * Best-effort, as at the other topup sites: on failure the RTT
+	 * allocator falls back to the per-granule delegate path under the lock.
+	 */
+	for (min = 1; min <= REALM_UNMAP_RTT_RESERVE; min++) {
+		if (rmi_sro_topup(sro, min, min))
+			break;
+	}
+
+	write_lock(&kvm->mmu_lock);
+	ret = __kvm_realm_unmap_range(kvm, start, size, unmap_private, true,
+				      sro);
+	write_unlock(&kvm->mmu_lock);
+
+	rmi_sro_free(sro);
+	kfree(sro);
+	return ret;
 }
 
 static int realm_data_map_init(struct kvm *kvm, unsigned long ipa,
@@ -2265,8 +2316,14 @@ static int realm_set_ipa_state(struct kvm_vcpu *vcpu,
 	struct kvm *kvm = vcpu->kvm;
 	int ret = ripas_change(kvm, vcpu, start, end, RIPAS_SET, top_ipa);
 
-	if (ripas == RMI_EMPTY && *top_ipa != start)
-		realm_unmap_private_range(kvm, start, *top_ipa, false);
+	if (ripas == RMI_EMPTY && *top_ipa != start) {
+		int unmap_ret;
+
+		unmap_ret = realm_unmap_private_range(kvm, start, *top_ipa,
+						false, vcpu->arch.rec.sro);
+		if (!ret)
+			ret = unmap_ret;
+	}
 
 	return ret;
 }

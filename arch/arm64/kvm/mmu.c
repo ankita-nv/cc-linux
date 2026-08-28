@@ -1739,6 +1739,26 @@ struct kvm_s2_fault_desc {
 	unsigned long		hva;
 };
 
+static bool realm_range_has_attrs(struct kvm *kvm,
+				  struct kvm_memory_slot *slot,
+				  gfn_t start, gfn_t end,
+				  unsigned long attrs)
+{
+	/*
+	 * In-place conversion stores attributes in the guest_memfd.  Slots
+	 * without guest_memfd backing are always shared and continue to use the
+	 * per-VM attributes, which also preserves block mappings for ordinary
+	 * shared slots.
+	 */
+	if (gmem_in_place_conversion && kvm_slot_has_gmem(slot))
+		return kvm_gmem_range_has_memory_attributes(slot, start, end,
+						    attrs);
+
+	return kvm_range_has_vm_memory_attributes(kvm, start, end,
+						   KVM_MEMORY_ATTRIBUTE_PRIVATE,
+						   attrs);
+}
+
 /*
  * kvm_gmem_get_pfn() validates that the folio-aligned file range is contained
  * in the memslot's guest_memfd binding. Before installing a multi-page realm
@@ -1755,9 +1775,8 @@ struct kvm_s2_fault_desc {
  * ALIGN_DOWN(fault_ipa, size) cover GFNs outside the slot, or pair the wrong
  * aligned PFN with the aligned IPA.
  *
- * Because mem_attr_array stores entries only for explicitly-PRIVATE
- * GFNs, the all-shared probe (attrs=0) collapses to a single xa_find;
- * the all-private probe is bounded by the proposed huge mapping.
+ * Query the active attribute store: per-guest_memfd attributes for in-place
+ * conversion, or the per-VM attribute XArray otherwise.
  */
 static int realm_clamp_order(struct kvm *kvm, struct kvm_memory_slot *slot,
 			     gfn_t gfn, kvm_pfn_t pfn, int max_order,
@@ -1781,10 +1800,8 @@ static int realm_clamp_order(struct kvm *kvm, struct kvm_memory_slot *slot,
 		if (is_gfn_in_memslot(slot, map_start) &&
 		    is_gfn_in_memslot(slot, map_start + npages - 1) &&
 		    IS_ALIGNED(gfn ^ pfn, npages) &&
-		    kvm_range_has_vm_memory_attributes(kvm, map_start,
-						map_start + npages,
-						KVM_MEMORY_ATTRIBUTE_PRIVATE,
-						attrs))
+		    realm_range_has_attrs(kvm, slot, map_start,
+					  map_start + npages, attrs))
 			break;
 
 		max_order = max_order == PUD_ORDER ? PMD_ORDER : 0;
@@ -2335,10 +2352,8 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
 	if (realm_shared && (mapping_size > PAGE_SIZE)) {
 		unsigned long nr_pages = mapping_size >> PAGE_SHIFT;
 
-		if (!kvm_range_has_vm_memory_attributes(kvm, gfn,
-							gfn + nr_pages,
-							KVM_MEMORY_ATTRIBUTE_PRIVATE,
-							0)) {
+		if (!realm_range_has_attrs(kvm, s2fd->memslot, gfn,
+					   gfn + nr_pages, 0)) {
 			unsigned long hva_offset;
 			unsigned long ipa_offset;
 
@@ -3068,6 +3083,68 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
 }
 
 #ifdef CONFIG_KVM_VM_MEMORY_ATTRIBUTES
+static int realm_prepare_memory_conversion(struct kvm *kvm,
+					   struct kvm_gfn_range *range)
+{
+	bool unmap_private;
+
+	if (!IS_ENABLED(CONFIG_KVM_GUEST_MEMFD_HUGETLB) || !kvm_is_realm(kvm))
+		return 0;
+
+	unmap_private = range->attr_filter & KVM_FILTER_PRIVATE;
+	return kvm_realm_prepare_unmap_range(kvm, range->start << PAGE_SHIFT,
+					     (range->end - range->start) << PAGE_SHIFT,
+					     unmap_private);
+}
+
+#ifdef CONFIG_HAVE_KVM_ARCH_GMEM_PREPARE_CONVERSION
+int kvm_arch_gmem_prepare_conversion(struct kvm *kvm,
+				     struct kvm_gfn_range *range)
+{
+	return realm_prepare_memory_conversion(kvm, range);
+}
+#endif
+
+#ifdef CONFIG_HAVE_KVM_ARCH_PREPARE_MEMORY_ATTRIBUTES
+int kvm_arch_prepare_memory_attributes(struct kvm *kvm, gfn_t start,
+				       gfn_t end, unsigned long attributes)
+{
+	struct kvm_memslot_iter iter;
+	struct kvm_memslots *slots;
+	struct kvm_gfn_range range = {
+		.arg.attributes = attributes,
+		.may_block = true,
+		.attr_filter = attributes & KVM_MEMORY_ATTRIBUTE_PRIVATE ?
+			       KVM_FILTER_SHARED : KVM_FILTER_PRIVATE,
+	};
+	int i, ret;
+
+	lockdep_assert_held(&kvm->slots_lock);
+
+	if (!IS_ENABLED(CONFIG_KVM_GUEST_MEMFD_HUGETLB) || !kvm_is_realm(kvm))
+		return 0;
+
+	for (i = 0; i < kvm_arch_nr_memslot_as_ids(kvm); i++) {
+		slots = __kvm_memslots(kvm, i);
+
+		kvm_for_each_memslot_in_gfn_range(&iter, slots, start, end) {
+			range.slot = iter.slot;
+			range.start = max(start, iter.slot->base_gfn);
+			range.end = min(end, iter.slot->base_gfn +
+					       iter.slot->npages);
+			if (range.start >= range.end)
+				continue;
+
+			ret = realm_prepare_memory_conversion(kvm, &range);
+			if (ret)
+				return ret;
+		}
+	}
+
+	return 0;
+}
+#endif
+
 bool kvm_arch_pre_set_vm_memory_attributes(struct kvm *kvm,
 					   struct kvm_gfn_range *range)
 {

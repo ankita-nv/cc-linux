@@ -2551,6 +2551,10 @@ bool kvm_arch_pre_set_vm_memory_attributes(struct kvm *kvm,
 					   struct kvm_gfn_range *range);
 bool kvm_arch_post_set_vm_memory_attributes(struct kvm *kvm,
 					    struct kvm_gfn_range *range);
+#ifdef CONFIG_HAVE_KVM_ARCH_PREPARE_MEMORY_ATTRIBUTES
+int kvm_arch_prepare_memory_attributes(struct kvm *kvm, gfn_t start,
+				       gfn_t end, unsigned long attributes);
+#endif
 
 static inline bool kvm_vm_mem_is_private(struct kvm *kvm, gfn_t gfn)
 {
@@ -2584,6 +2588,9 @@ static inline bool kvm_mem_is_private(struct kvm *kvm, gfn_t gfn)
 
 #ifdef CONFIG_KVM_GUEST_MEMFD
 bool kvm_gmem_is_private(struct kvm *kvm, gfn_t gfn);
+bool kvm_gmem_range_has_memory_attributes(struct kvm_memory_slot *slot,
+					  gfn_t start, gfn_t end,
+					  u64 attributes);
 bool kvm_arch_supports_gmem_init_shared(struct kvm *kvm);
 
 static inline u64 kvm_gmem_get_supported_flags(struct kvm *kvm)
@@ -2609,6 +2616,12 @@ static inline int kvm_gmem_get_pfn(struct kvm *kvm,
 {
 	KVM_BUG_ON(1, kvm);
 	return -EIO;
+}
+
+static inline bool kvm_gmem_range_has_memory_attributes(
+	struct kvm_memory_slot *slot, gfn_t start, gfn_t end, u64 attributes)
+{
+	return false;
 }
 #endif /* CONFIG_KVM_GUEST_MEMFD */
 
@@ -2654,6 +2667,11 @@ void kvm_arch_gmem_reclaim(kvm_pfn_t pfn, kvm_pfn_t nr_pages);
 
 #ifdef CONFIG_HAVE_KVM_ARCH_GMEM_INVALIDATE
 void kvm_arch_gmem_invalidate_range(struct kvm *kvm, struct kvm_gfn_range *range);
+#endif
+
+#ifdef CONFIG_HAVE_KVM_ARCH_GMEM_PREPARE_CONVERSION
+int kvm_arch_gmem_prepare_conversion(struct kvm *kvm,
+				     struct kvm_gfn_range *range);
 #endif
 
 #ifdef CONFIG_KVM_GENERIC_PRE_FAULT_MEMORY

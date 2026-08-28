@@ -2551,6 +2551,14 @@ static bool kvm_pre_set_vm_memory_attributes(struct kvm *kvm,
 	return kvm_arch_pre_set_vm_memory_attributes(kvm, range);
 }
 
+#ifdef CONFIG_HAVE_KVM_ARCH_PREPARE_MEMORY_ATTRIBUTES
+static bool kvm_cancel_set_vm_memory_attributes(struct kvm *kvm,
+						struct kvm_gfn_range *range)
+{
+	return false;
+}
+#endif
+
 /* Set @attributes for the gfn range [@start, @end). */
 static int kvm_set_vm_mem_attributes(struct kvm *kvm, gfn_t start, gfn_t end,
 				     unsigned long attributes)
@@ -2572,6 +2580,15 @@ static int kvm_set_vm_mem_attributes(struct kvm *kvm, gfn_t start, gfn_t end,
 		.on_lock = kvm_mmu_invalidate_end,
 		.may_block = true,
 	};
+#ifdef CONFIG_HAVE_KVM_ARCH_PREPARE_MEMORY_ATTRIBUTES
+	struct kvm_mmu_notifier_range cancel_set_range = {
+		.start = start,
+		.end = end,
+		.handler = kvm_cancel_set_vm_memory_attributes,
+		.on_lock = kvm_mmu_invalidate_end,
+		.may_block = true,
+	};
+#endif
 	unsigned long i;
 	void *entry;
 	int r = 0;
@@ -2599,6 +2616,14 @@ static int kvm_set_vm_mem_attributes(struct kvm *kvm, gfn_t start, gfn_t end,
 	}
 
 	kvm_handle_gfn_range(kvm, &pre_set_range);
+
+#ifdef CONFIG_HAVE_KVM_ARCH_PREPARE_MEMORY_ATTRIBUTES
+	r = kvm_arch_prepare_memory_attributes(kvm, start, end, attributes);
+	if (r) {
+		kvm_handle_gfn_range(kvm, &cancel_set_range);
+		goto out_unlock;
+	}
+#endif
 
 	for (i = start; i < end; i++) {
 		r = xa_err(xa_store(&kvm->mem_attr_array, i, entry,

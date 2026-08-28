@@ -107,16 +107,19 @@ static bool kvm_gmem_range_has_attributes(struct inode *inode,
 {
 	struct maple_tree *mt = &GMEM_I(inode)->attributes;
 	pgoff_t end = index + nr_pages - 1;
+	bool matches = true;
 	void *entry;
 
-	lockdep_assert(mt_lock_is_held(mt));
-
+	rcu_read_lock();
 	mt_for_each(mt, entry, index, end) {
-		if (kvm_gmem_interpret_entry(inode, entry) != attributes)
-			return false;
+		if (kvm_gmem_interpret_entry(inode, entry) != attributes) {
+			matches = false;
+			break;
+		}
 	}
+	rcu_read_unlock();
 
-	return true;
+	return matches;
 }
 
 static struct folio *__kvm_gmem_get_folio(struct inode *inode,
@@ -285,6 +288,57 @@ static void kvm_gmem_zap(struct inode *inode, pgoff_t start, pgoff_t end,
 	kvm_gmem_for_each_file(f, inode)
 		__kvm_gmem_zap(f, start, end, attr_filter);
 }
+
+#ifdef CONFIG_HAVE_KVM_ARCH_GMEM_PREPARE_CONVERSION
+static int __kvm_gmem_prepare_conversion(struct gmem_file *f,
+					 pgoff_t start, pgoff_t end,
+					 enum kvm_gfn_range_filter attr_filter)
+{
+	struct kvm_memory_slot *slot;
+	unsigned long index;
+
+	xa_for_each_range(&f->bindings, index, slot, start, end - 1) {
+		pgoff_t pgoff = slot->gmem.pgoff;
+		struct kvm_gfn_range gfn_range = {
+			.start = slot->base_gfn + max(pgoff, start) - pgoff,
+			.end = slot->base_gfn + min(pgoff + slot->npages, end) - pgoff,
+			.slot = slot,
+			.may_block = true,
+			.attr_filter = attr_filter,
+		};
+		int ret;
+
+		ret = kvm_arch_gmem_prepare_conversion(f->kvm, &gfn_range);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int kvm_gmem_prepare_conversion(struct inode *inode, pgoff_t start,
+				       pgoff_t end,
+				       enum kvm_gfn_range_filter attr_filter)
+{
+	struct gmem_file *f;
+	int ret;
+
+	kvm_gmem_for_each_file(f, inode) {
+		ret = __kvm_gmem_prepare_conversion(f, start, end, attr_filter);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+#else
+static int kvm_gmem_prepare_conversion(struct inode *inode, pgoff_t start,
+				       pgoff_t end,
+				       enum kvm_gfn_range_filter attr_filter)
+{
+	return 0;
+}
+#endif
 
 static void __kvm_gmem_invalidate_start(struct gmem_file *f, pgoff_t start,
 					pgoff_t end)
@@ -774,6 +828,29 @@ bool kvm_gmem_is_private(struct kvm *kvm, gfn_t gfn)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_gmem_is_private);
 
+bool kvm_gmem_range_has_memory_attributes(struct kvm_memory_slot *slot,
+					  gfn_t start, gfn_t end,
+					  u64 attributes)
+{
+	pgoff_t index;
+	struct inode *inode;
+
+	if (start >= end || start < slot->base_gfn ||
+	    end > slot->base_gfn + slot->npages)
+		return false;
+
+	CLASS(gmem_get_file, file)(slot);
+	if (!file)
+		return false;
+
+	inode = file_inode(file);
+	index = slot->gmem.pgoff + start - slot->base_gfn;
+
+	return kvm_gmem_range_has_attributes(inode, index, end - start,
+					     attributes);
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_gmem_range_has_memory_attributes);
+
 /*
  * Preallocate memory for attributes to be stored on a maple tree, pointed to
  * by mas.  Adjacent ranges with attributes identical to the new attributes
@@ -964,6 +1041,10 @@ static int kvm_gmem_convert(struct inode *inode, pgoff_t start,
 	invalidate_start = kvm_gmem_compute_invalidate_start(inode, start);
 	invalidate_end = kvm_gmem_compute_invalidate_end(inode, end);
 	kvm_gmem_invalidate_start(inode, invalidate_start, invalidate_end);
+	r = kvm_gmem_prepare_conversion(inode, start, end, filter);
+	if (r)
+		goto out_invalidate;
+
 	kvm_gmem_zap(inode, start, end, filter);
 
 	if (!to_private)
@@ -971,9 +1052,14 @@ static int kvm_gmem_convert(struct inode *inode, pgoff_t start,
 
 	mas_store_prealloc(&mas, xa_mk_value(attrs));
 
+out_invalidate:
 	kvm_gmem_invalidate_end(inode, invalidate_start, invalidate_end);
+	if (r) {
+		*err_index = start;
+		mas_destroy(&mas);
+	}
 
-	return 0;
+	return r;
 }
 
 static int __kvm_gmem_set_attributes(struct inode *inode, pgoff_t start,
@@ -1187,6 +1273,8 @@ static int kvm_gmem_init_inode(struct inode *inode, loff_t size, u64 flags,
 	inode->i_mapping->a_ops = flags & GUEST_MEMFD_FLAG_HUGETLB ?
 					  &kvm_gmem_hugetlb_aops :
 					  &kvm_gmem_aops;
+	if (flags & GUEST_MEMFD_FLAG_HUGETLB)
+		mapping_set_no_file_account(inode->i_mapping);
 	inode->i_mode |= S_IFREG;
 	inode->i_size = size;
 	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
