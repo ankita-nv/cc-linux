@@ -9,6 +9,7 @@
 #include <linux/hugetlb.h>
 #include <linux/hugetlb_cgroup.h>
 #include <linux/hugetlb_restructuring.h>
+#include <linux/llist.h>
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
 
@@ -17,22 +18,80 @@
 
 static DEFINE_XARRAY(hugetlb_restructuring_metadata);
 
-static void hugetlb_restructuring_metadata_initialize(
+struct hugetlb_restructuring_metadata {
+	struct hugepage_subpool *spool;
+	struct hugetlb_cgroup *h_cg;
+	struct hugetlb_cgroup *h_cg_rsvd;
+	unsigned long base_pfn;
+	unsigned long nr_pages_waiting_to_be_merged;
+	u8 page_order;
+	bool hugetlb_cma;
+};
+
+static struct hugetlb_restructuring_metadata *
+__hugetlb_restructuring_metadata_get(unsigned long pfn)
+{
+	lockdep_assert_held(&hugetlb_lock);
+
+	return xa_load(&hugetlb_restructuring_metadata, pfn);
+}
+
+static bool hugetlb_restructuring_metadata_valid(
+	struct hugetlb_restructuring_metadata *metadata)
+{
+	unsigned long nr_pages;
+
+	lockdep_assert_held(&hugetlb_lock);
+
+	if (!metadata || metadata->page_order >= BITS_PER_LONG ||
+	    !hugetlb_order_to_hstate(metadata->page_order))
+		return false;
+
+	nr_pages = 1UL << metadata->page_order;
+	return IS_ALIGNED(metadata->base_pfn, nr_pages);
+}
+
+static void __hugetlb_restructuring_metadata_initialize(
 	struct hugetlb_restructuring_metadata *metadata, struct folio *folio)
 {
+	lockdep_assert_held(&hugetlb_lock);
+
+	metadata->base_pfn = folio_pfn(folio);
 	metadata->page_order = folio_order(folio);
 	metadata->spool = hugetlb_folio_subpool(folio);
 	metadata->h_cg = hugetlb_cgroup_from_folio(folio);
 	metadata->h_cg_rsvd = hugetlb_cgroup_from_folio_rsvd(folio);
 	metadata->hugetlb_cma = folio_test_hugetlb_cma(folio);
-	atomic_set(&metadata->nr_pages_waiting_to_be_merged, 0);
+	metadata->nr_pages_waiting_to_be_merged = 0;
 }
 
-static void __hugetlb_restructuring_metadata_restore(
+static bool __hugetlb_restructuring_metadata_range_empty(
+	struct hugetlb_restructuring_metadata *metadata)
+{
+	unsigned long index = metadata->base_pfn;
+	unsigned long nr_pages = 1UL << metadata->page_order;
+	unsigned long last;
+
+	lockdep_assert_held(&hugetlb_lock);
+
+	if (metadata->base_pfn > ULONG_MAX - (nr_pages - 1))
+		return false;
+	last = metadata->base_pfn + nr_pages - 1;
+
+	return !xa_find(&hugetlb_restructuring_metadata, &index, last,
+			XA_PRESENT);
+}
+
+static bool __hugetlb_restructuring_metadata_apply(
 	struct folio *folio, struct hugetlb_restructuring_metadata *metadata)
 {
-	WARN_ON(!folio_test_hugetlb(folio));
-	WARN_ON(folio_order(folio) != metadata->page_order);
+	lockdep_assert_held(&hugetlb_lock);
+
+	if (!hugetlb_restructuring_metadata_valid(metadata) ||
+	    !folio_test_hugetlb(folio) ||
+	    folio_pfn(folio) != metadata->base_pfn ||
+	    folio_order(folio) != metadata->page_order)
+		return false;
 
 	hugetlb_set_folio_subpool(folio, metadata->spool);
 	set_hugetlb_cgroup(folio, metadata->h_cg);
@@ -41,55 +100,181 @@ static void __hugetlb_restructuring_metadata_restore(
 		folio_set_hugetlb_cma(folio);
 	else
 		folio_clear_hugetlb_cma(folio);
+
+	return true;
 }
 
-static int hugetlb_restructuring_metadata_register(
-	unsigned long pfn, struct hugetlb_restructuring_metadata *metadata)
+static bool hugetlb_restructuring_metadata_restore(struct folio *folio)
 {
-	u8 order = metadata->page_order;
-	void *entry;
+	struct hugetlb_restructuring_metadata *metadata;
+	void *erased;
+	bool restored = false;
 
-	entry = xa_store_order(&hugetlb_restructuring_metadata, pfn, order,
-			       metadata, GFP_KERNEL);
+	spin_lock_irq(&hugetlb_lock);
+	metadata = __hugetlb_restructuring_metadata_get(folio_pfn(folio));
+	if (!__hugetlb_restructuring_metadata_apply(folio, metadata))
+		goto out_unlock;
 
-	WARN(entry, "Unexpected duplicate metadata registered");
-	if (xa_is_err(entry))
-		return xa_err(entry);
+	erased = xa_erase(&hugetlb_restructuring_metadata, metadata->base_pfn);
+	if (WARN_ON_ONCE(erased != metadata))
+		goto out_unlock;
+	restored = true;
 
-	return 0;
+out_unlock:
+	spin_unlock_irq(&hugetlb_lock);
+	if (restored)
+		kfree(metadata);
+
+	return restored;
 }
 
 int hugetlb_restructuring_metadata_store(struct folio *folio)
 {
+	XA_STATE(xas, &hugetlb_restructuring_metadata, folio_pfn(folio));
 	struct hugetlb_restructuring_metadata *metadata;
+	int ret;
 
 	metadata = kmalloc(sizeof(*metadata), GFP_KERNEL);
 	if (!metadata)
 		return -ENOMEM;
 
-	hugetlb_restructuring_metadata_initialize(metadata, folio);
-	return hugetlb_restructuring_metadata_register(folio_pfn(folio), metadata);
+	for (;;) {
+		spin_lock_irq(&hugetlb_lock);
+		if (!folio_test_hugetlb(folio) ||
+		    folio_order(folio) >= BITS_PER_LONG ||
+		    !hugetlb_order_to_hstate(folio_order(folio))) {
+			ret = -EINVAL;
+			goto out_unlock;
+		}
+
+		__hugetlb_restructuring_metadata_initialize(metadata, folio);
+		if (!__hugetlb_restructuring_metadata_range_empty(metadata)) {
+			ret = -EEXIST;
+			goto out_unlock;
+		}
+
+		xas_set_order(&xas, metadata->base_pfn, metadata->page_order);
+		xas_lock(&xas);
+		xas_store(&xas, metadata);
+		ret = xas_error(&xas);
+		xas_unlock(&xas);
+
+out_unlock:
+		spin_unlock_irq(&hugetlb_lock);
+
+		/* Allocate outside hugetlb_lock, then revalidate before retrying. */
+		if (ret != -ENOMEM || !xas_nomem(&xas, GFP_KERNEL))
+			break;
+	}
+
+	xas_destroy(&xas);
+	if (ret)
+		kfree(metadata);
+
+	return ret;
 }
 EXPORT_SYMBOL_FOR_MODULES(hugetlb_restructuring_metadata_store, "kvm");
 
-void hugetlb_restructuring_metadata_restore(struct folio *folio)
+void hugetlb_restructuring_metadata_abort(struct folio *folio)
+{
+	struct hugetlb_restructuring_metadata *metadata;
+	void *erased = NULL;
+
+	spin_lock_irq(&hugetlb_lock);
+	metadata = __hugetlb_restructuring_metadata_get(folio_pfn(folio));
+	if (hugetlb_restructuring_metadata_valid(metadata) &&
+	    folio_test_hugetlb(folio) &&
+	    folio_pfn(folio) == metadata->base_pfn &&
+	    folio_order(folio) == metadata->page_order &&
+	    __hugetlb_restructuring_metadata_apply(folio, metadata))
+		erased = xa_erase(&hugetlb_restructuring_metadata,
+				  metadata->base_pfn);
+	spin_unlock_irq(&hugetlb_lock);
+
+	if (WARN_ON_ONCE(erased != metadata))
+		return;
+	kfree(metadata);
+}
+EXPORT_SYMBOL_FOR_MODULES(hugetlb_restructuring_metadata_abort, "kvm");
+
+static bool hugetlb_restructuring_metadata_order(struct folio *folio,
+						  unsigned long *base_pfn,
+						  u8 *page_order)
 {
 	struct hugetlb_restructuring_metadata *metadata;
 	unsigned long pfn = folio_pfn(folio);
+	unsigned long nr_pages;
+	bool found = false;
 
-	metadata = xa_erase(&hugetlb_restructuring_metadata, pfn);
-	__hugetlb_restructuring_metadata_restore(folio, metadata);
+	spin_lock_irq(&hugetlb_lock);
+	metadata = __hugetlb_restructuring_metadata_get(pfn);
+	if (!hugetlb_restructuring_metadata_valid(metadata))
+		goto out_unlock;
 
-	kfree(metadata);
+	nr_pages = 1UL << metadata->page_order;
+	if (pfn < metadata->base_pfn ||
+	    pfn - metadata->base_pfn >= nr_pages)
+		goto out_unlock;
+
+	*base_pfn = metadata->base_pfn;
+	*page_order = metadata->page_order;
+	found = true;
+
+out_unlock:
+	spin_unlock_irq(&hugetlb_lock);
+	return found;
 }
-EXPORT_SYMBOL_FOR_MODULES(hugetlb_restructuring_metadata_restore, "kvm");
 
-struct hugetlb_restructuring_metadata *
-hugetlb_restructuring_metadata_get(unsigned long pfn)
+bool hugetlb_restructuring_cgroup_get(struct folio *folio,
+				     struct hugetlb_cgroup **h_cg,
+				     unsigned long *nr_pages)
 {
-	return xa_load(&hugetlb_restructuring_metadata, pfn);
+	struct hugetlb_restructuring_metadata *metadata;
+
+	lockdep_assert_held(&hugetlb_lock);
+
+	metadata = __hugetlb_restructuring_metadata_get(folio_pfn(folio));
+	if (!hugetlb_restructuring_metadata_valid(metadata))
+		return false;
+
+	*h_cg = metadata->h_cg;
+	*nr_pages = 1UL << metadata->page_order;
+	return true;
 }
-EXPORT_SYMBOL_FOR_MODULES(hugetlb_restructuring_metadata_get, "kvm");
+
+void hugetlb_restructuring_cgroup_set(struct folio *folio,
+				     struct hugetlb_cgroup *h_cg)
+{
+	struct hugetlb_restructuring_metadata *metadata;
+
+	lockdep_assert_held(&hugetlb_lock);
+
+	metadata = __hugetlb_restructuring_metadata_get(folio_pfn(folio));
+	if (WARN_ON_ONCE(!hugetlb_restructuring_metadata_valid(metadata)))
+		return;
+
+	metadata->h_cg = h_cg;
+	if (folio_test_hugetlb(folio) &&
+	    folio_pfn(folio) == metadata->base_pfn &&
+	    folio_order(folio) == metadata->page_order)
+		set_hugetlb_cgroup(folio, h_cg);
+}
+
+static bool hugetlb_restructuring_metadata_matches(struct folio *folio,
+						     u8 original_order)
+{
+	struct hugetlb_restructuring_metadata *metadata;
+	bool matches;
+
+	spin_lock_irq(&hugetlb_lock);
+	metadata = __hugetlb_restructuring_metadata_get(folio_pfn(folio));
+	matches = hugetlb_restructuring_metadata_valid(metadata) &&
+		  metadata->base_pfn == folio_pfn(folio) &&
+		  metadata->page_order == original_order;
+	spin_unlock_irq(&hugetlb_lock);
+
+	return matches;
+}
 
 static int hugetlb_restructuring_freeze_folio(struct folio *folio)
 {
@@ -108,11 +293,28 @@ static void hugetlb_restructuring_unfreeze_folio(struct folio *folio)
 	folio_ref_unfreeze(folio, filemap_refcount);
 }
 
-static void hugetlb_restructuring_set_hugetlb(struct folio *folio)
+static bool hugetlb_restructuring_set_hugetlb_and_apply(struct folio *folio)
 {
+	struct hugetlb_restructuring_metadata *metadata;
+	bool applied;
+
 	spin_lock_irq(&hugetlb_lock);
+	metadata = __hugetlb_restructuring_metadata_get(folio_pfn(folio));
+	if (WARN_ON_ONCE(folio_has_type(folio) ||
+			 !hugetlb_restructuring_metadata_valid(metadata) ||
+			 metadata->base_pfn != folio_pfn(folio) ||
+			 metadata->page_order != folio_order(folio))) {
+		applied = false;
+		goto out_unlock;
+	}
+
 	__folio_set_hugetlb(folio);
+	applied = __hugetlb_restructuring_metadata_apply(folio, metadata);
+	WARN_ON_ONCE(!applied);
+
+out_unlock:
 	spin_unlock_irq(&hugetlb_lock);
+	return applied;
 }
 
 static int hugetlb_restructuring_clear_hugetlb(struct folio *folio)
@@ -227,19 +429,28 @@ static void hugetlb_restructuring_merge_folios(struct folio **children,
 		folio_set_large_rmappable(children[0]);
 }
 
-static int merge_unreferenced_folio(struct folio *first_folio, u8 to_order)
+static void hugetlb_restructuring_prepare_uptodate(struct folio **children,
+						    unsigned long nr_children)
 {
-	struct hstate *h;
+	bool any_uptodate = false;
+	unsigned long i;
 
-	WARN_ON_ONCE(!IS_ALIGNED(first_folio->index, 1 << to_order));
+	for (i = 0; i < nr_children; i++)
+		any_uptodate |= folio_test_uptodate(children[i]);
+	if (!any_uptodate)
+		return;
 
-	__merge_folio_to_order(first_folio, to_order);
-
-	hugetlb_restructuring_set_hugetlb(first_folio);
-	h = hugetlb_order_to_hstate(folio_order(first_folio));
-	hugetlb_vmemmap_optimize_folio(h, first_folio);
-
-	return 0;
+	/*
+	 * A merged folio has one uptodate bit.  Preserve initialized children
+	 * and zero only untouched children before representing the entire range
+	 * as uptodate.
+	 */
+	for (i = 0; i < nr_children; i++) {
+		if (folio_test_uptodate(children[i]))
+			continue;
+		folio_zero_user(children[i], 0);
+		folio_mark_uptodate(children[i]);
+	}
 }
 
 static int hugetlb_restructuring_split_one(struct address_space *mapping,
@@ -365,8 +576,9 @@ static int hugetlb_restructuring_split_one(struct address_space *mapping,
 	return 0;
 
 out_unfreeze:
-	if (hugetlb_cleared)
-		hugetlb_restructuring_set_hugetlb(folio);
+	if (hugetlb_cleared &&
+	    WARN_ON_ONCE(!hugetlb_restructuring_set_hugetlb_and_apply(folio)))
+		ret = -EINVAL;
 	hugetlb_restructuring_unfreeze_folio(folio);
 out_destroy:
 	xas_destroy(&xas);
@@ -481,6 +693,10 @@ static int hugetlb_restructuring_merge_one(struct address_space *mapping,
 
 		children[i] = child;
 	}
+	if (to_order == original_order &&
+	    !hugetlb_restructuring_metadata_matches(children[0],
+						      original_order))
+		return -EINVAL;
 
 	for (i = 0; i < nr_children; i++) {
 		ret = hugetlb_restructuring_freeze_folio(children[i]);
@@ -502,6 +718,7 @@ static int hugetlb_restructuring_merge_one(struct address_space *mapping,
 			goto out_unfreeze;
 		}
 	}
+	hugetlb_restructuring_prepare_uptodate(children, nr_children);
 
 	mapping_set_update(&xas, mapping);
 	xas_lock_irq(&xas);
@@ -530,12 +747,14 @@ out_unlock:
 					      current_order, to_order,
 					      to_order != original_order);
 	if (to_order == original_order) {
-		hugetlb_restructuring_set_hugetlb(children[0]);
-		hugetlb_vmemmap_optimize_folio(h, children[0]);
+		if (!hugetlb_restructuring_set_hugetlb_and_apply(children[0]))
+			ret = -EINVAL;
+		else
+			hugetlb_vmemmap_optimize_folio(h, children[0]);
 	}
 
 	hugetlb_restructuring_unfreeze_folio(children[0]);
-	return 0;
+	return ret;
 
 out_unfreeze:
 	while (nr_frozen) {
@@ -609,8 +828,8 @@ static int hugetlb_restructuring_merge_range(struct address_space *mapping,
 
 int hugetlb_restructuring_restructure_folio(struct folio *folio, u8 to_order)
 {
-	struct hugetlb_restructuring_metadata *metadata;
 	struct address_space *mapping = folio->mapping;
+	unsigned long base_pfn;
 	unsigned long nr_pages;
 	pgoff_t start;
 	u8 original_order;
@@ -620,13 +839,8 @@ int hugetlb_restructuring_restructure_folio(struct folio *folio, u8 to_order)
 
 	lockdep_assert_held_write(&mapping->invalidate_lock);
 
-	metadata = hugetlb_restructuring_metadata_get(folio_pfn(folio));
-	if (!metadata)
-		return -EINVAL;
-
-	original_order = metadata->page_order;
-	if (original_order >= BITS_PER_LONG ||
-	    !hugetlb_order_to_hstate(original_order))
+	if (!hugetlb_restructuring_metadata_order(folio, &base_pfn,
+						  &original_order))
 		return -EINVAL;
 
 	/* The conversion interface only needs fully split or original order. */
@@ -638,6 +852,10 @@ int hugetlb_restructuring_restructure_folio(struct folio *folio, u8 to_order)
 
 	nr_pages = 1UL << original_order;
 	start = round_down(folio->index, nr_pages);
+	if (folio_pfn(folio) < base_pfn ||
+	    folio_pfn(folio) - base_pfn >= nr_pages ||
+	    folio->index - start != folio_pfn(folio) - base_pfn)
+		return -EINVAL;
 	if (start + nr_pages < start)
 		return -EINVAL;
 
@@ -651,73 +869,279 @@ int hugetlb_restructuring_restructure_folio(struct folio *folio, u8 to_order)
 
 EXPORT_SYMBOL_FOR_MODULES(hugetlb_restructuring_restructure_folio, "kvm");
 
-static struct folio *maybe_merge_unreferenced_folio(struct folio *folio)
+static int hugetlb_restructuring_cleanup_account(
+	struct folio *folio, unsigned long *base_pfn, u8 *original_order)
 {
 	struct hugetlb_restructuring_metadata *metadata;
-	size_t nr_pages_waiting_to_be_merged;
-	unsigned long first_folio_pfn;
-	struct folio *first_folio;
-	size_t original_nr_pages;
-	u8 original_order;
-	int ret;
-
 	unsigned long pfn = folio_pfn(folio);
-	metadata = hugetlb_restructuring_metadata_get(pfn);
-	original_order = metadata->page_order;
-	original_nr_pages = 1 << original_order;
+	unsigned long offset, nr_pages, total_pages;
+	unsigned int order = folio_order(folio);
+	int ret = -EINVAL;
 
-	nr_pages_waiting_to_be_merged = atomic_add_return(
-		folio_nr_pages(folio), &metadata->nr_pages_waiting_to_be_merged);
-	if (nr_pages_waiting_to_be_merged < original_nr_pages)
-		return NULL;
+	spin_lock_irq(&hugetlb_lock);
+	metadata = __hugetlb_restructuring_metadata_get(pfn);
+	if (!hugetlb_restructuring_metadata_valid(metadata) ||
+	    !folio_test_hugetlb_split(folio) ||
+	    folio_ref_count(folio) || folio->mapping ||
+	    order >= metadata->page_order || order >= BITS_PER_LONG ||
+	    folio_test_large(folio) != !!order)
+		goto out_unlock;
 
-	first_folio_pfn = round_down(pfn, original_nr_pages);
-	first_folio = pfn_folio(first_folio_pfn);
+	total_pages = 1UL << metadata->page_order;
+	nr_pages = 1UL << order;
+	if (pfn < metadata->base_pfn)
+		goto out_unlock;
+	offset = pfn - metadata->base_pfn;
+	if (!IS_ALIGNED(pfn, nr_pages) || offset >= total_pages ||
+	    nr_pages > total_pages - offset ||
+	    metadata->nr_pages_waiting_to_be_merged >
+		total_pages - nr_pages)
+		goto out_unlock;
 
-	ret = merge_unreferenced_folio(first_folio, original_order);
-	if (ret) {
-		WARN_ONCE(ret, "Error merging unreferenced folio.");
-		return ERR_PTR(ret);
+	metadata->nr_pages_waiting_to_be_merged += nr_pages;
+	if (metadata->nr_pages_waiting_to_be_merged == total_pages) {
+		*base_pfn = metadata->base_pfn;
+		*original_order = metadata->page_order;
+		ret = 1;
+	} else {
+		ret = 0;
 	}
 
-	return first_folio;
+out_unlock:
+	spin_unlock_irq(&hugetlb_lock);
+	WARN_ON_ONCE(ret < 0);
+	return ret;
+}
+
+static bool hugetlb_restructuring_cleanup_validate(unsigned long base_pfn,
+						     u8 original_order)
+{
+	unsigned long offset = 0;
+	unsigned long total_pages = 1UL << original_order;
+#ifdef CONFIG_MEMCG
+	unsigned long memcg_data = pfn_folio(base_pfn)->memcg_data;
+#endif
+
+	while (offset < total_pages) {
+		struct page *page = pfn_to_page(base_pfn + offset);
+		struct folio *folio;
+		unsigned long nr_pages;
+		unsigned int order;
+
+		if (PageTail(page))
+			return false;
+		folio = page_folio(page);
+		order = folio_order(folio);
+		if (order >= original_order || order >= BITS_PER_LONG)
+			return false;
+
+		nr_pages = 1UL << order;
+		if (folio_pfn(folio) != base_pfn + offset ||
+		    !IS_ALIGNED(base_pfn + offset, nr_pages) ||
+		    nr_pages > total_pages - offset ||
+		    folio_test_large(folio) != !!order ||
+		    folio_ref_count(folio) || folio->mapping ||
+		    !folio_test_hugetlb_split(folio) ||
+		    folio_test_lru(folio) || folio_test_locked(folio) ||
+		    folio_test_writeback(folio) || folio_test_dirty(folio) ||
+		    folio_test_uptodate(folio) || folio_has_private(folio) ||
+		    folio_contain_hwpoisoned_page(folio))
+			return false;
+		if (order > 1 && !list_empty(&folio->_deferred_list))
+			return false;
+#ifdef CONFIG_MEMCG
+		if (folio->memcg_data != memcg_data)
+			return false;
+#endif
+
+		offset += nr_pages;
+		if (!(offset & (XA_CHUNK_SIZE - 1)))
+			cond_resched();
+	}
+
+	return offset == total_pages;
+}
+
+static bool hugetlb_restructuring_cleanup_merge_one(unsigned long base_pfn,
+						      unsigned long offset,
+						      u8 current_order,
+						      u8 to_order,
+						      u8 original_order)
+{
+	struct folio *children[XA_CHUNK_SIZE];
+	unsigned long nr_children, i;
+
+	if (to_order <= current_order ||
+	    to_order - current_order > XA_CHUNK_SHIFT)
+		return false;
+
+	nr_children = 1UL << (to_order - current_order);
+	for (i = 0; i < nr_children; i++) {
+		unsigned long child_pfn = base_pfn + offset +
+					  (i << current_order);
+		struct page *page = pfn_to_page(child_pfn);
+		struct folio *child;
+
+		if (PageTail(page))
+			return false;
+		child = page_folio(page);
+		if (folio_pfn(child) != child_pfn ||
+		    folio_order(child) != current_order ||
+		    folio_ref_count(child) || child->mapping ||
+		    !folio_test_hugetlb_split(child))
+			return false;
+		children[i] = child;
+	}
+
+	spin_lock_irq(&hugetlb_lock);
+	for (i = 0; i < nr_children; i++) {
+		if (WARN_ON_ONCE(!folio_test_hugetlb_split(children[i]))) {
+			spin_unlock_irq(&hugetlb_lock);
+			return false;
+		}
+	}
+	for (i = 1; i < nr_children; i++)
+		__folio_clear_hugetlb_split(children[i]);
+	spin_unlock_irq(&hugetlb_lock);
+
+	hugetlb_restructuring_merge_folios(children, nr_children,
+					      current_order, to_order,
+					      to_order != original_order);
+	return true;
+}
+
+static bool hugetlb_restructuring_cleanup_merge(unsigned long base_pfn,
+						  u8 original_order)
+{
+	unsigned long total_pages = 1UL << original_order;
+	u8 current_order = 0;
+
+	while (current_order < original_order) {
+		u8 next_order = hugetlb_restructuring_next_merge_order(
+			current_order, original_order);
+		unsigned long offset = 0;
+
+		while (offset < total_pages) {
+			struct page *page = pfn_to_page(base_pfn + offset);
+			struct folio *folio;
+			unsigned int actual_order;
+
+			if (PageTail(page))
+				return false;
+			folio = page_folio(page);
+			actual_order = folio_order(folio);
+			if (!folio_test_hugetlb_split(folio))
+				return false;
+			if (actual_order > next_order) {
+				offset += folio_nr_pages(folio);
+				continue;
+			}
+			if (actual_order == next_order) {
+				offset += 1UL << next_order;
+				continue;
+			}
+			if (actual_order != current_order ||
+			    !hugetlb_restructuring_cleanup_merge_one(
+					base_pfn, offset, current_order,
+					next_order, original_order))
+				return false;
+
+			offset += 1UL << next_order;
+			cond_resched();
+		}
+
+		current_order = next_order;
+	}
+
+	return folio_order(pfn_folio(base_pfn)) == original_order;
+}
+
+static bool hugetlb_restructuring_cleanup_finish(struct folio *folio,
+						   unsigned long base_pfn,
+						   u8 original_order)
+{
+	struct hugetlb_restructuring_metadata *metadata;
+	unsigned long total_pages = 1UL << original_order;
+	void *erased = NULL;
+	bool finished = false;
+
+	spin_lock_irq(&hugetlb_lock);
+	metadata = __hugetlb_restructuring_metadata_get(base_pfn);
+	if (!hugetlb_restructuring_metadata_valid(metadata) ||
+	    metadata->base_pfn != base_pfn ||
+	    metadata->page_order != original_order ||
+	    metadata->nr_pages_waiting_to_be_merged != total_pages ||
+	    folio_pfn(folio) != base_pfn ||
+	    folio_order(folio) != original_order ||
+	    !folio_test_hugetlb_split(folio))
+		goto out_unlock;
+
+	__folio_clear_hugetlb_split(folio);
+	__folio_set_hugetlb(folio);
+	if (!__hugetlb_restructuring_metadata_apply(folio, metadata))
+		goto out_unlock;
+
+	erased = xa_erase(&hugetlb_restructuring_metadata, base_pfn);
+	if (erased == metadata)
+		finished = true;
+
+out_unlock:
+	if (!finished) {
+		/* Keep a failed reconstruction out of both HugeTLB and buddy. */
+		if (folio_test_hugetlb(folio))
+			__folio_clear_hugetlb(folio);
+		/* A zero refcount keeps page_type stable outside hugetlb_lock. */
+		if (data_race(folio->page.page_type) == UINT_MAX)
+			__folio_set_hugetlb_split(folio);
+	}
+	spin_unlock_irq(&hugetlb_lock);
+	if (WARN_ON_ONCE(!finished))
+		return false;
+
+	kfree(metadata);
+	return true;
 }
 
 static void hugetlb_restructuring_cleanup_folio(struct folio *folio)
 {
-	struct folio *merged_folio = maybe_merge_unreferenced_folio(folio);
+	unsigned long base_pfn;
+	struct folio *first_folio;
+	struct hstate *h;
+	u8 original_order;
+	int ret;
 
-	if (!IS_ERR_OR_NULL(merged_folio)) {
-		hugetlb_restructuring_metadata_restore(merged_folio);
-		__folio_put(merged_folio);
+	ret = hugetlb_restructuring_cleanup_account(folio, &base_pfn,
+						     &original_order);
+	if (ret <= 0)
+		return;
+
+	if (WARN_ON_ONCE(!hugetlb_restructuring_cleanup_validate(
+					base_pfn, original_order))) {
+		/* Poison or corrupt topology is quarantined instead of reused. */
+		return;
 	}
+
+	if (WARN_ON_ONCE(!hugetlb_restructuring_cleanup_merge(
+					base_pfn, original_order)))
+		return;
+	first_folio = pfn_folio(base_pfn);
+	if (!hugetlb_restructuring_cleanup_finish(first_folio, base_pfn,
+						  original_order))
+		return;
+
+	h = hugetlb_order_to_hstate(original_order);
+	hugetlb_vmemmap_optimize_folio(h, first_folio);
+	__folio_put(first_folio);
 }
 
-struct workqueue_struct *hugetlb_restructuring_wq __ro_after_init;
-static struct work_struct hugetlb_restructuring_cleanup_work;
 static LLIST_HEAD(hugetlb_restructuring_cleanup_list);
-
-static void hugetlb_restructuring_cleanup_workfn(struct work_struct *work)
-{
-	struct llist_node *node = llist_del_all(&hugetlb_restructuring_cleanup_list);
-
-	while (node) {
-		struct folio *folio;
-
-		folio = container_of((struct address_space **)node,
-				     struct folio, mapping);
-
-		node = node->next;
-		folio->mapping = NULL;
-
-		hugetlb_restructuring_cleanup_folio(folio);
-	}
-}
+static void hugetlb_restructuring_cleanup_workfn(struct work_struct *work);
+static DECLARE_WORK(hugetlb_restructuring_cleanup_work,
+			    hugetlb_restructuring_cleanup_workfn);
+static struct workqueue_struct *hugetlb_restructuring_wq __ro_after_init;
 
 static int __init hugetlb_restructuring_init(void)
 {
-	INIT_WORK(&hugetlb_restructuring_cleanup_work, hugetlb_restructuring_cleanup_workfn);
-
 	hugetlb_restructuring_wq = alloc_workqueue("hugetlb_restructuring",
 						   WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
 	if (!hugetlb_restructuring_wq)
@@ -727,65 +1151,114 @@ static int __init hugetlb_restructuring_init(void)
 }
 subsys_initcall(hugetlb_restructuring_init);
 
-static void hugetlb_restructuring_mark_folio(struct folio *folio)
+static void hugetlb_restructuring_cleanup_workfn(struct work_struct *work)
 {
-	/*
-	 * Clear HugeTLB page type (if it is set) temporarily to make way for
-	 * guestmem_hugetlb page type.
-	 */
-	__folio_clear_hugetlb(folio);
-	__folio_set_hugetlb_split(folio);
-}
+	struct llist_node *node;
 
-static void hugetlb_restructuring_unmark_folio(struct folio *folio)
-{
-	__folio_clear_hugetlb_split(folio);
+	while ((node = llist_del_all(&hugetlb_restructuring_cleanup_list))) {
+		while (node) {
+			struct llist_node *next = node->next;
+			struct folio *folio;
 
-	/* Restore invariant ahead of merging later. */
-	if (folio_order(folio) > 0)
-		__folio_set_hugetlb(folio);
+			folio = container_of((struct address_space **)node,
+					     struct folio, mapping);
+			folio->mapping = NULL;
+			hugetlb_restructuring_cleanup_folio(folio);
+			node = next;
+		}
+	}
 }
 
 static void hugetlb_restructuring_defer_cleanup(struct folio *folio)
 {
 	struct llist_node *node;
 
-	/*
-	 * Reuse the folio->mapping pointer as a struct llist_node, since
-	 * folio->mapping is NULL at this point.
-	 */
+	/* Reuse folio->mapping after the folio has left the page cache. */
 	BUILD_BUG_ON(sizeof(folio->mapping) != sizeof(struct llist_node));
+	if (WARN_ON_ONCE(folio->mapping))
+		return;
 	node = (struct llist_node *)&folio->mapping;
 
-	/*
-	 * Only schedule work if list is previously empty. Otherwise,
-	 * schedule_work() had been called but the workfn hasn't retrieved the
-	 * list yet.
-	 */
 	if (llist_add(node, &hugetlb_restructuring_cleanup_list))
-		queue_work(hugetlb_restructuring_wq, &hugetlb_restructuring_cleanup_work);
+		queue_work(hugetlb_restructuring_wq,
+			   &hugetlb_restructuring_cleanup_work);
+}
+
+static bool hugetlb_restructuring_mark_folio(struct folio *folio)
+{
+	struct hugetlb_restructuring_metadata *metadata;
+	unsigned long pfn = folio_pfn(folio);
+	unsigned long offset, nr_pages, total_pages;
+	unsigned int order = folio_order(folio);
+	bool marked = false;
+
+	spin_lock_irq(&hugetlb_lock);
+	metadata = __hugetlb_restructuring_metadata_get(pfn);
+	if (!hugetlb_restructuring_metadata_valid(metadata) ||
+	    order >= metadata->page_order || order >= BITS_PER_LONG ||
+	    folio_test_large(folio) != !!order || folio_has_type(folio) ||
+	    folio->mapping || folio_mapped(folio))
+		goto out_unlock;
+
+	total_pages = 1UL << metadata->page_order;
+	nr_pages = 1UL << order;
+	if (pfn < metadata->base_pfn)
+		goto out_unlock;
+	offset = pfn - metadata->base_pfn;
+	if (!IS_ALIGNED(pfn, nr_pages) || offset >= total_pages ||
+	    nr_pages > total_pages - offset)
+		goto out_unlock;
+
+	__folio_set_hugetlb_split(folio);
+	marked = true;
+
+out_unlock:
+	spin_unlock_irq(&hugetlb_lock);
+	return marked;
+}
+
+static void hugetlb_restructuring_quarantine_folio(struct folio *folio)
+{
+	spin_lock_irq(&hugetlb_lock);
+	if (folio_test_hugetlb(folio))
+		__folio_clear_hugetlb(folio);
+	/* The unmapped folio cannot acquire a mapcount after final removal. */
+	if (data_race(folio->page.page_type) == UINT_MAX)
+		__folio_set_hugetlb_split(folio);
+	spin_unlock_irq(&hugetlb_lock);
 }
 
 void hugetlb_split_handle_folio_put(struct folio *folio)
 {
-	hugetlb_restructuring_unmark_folio(folio);
+	if (WARN_ON_ONCE(!folio_test_hugetlb_split(folio) ||
+			 folio_ref_count(folio)))
+		return;
 
-	/*
-	 * folio_put() can be called in interrupt context, hence do the work
-	 * outside of interrupt context
-	 */
+	/* folio_put() may run in interrupt context; merge in process context. */
 	hugetlb_restructuring_defer_cleanup(folio);
 }
 
 void hugetlb_restructuring_free_folio(struct folio *folio)
 {
-	struct hugetlb_restructuring_metadata *metadata;
-	unsigned long pfn = folio_pfn(folio);
+	unsigned long base_pfn;
+	u8 original_order;
 
-	metadata = hugetlb_restructuring_metadata_get(pfn);
+	if (!hugetlb_restructuring_metadata_order(folio, &base_pfn,
+						  &original_order))
+		goto quarantine;
 
-	if (folio_order(folio) == metadata->page_order)
-		hugetlb_restructuring_metadata_restore(folio);
-	else
-		hugetlb_restructuring_mark_folio(folio);
+	if (folio_order(folio) == original_order) {
+		if (folio_pfn(folio) == base_pfn &&
+		    hugetlb_restructuring_metadata_restore(folio))
+			return;
+		goto quarantine;
+	}
+
+	if (hugetlb_restructuring_mark_folio(folio))
+		return;
+
+quarantine:
+	WARN_ON_ONCE(1);
+	hugetlb_restructuring_quarantine_folio(folio);
 }
+EXPORT_SYMBOL_FOR_MODULES(hugetlb_restructuring_free_folio, "kvm");

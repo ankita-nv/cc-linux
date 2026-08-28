@@ -21,6 +21,11 @@ static inline void gmem_hugetlb_free_folio(struct folio *folio)
 	hugetlb_restructuring_free_folio(folio);
 }
 
+static inline void gmem_hugetlb_abort_folio(struct folio *folio)
+{
+	hugetlb_restructuring_metadata_abort(folio);
+}
+
 int gmem_hugetlb_restructure_folio(struct address_space *mapping,
 				   pgoff_t index, u8 to_order);
 
@@ -49,6 +54,8 @@ static inline struct folio *gmem_hugetlb_alloc_folio(
 }
 
 static inline void gmem_hugetlb_free_folio(struct folio *folio) {}
+
+static inline void gmem_hugetlb_abort_folio(struct folio *folio) {}
 
 static inline int gmem_hugetlb_restructure_folio(struct address_space *mapping,
 						 pgoff_t index, u8 to_order)

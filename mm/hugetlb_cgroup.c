@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/hugetlb.h>
 #include <linux/hugetlb_cgroup.h>
+#include <linux/hugetlb_restructuring.h>
 
 #define MEMFILE_PRIVATE(x, val)	(((x) << 16) | (val))
 #define MEMFILE_IDX(val)	(((val) >> 16) & 0xffff)
@@ -189,12 +190,20 @@ static void hugetlb_cgroup_css_free(struct cgroup_subsys_state *css)
 static void hugetlb_cgroup_move_parent(int idx, struct hugetlb_cgroup *h_cg,
 				       struct folio *folio)
 {
-	unsigned int nr_pages;
+	unsigned long nr_pages;
 	struct page_counter *counter;
 	struct hugetlb_cgroup *hcg;
 	struct hugetlb_cgroup *parent = parent_hugetlb_cgroup(h_cg);
+	bool restructuring;
 
-	hcg = hugetlb_cgroup_from_folio(folio);
+	restructuring = hugetlb_restructuring_cgroup_get(folio, &hcg,
+							  &nr_pages);
+	if (!restructuring) {
+		if (!folio_test_hugetlb(folio))
+			goto out;
+		hcg = hugetlb_cgroup_from_folio(folio);
+		nr_pages = folio_nr_pages(folio);
+	}
 	/*
 	 * We can have pages in active list without any cgroup
 	 * ie, hugepage with less than 3 pages. We can safely
@@ -203,7 +212,6 @@ static void hugetlb_cgroup_move_parent(int idx, struct hugetlb_cgroup *h_cg,
 	if (!hcg || hcg != h_cg)
 		goto out;
 
-	nr_pages = folio_nr_pages(folio);
 	if (!parent) {
 		parent = root_h_cgroup;
 		/* root has no limit */
@@ -213,7 +221,10 @@ static void hugetlb_cgroup_move_parent(int idx, struct hugetlb_cgroup *h_cg,
 	/* Take the pages off the local counter */
 	page_counter_cancel(counter, nr_pages);
 
-	set_hugetlb_cgroup(folio, parent);
+	if (restructuring)
+		hugetlb_restructuring_cgroup_set(folio, parent);
+	else
+		set_hugetlb_cgroup(folio, parent);
 out:
 	return;
 }

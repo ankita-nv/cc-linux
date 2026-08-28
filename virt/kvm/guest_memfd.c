@@ -163,6 +163,8 @@ static struct folio *__kvm_gmem_get_folio(struct inode *inode,
 	err = __filemap_add_folio(mapping, folio, index_floor, gfp, NULL);
 	if (err) {
 		__folio_clear_locked(folio);
+		if (is_hugetlb)
+			gmem_hugetlb_abort_folio(folio);
 		goto err_put;
 	}
 	inode_add_bytes(mapping->host, folio_size(folio));
@@ -174,33 +176,46 @@ err_put:
 	return ERR_PTR(err);
 }
 
-static struct folio *__maybe_split_fresh_folio(struct folio *folio,
-					       pgoff_t requested_index)
+static struct folio *__maybe_split_hugetlb_folio(struct folio *folio,
+						 pgoff_t requested_index,
+						 bool may_restructure)
 {
 	struct inode *inode = folio->mapping->host;
 	struct gmem_inode *gi = GMEM_I(inode);
 	size_t nr_pages = 1UL << gi->page_order;
+	pgoff_t huge_start;
 	int ret;
 
 	if (!IS_ENABLED(CONFIG_KVM_GUEST_MEMFD_HUGETLB) || gi->page_order == 0)
 		return folio;
+	if (!folio_order(folio))
+		return folio;
 
-	if (kvm_gmem_range_has_attributes(inode, folio->index,
+	huge_start = round_down(requested_index, nr_pages);
+	if (kvm_gmem_range_has_attributes(inode, huge_start,
 					  nr_pages,
 					  KVM_MEMORY_ATTRIBUTE_PRIVATE))
 		return folio;
 
-	/* Set folio up for splitting, leave only filemap's refcounts on folio. */
-	__folio_clear_locked(folio);
+	/* Leave only filemap's references before restructuring the folio. */
+	folio_unlock(folio);
 	folio_put(folio);
 
-	ret = gmem_hugetlb_restructure_folio(inode->i_mapping, folio->index, 0);
+	if (!may_restructure)
+		return ERR_PTR(-EAGAIN);
+
+	ret = gmem_hugetlb_restructure_folio(inode->i_mapping, huge_start, 0);
 	if (ret)
 		return ERR_PTR(ret);
 
-	folio = (struct folio *)folio_page(folio, requested_index - folio->index);
-	__folio_set_locked(folio);
-	folio_get(folio);
+	folio = filemap_lock_folio(inode->i_mapping, requested_index);
+	if (IS_ERR(folio))
+		return folio;
+	if (WARN_ON_ONCE(folio_order(folio))) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return ERR_PTR(-EINVAL);
+	}
 
 	return folio;
 }
@@ -215,7 +230,8 @@ static struct folio *__maybe_split_fresh_folio(struct folio *folio,
  * Ignore accessed, referenced, and dirty flags.  The memory is
  * unevictable and there is no storage to write back to.
  */
-static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
+static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index,
+					bool may_restructure)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct mempolicy *policy;
@@ -227,7 +243,8 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 	 */
 	folio = filemap_lock_folio(mapping, index);
 	if (!IS_ERR(folio))
-		return folio;
+		return __maybe_split_hugetlb_folio(folio, index,
+						      may_restructure);
 
 	policy = mpol_shared_policy_lookup(&GMEM_I(inode)->policy, index);
 	do {
@@ -239,7 +256,7 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 	if (IS_ERR(folio))
 		return folio;
 
-	return __maybe_split_fresh_folio(folio, index);
+	return __maybe_split_hugetlb_folio(folio, index, may_restructure);
 }
 
 static void __kvm_gmem_zap(struct gmem_file *f, pgoff_t start, pgoff_t end,
@@ -561,6 +578,7 @@ static long kvm_gmem_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 static long kvm_gmem_allocate(struct inode *inode, loff_t offset, loff_t len)
 {
 	struct address_space *mapping = inode->i_mapping;
+	bool may_restructure = false;
 	pgoff_t start, index, end;
 	int r;
 
@@ -568,10 +586,14 @@ static long kvm_gmem_allocate(struct inode *inode, loff_t offset, loff_t len)
 	if (offset + len > i_size_read(inode))
 		return -EINVAL;
 
-	filemap_invalidate_lock_shared(mapping);
-
 	start = offset >> PAGE_SHIFT;
 	end = (offset + len) >> PAGE_SHIFT;
+
+retry:
+	if (may_restructure)
+		filemap_invalidate_lock(mapping);
+	else
+		filemap_invalidate_lock_shared(mapping);
 
 	r = 0;
 	for (index = start; index < end; ) {
@@ -582,7 +604,7 @@ static long kvm_gmem_allocate(struct inode *inode, loff_t offset, loff_t len)
 			break;
 		}
 
-		folio = kvm_gmem_get_folio(inode, index);
+		folio = kvm_gmem_get_folio(inode, index, may_restructure);
 		if (IS_ERR(folio)) {
 			r = PTR_ERR(folio);
 			break;
@@ -600,7 +622,15 @@ static long kvm_gmem_allocate(struct inode *inode, loff_t offset, loff_t len)
 		cond_resched();
 	}
 
-	filemap_invalidate_unlock_shared(mapping);
+	if (may_restructure)
+		filemap_invalidate_unlock(mapping);
+	else
+		filemap_invalidate_unlock_shared(mapping);
+
+	if (r == -EAGAIN && !may_restructure) {
+		may_restructure = true;
+		goto retry;
+	}
 
 	return r;
 }
@@ -703,18 +733,33 @@ static bool kvm_gmem_supports_mmap(struct inode *inode)
 static vm_fault_t kvm_gmem_fault_user_mapping(struct vm_fault *vmf)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
+	bool may_restructure = false;
 	struct folio *folio;
 	vm_fault_t ret = VM_FAULT_LOCKED;
 
 	if (((loff_t)vmf->pgoff << PAGE_SHIFT) >= i_size_read(inode))
 		return VM_FAULT_SIGBUS;
 
-	filemap_invalidate_lock_shared(inode->i_mapping);
+retry:
+	if (may_restructure)
+		filemap_invalidate_lock(inode->i_mapping);
+	else
+		filemap_invalidate_lock_shared(inode->i_mapping);
 	if (kvm_gmem_is_shared_mem(inode, vmf->pgoff))
-		folio = kvm_gmem_get_folio(inode, vmf->pgoff);
+		folio = kvm_gmem_get_folio(inode, vmf->pgoff,
+					   may_restructure);
 	else
 		folio = ERR_PTR(-EACCES);
-	filemap_invalidate_unlock_shared(inode->i_mapping);
+	if (may_restructure)
+		filemap_invalidate_unlock(inode->i_mapping);
+	else
+		filemap_invalidate_unlock_shared(inode->i_mapping);
+
+	if (IS_ERR(folio) && PTR_ERR(folio) == -EAGAIN &&
+	    !may_restructure) {
+		may_restructure = true;
+		goto retry;
+	}
 
 	if (IS_ERR(folio)) {
 		if (PTR_ERR(folio) == -EAGAIN)
@@ -1519,7 +1564,7 @@ void kvm_gmem_unbind(struct kvm_memory_slot *slot)
 static struct folio *__kvm_gmem_get_pfn(struct file *file,
 					struct kvm_memory_slot *slot,
 					pgoff_t index, kvm_pfn_t *pfn,
-					int *max_order)
+					int *max_order, bool may_restructure)
 {
 	struct file *slot_file = READ_ONCE(slot->gmem.file);
 	struct gmem_file *f = file->private_data;
@@ -1535,7 +1580,7 @@ static struct folio *__kvm_gmem_get_pfn(struct file *file,
 		return ERR_PTR(-EIO);
 	}
 
-	folio = kvm_gmem_get_folio(file_inode(file), index);
+	folio = kvm_gmem_get_folio(file_inode(file), index, may_restructure);
 	if (IS_ERR(folio))
 		return folio;
 
@@ -1562,6 +1607,8 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
 		     int *max_order)
 {
 	pgoff_t index = kvm_gmem_get_index(slot, gfn);
+	bool may_restructure = false;
+	bool retry_exclusive;
 	struct folio *folio;
 	int r = 0, __order;
 
@@ -1571,11 +1618,19 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
 	if (!file)
 		return -EFAULT;
 
-	filemap_invalidate_lock_shared(file_inode(file)->i_mapping);
+retry:
+	r = 0;
+	retry_exclusive = false;
+	if (may_restructure)
+		filemap_invalidate_lock(file_inode(file)->i_mapping);
+	else
+		filemap_invalidate_lock_shared(file_inode(file)->i_mapping);
 
-	folio = __kvm_gmem_get_pfn(file, slot, index, pfn, max_order);
+	folio = __kvm_gmem_get_pfn(file, slot, index, pfn, max_order,
+				     may_restructure);
 	if (IS_ERR(folio)) {
 		r = PTR_ERR(folio);
+		retry_exclusive = r == -EAGAIN && !may_restructure;
 		goto out;
 	}
 
@@ -1593,7 +1648,14 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
 		folio_put(folio);
 
 out:
-	filemap_invalidate_unlock_shared(file_inode(file)->i_mapping);
+	if (may_restructure)
+		filemap_invalidate_unlock(file_inode(file)->i_mapping);
+	else
+		filemap_invalidate_unlock_shared(file_inode(file)->i_mapping);
+	if (retry_exclusive) {
+		may_restructure = true;
+		goto retry;
+	}
 	return r;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_gmem_get_pfn);
@@ -1626,7 +1688,7 @@ static long __kvm_gmem_populate(struct kvm *kvm, struct kvm_memory_slot *slot,
 
 	filemap_invalidate_lock(file->f_mapping);
 
-	folio = __kvm_gmem_get_pfn(file, slot, index, &pfn, NULL);
+	folio = __kvm_gmem_get_pfn(file, slot, index, &pfn, NULL, true);
 	if (IS_ERR(folio)) {
 		ret = PTR_ERR(folio);
 		goto out_unlock;
