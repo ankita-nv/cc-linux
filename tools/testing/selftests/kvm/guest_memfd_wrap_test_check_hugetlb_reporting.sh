@@ -72,24 +72,40 @@ establish_statistics_baseline() {
 }
 
 assert_path_at_baseline() {
-  local path=$1
+  local path="$1"
+  local current
+  local expected
 
   current=$(cat "$path")
   expected=${baseline["$path"]}
   if [ "$current" != "$expected"  ]; then
     echo "$path was $current instead of $expected"
+    return 1
   fi
 }
 
 assert_statistics_at_baseline() {
+  local path
+  local status=0
+
   for path in "${!baseline[@]}"; do
-    assert_path_at_baseline $path
+    assert_path_at_baseline "$path" || status=1
   done
+
+  return "$status"
 }
 
 
 establish_statistics_baseline
 
-$@
+"$@"
+test_status=$?
 
 assert_statistics_at_baseline
+statistics_status=$?
+
+if [ "$test_status" -ne 0 ]; then
+  exit "$test_status"
+fi
+
+exit "$statistics_status"
