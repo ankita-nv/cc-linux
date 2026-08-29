@@ -5135,17 +5135,17 @@ static bool is_pfn_range_shared(kvm_pfn_t start, kvm_pfn_t end)
 	return true;
 }
 
-static bool is_large_rmp_possible(kvm_pfn_t pfn, kvm_pfn_t nr_pages)
+static bool is_large_rmp_possible(gfn_t gfn, kvm_pfn_t pfn,
+				  kvm_pfn_t nr_pages)
 {
-	kvm_pfn_t pfn_aligned = ALIGN_DOWN(pfn, PTRS_PER_PMD);
-
 	/*
-	 * If this is a large folio, and the entire 2M range containing the
-	 * PFN is currently shared, then the entire 2M-aligned range can be
-	 * set to private via a single 2M RMP entry.
+	 * If the next 2M range is aligned in both the guest and host, and is
+	 * currently shared, set it private via a single 2M RMP entry.
 	 */
 	if (nr_pages >= KVM_PAGES_PER_HPAGE(PG_LEVEL_2M) &&
-	    is_pfn_range_shared(pfn_aligned, pfn_aligned + PTRS_PER_PMD))
+	    IS_ALIGNED(gfn, PTRS_PER_PMD) &&
+	    IS_ALIGNED(pfn, PTRS_PER_PMD) &&
+	    is_pfn_range_shared(pfn, pfn + PTRS_PER_PMD))
 		return true;
 
 	return false;
@@ -5154,49 +5154,57 @@ static bool is_large_rmp_possible(kvm_pfn_t pfn, kvm_pfn_t nr_pages)
 int sev_gmem_make_private(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn, kvm_pfn_t nr_pages)
 {
 	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
-	kvm_pfn_t pfn_aligned;
-	gfn_t gfn_aligned;
-	int level, rc;
-	bool assigned;
+	kvm_pfn_t end;
 
 	if (!sev_snp_guest(kvm))
 		return 0;
 
-	if (WARN_ON_ONCE(nr_pages != 1))
-		return -EIO;
-
-	rc = snp_lookup_rmpentry(pfn, &assigned, &level);
-	if (rc) {
-		pr_err_ratelimited("SEV: Failed to look up RMP entry: GFN %llx PFN %llx error %d\n",
-				   gfn, pfn, rc);
-		return -ENOENT;
-	}
-
-	if (assigned) {
-		pr_debug("%s: already assigned: gfn %llx pfn %llx nr_pages %llx level %d\n",
-			 __func__, gfn, pfn, nr_pages, level);
-		return 0;
-	}
-
-	if (is_large_rmp_possible(pfn, nr_pages)) {
-		level = PG_LEVEL_2M;
-		pfn_aligned = ALIGN_DOWN(pfn, PTRS_PER_PMD);
-		gfn_aligned = ALIGN_DOWN(gfn, PTRS_PER_PMD);
-	} else {
-		level = PG_LEVEL_4K;
-		pfn_aligned = pfn;
-		gfn_aligned = gfn;
-	}
-
-	rc = rmp_make_private(pfn_aligned, gfn_to_gpa(gfn_aligned), level, sev->asid, false);
-	if (rc) {
-		pr_err_ratelimited("SEV: Failed to update RMP entry: GFN %llx PFN %llx level %d error %d\n",
-				   gfn, pfn, level, rc);
+	if (WARN_ON_ONCE(!nr_pages || pfn + nr_pages < pfn))
 		return -EINVAL;
-	}
 
-	pr_debug("%s: updated: gfn %llx pfn %llx pfn_aligned %llx nr_pages %llx level %d\n",
-		 __func__, gfn, pfn, pfn_aligned, nr_pages, level);
+	end = pfn + nr_pages;
+	while (pfn < end) {
+		kvm_pfn_t remaining = end - pfn;
+		kvm_pfn_t converted = 1;
+		int level, rc;
+		bool assigned;
+
+		rc = snp_lookup_rmpentry(pfn, &assigned, &level);
+		if (rc) {
+			pr_err_ratelimited("SEV: Failed to look up RMP entry: GFN %llx PFN %llx error %d\n",
+					   gfn, pfn, rc);
+			return -ENOENT;
+		}
+
+		if (assigned) {
+			/* Skip an already assigned 2M entry as a single unit. */
+			if (level > PG_LEVEL_4K &&
+			    IS_ALIGNED(gfn, PTRS_PER_PMD) &&
+			    IS_ALIGNED(pfn, PTRS_PER_PMD) &&
+			    remaining >= PTRS_PER_PMD)
+				converted = PTRS_PER_PMD;
+			goto next;
+		}
+
+		if (is_large_rmp_possible(gfn, pfn, remaining)) {
+			level = PG_LEVEL_2M;
+			converted = PTRS_PER_PMD;
+		} else {
+			level = PG_LEVEL_4K;
+		}
+
+		rc = rmp_make_private(pfn, gfn_to_gpa(gfn), level,
+				      sev->asid, false);
+		if (rc) {
+			pr_err_ratelimited("SEV: Failed to update RMP entry: GFN %llx PFN %llx level %d error %d\n",
+					   gfn, pfn, level, rc);
+			return -EINVAL;
+		}
+next:
+		pfn += converted;
+		gfn += converted;
+		cond_resched();
+	}
 
 	return 0;
 }
