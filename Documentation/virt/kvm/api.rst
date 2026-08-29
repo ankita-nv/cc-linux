@@ -6464,16 +6464,30 @@ that refers to it.  guest_memfd files are roughly analogous to files created
 via memfd_create(), e.g. guest_memfd files live in RAM, have volatile storage,
 and are automatically released when the last reference is dropped.  Unlike
 "regular" memfd_create() files, guest_memfd files are bound to their owning
-virtual machine (see below), cannot be mapped, read, or written by userspace,
-and cannot be resized  (guest_memfd files do however support PUNCH_HOLE).
+virtual machine (see below), cannot be resized, and cannot be accessed with
+read(2) or write(2).  They can be mapped only when ``GUEST_MEMFD_FLAG_MMAP``
+is specified, and only shared pages can be faulted into such a userspace
+mapping.  guest_memfd files also support fallocate(2) with
+``FALLOC_FL_KEEP_SIZE`` to preallocate memory, with optional
+``FALLOC_FL_PUNCH_HOLE`` to discard it.
 
 ::
 
   struct kvm_create_guest_memfd {
 	__u64 size;
 	__u64 flags;
-	__u64 reserved[6];
+	__u8 page_order;
+	__u8 reserve8;
+	__u16 reserve16;
+	__u32 reserve32;
+	__u64 reserved[5];
   };
+
+``reserve8``, ``reserve16``, ``reserve32``, and ``reserved`` must be zero.
+``page_order`` is the order of a guest_memfd folio relative to ``PAGE_SIZE``,
+i.e. the folio size is ``PAGE_SIZE << page_order``.  ``page_order`` must be
+zero unless ``GUEST_MEMFD_FLAG_HUGETLB`` is specified.  ``size`` must be
+nonzero and aligned to the resulting folio size.
 
 Conceptually, the inode backing a guest_memfd file represents physical memory,
 i.e. is coupled to the virtual machine as a thing, not to a "struct kvm".  The
@@ -6502,7 +6516,16 @@ specified via KVM_CREATE_GUEST_MEMFD.  Currently defined flags:
                                without INIT_SHARED will be marked private).
                                Shared memory can be faulted into host userspace
                                page tables. Private memory cannot.
+  GUEST_MEMFD_FLAG_HUGETLB     Back the file with HugeTLB folios. ``page_order``
+                               must be nonzero and select a HugeTLB page size
+                               supported by the running kernel. ``size`` must
+                               be aligned to that page size. This flag cannot
+                               be combined with GUEST_MEMFD_FLAG_INIT_SHARED.
   ============================ ================================================
+
+Creating a HugeTLB-backed guest_memfd reserves ``size`` bytes from the selected
+HugeTLB pool.  The offset and length of subsequent fallocate(2) operations must
+be aligned to the selected HugeTLB page size.
 
 When the KVM MMU performs a PFN lookup to service a guest fault and the backing
 guest_memfd has the GUEST_MEMFD_FLAG_MMAP set, then the fault will always be
