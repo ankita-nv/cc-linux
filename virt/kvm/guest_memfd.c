@@ -8,6 +8,7 @@
 #include <linux/mempolicy.h>
 #include <linux/pseudo_fs.h>
 #include <linux/pagemap.h>
+#include <linux/pgtable.h>
 #include <linux/string.h>
 #include <linux/swap.h>
 
@@ -1602,6 +1603,83 @@ static struct folio *__kvm_gmem_get_pfn(struct file *file,
 	return folio;
 }
 
+static bool kvm_gmem_range_has_active_attributes(struct kvm *kvm,
+						 struct kvm_memory_slot *slot,
+						 struct inode *inode,
+						 gfn_t start, gfn_t end,
+						 u64 attributes)
+{
+#ifdef CONFIG_KVM_VM_MEMORY_ATTRIBUTES
+	if (!gmem_in_place_conversion)
+		return kvm_range_has_vm_memory_attributes(kvm, start, end,
+							  KVM_MEMORY_ATTRIBUTE_PRIVATE,
+							  attributes);
+#endif
+
+	return kvm_gmem_range_has_attributes(inode,
+					     kvm_gmem_get_index(slot, start),
+					     end - start, attributes);
+}
+
+static int kvm_gmem_next_mapping_order(int max_order)
+{
+	if (PTRS_PER_PUD > 1 && max_order >= PUD_ORDER)
+		return PUD_ORDER;
+	if (PTRS_PER_PMD > 1 && max_order >= PMD_ORDER)
+		return PMD_ORDER;
+
+	return 0;
+}
+
+/*
+ * Clamp @max_order so that aligning @gfn and @pfn down by the resulting
+ * order describes the same range in the guest and in guest_memfd.  In
+ * particular, don't let a large stage-2 mapping or an architecture-private
+ * conversion escape the memslot binding or span a memory-attribute boundary.
+ */
+static int kvm_gmem_max_mapping_order(struct kvm *kvm,
+				      struct kvm_memory_slot *slot,
+				      struct inode *inode, struct folio *folio,
+				      gfn_t gfn, kvm_pfn_t pfn, int max_order,
+				      bool has_private_mem, bool is_private)
+{
+	gfn_t slot_end = slot->base_gfn + slot->npages;
+	u64 attributes = is_private ? KVM_MEMORY_ATTRIBUTE_PRIVATE : 0;
+
+	max_order = kvm_gmem_next_mapping_order(max_order);
+	while (max_order > 0) {
+		unsigned long nr_pages = 1UL << max_order;
+		gfn_t start = ALIGN_DOWN(gfn, nr_pages);
+		pgoff_t index;
+
+		if (start < slot->base_gfn || start + nr_pages > slot_end ||
+		    ((gfn ^ pfn) & (nr_pages - 1))) {
+			max_order = kvm_gmem_next_mapping_order(max_order - 1);
+			continue;
+		}
+
+		index = kvm_gmem_get_index(slot, start);
+		if (index < folio->index ||
+		    index + nr_pages > folio->index + folio_nr_pages(folio)) {
+			max_order = kvm_gmem_next_mapping_order(max_order - 1);
+			continue;
+		}
+
+		if (!has_private_mem)
+			break;
+
+		if (kvm_gmem_range_has_active_attributes(kvm, slot, inode,
+							 start,
+							 start + nr_pages,
+							 attributes))
+			break;
+
+		max_order = kvm_gmem_next_mapping_order(max_order - 1);
+	}
+
+	return max_order;
+}
+
 int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
 		     gfn_t gfn, kvm_pfn_t *pfn, struct page **page,
 		     int *max_order)
@@ -1609,6 +1687,8 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
 	pgoff_t index = kvm_gmem_get_index(slot, gfn);
 	bool may_restructure = false;
 	bool retry_exclusive;
+	bool has_private_mem;
+	bool is_private;
 	struct folio *folio;
 	int r = 0, __order;
 
@@ -1634,10 +1714,21 @@ retry:
 		goto out;
 	}
 
+	has_private_mem = kvm_arch_has_private_mem(kvm);
+	is_private = has_private_mem && kvm_mem_is_private(kvm, gfn);
+	*max_order = kvm_gmem_max_mapping_order(kvm, slot, file_inode(file),
+						folio, gfn, *pfn, *max_order,
+						has_private_mem, is_private);
+
 #ifdef CONFIG_HAVE_KVM_ARCH_GMEM_CONVERT
-	if (kvm_gmem_is_private_mem(file_inode(file), index))
-		r = kvm_arch_gmem_make_private(kvm, gfn, *pfn,
-					       (kvm_pfn_t)1 << *max_order);
+	if (is_private) {
+		kvm_pfn_t nr_pages = (kvm_pfn_t)1 << *max_order;
+
+		r = kvm_arch_gmem_make_private(kvm,
+					       ALIGN_DOWN(gfn, nr_pages),
+					       ALIGN_DOWN(*pfn, nr_pages),
+					       nr_pages);
+	}
 #endif
 
 	folio_unlock(folio);
