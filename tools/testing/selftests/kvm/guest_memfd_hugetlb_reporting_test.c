@@ -287,6 +287,11 @@ static void test_hugetlb_behavior(const char *hugetlb_cgroup_path, enum test_pag
 
 	memfd = memfd_create("guest_memfd_hugetlb_reporting_test",
 			     param->memfd_create_flags);
+	TEST_ASSERT(memfd >= 0, "Couldn't create memfd");
+
+	assert_stats(hugetlb_cgroup_path, test_size, 0, 0);
+
+	TEST_ASSERT_EQ(ftruncate(memfd, param->page_size), 0);
 
 	assert_stats(hugetlb_cgroup_path, test_size, 0, 0);
 
@@ -300,19 +305,16 @@ static void test_hugetlb_behavior(const char *hugetlb_cgroup_path, enum test_pag
 
 	assert_stats(hugetlb_cgroup_path, test_size, 1, 1);
 
-	munmap(mem, param->page_size);
+	TEST_ASSERT_EQ(madvise(mem, param->page_size, MADV_DONTNEED), 0);
 
 	assert_stats(hugetlb_cgroup_path, test_size, 1, 1);
 
-	madvise(mem, param->page_size, MADV_DONTNEED);
+	TEST_ASSERT_EQ(madvise(mem, param->page_size, MADV_REMOVE), 0);
 
-	assert_stats(hugetlb_cgroup_path, test_size, 1, 1);
+	assert_stats(hugetlb_cgroup_path, test_size, 0, 0);
 
-	madvise(mem, param->page_size, MADV_REMOVE);
-
-	assert_stats(hugetlb_cgroup_path, test_size, 1, 1);
-
-	close(memfd);
+	TEST_ASSERT_EQ(munmap(mem, param->page_size), 0);
+	TEST_ASSERT_EQ(close(memfd), 0);
 
 	assert_stats_at_baseline(hugetlb_cgroup_path);
 }
