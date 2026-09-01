@@ -25,6 +25,7 @@
 #include <linux/msi.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_irq.h>
 #include <linux/of_platform.h>
 #include <linux/pci.h>
 #include <linux/pci-ats.h>
@@ -33,6 +34,7 @@
 #include <linux/string_choices.h>
 #include <kunit/visibility.h>
 #include <uapi/linux/iommufd.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <linux/irq.h>
 #include <linux/msi.h>
 #include <asm/rmi_cmds.h>
@@ -5680,85 +5682,97 @@ err_remove:
 	return ERR_PTR(ret);
 }
 
-static void __arm_smmu_release_realm_irq_mapping(void *data)
+struct arm_smmu_realm_gsiv {
+	u32	gsiv;
+	int	irq;
+};
+
+static void arm_smmu_unregister_realm_gsiv(void *data)
 {
-	irq_dispose_mapping((unsigned long)data);
-}
+	struct arm_smmu_realm_gsiv *map = data;
 
-static struct irq_domain *arm_smmu_get_wired_irq_domain(struct arm_smmu_device *smmu)
-{
-	int irqs[] = {
-		smmu->combined_irq,
-		smmu->evtq.q.irq,
-		smmu->gerr_irq,
-		smmu->priq.q.irq,
-	};
-	struct irq_domain *domain = NULL;
-	struct irq_data *irq_data;
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(irqs); i++) {
-		if (irqs[i] <= 0)
-			continue;
-
-		irq_data = irq_get_irq_data(irqs[i]);
-		if (!irq_data || !irq_data->domain)
-			return ERR_PTR(-EINVAL);
-
-		if (domain && domain != irq_data->domain)
-			return ERR_PTR(-EINVAL);
-
-		domain = irq_data->domain;
+#ifdef CONFIG_ACPI
+	if (!acpi_disabled) {
+		acpi_unregister_gsi(map->gsiv);
+		return;
 	}
-
-	return domain ?: ERR_PTR(-ENXIO);
+#endif
+	irq_dispose_mapping(map->irq);
 }
 
-static int arm_smmu_map_realm_irq(struct arm_smmu_device *smmu,
-				  struct irq_domain *domain,
-				  irq_hw_number_t hwirq, int *irq,
-				  bool *mapping_created)
+/*
+ * RMI_PSMMU_INFO reports the Realm wired interrupts as GIC INTIDs (GSIVs).
+ * They are not hwirqs of the domain serving the non-secure SMMU interrupts,
+ * which may be an MSI domain, so map them as rising-edge GIC SPIs.
+ */
+static int arm_smmu_register_realm_gsiv(struct arm_smmu_device *smmu,
+					u32 gsiv)
 {
+	struct irq_fwspec fwspec = {};
+	struct device_node *parent;
 	unsigned int virq;
-	bool existing;
-	int ret;
 
-	existing = irq_find_mapping(domain, hwirq);
-	virq = irq_create_mapping(domain, hwirq);
-	if (!virq)
+#ifdef CONFIG_ACPI
+	if (!acpi_disabled)
+		return acpi_register_gsi(NULL, gsiv, ACPI_EDGE_SENSITIVE,
+					 ACPI_ACTIVE_HIGH);
+#endif
+	if (!smmu->dev->of_node)
+		return -ENODEV;
+
+	if (gsiv >= 32 && gsiv < 1020) {
+		fwspec.param[0] = GIC_SPI;
+		fwspec.param[1] = gsiv - 32;
+	} else if (gsiv >= 4096 && gsiv < 5120) {
+		fwspec.param[0] = GIC_ESPI;
+		fwspec.param[1] = gsiv - 4096;
+	} else {
+		return -EINVAL;
+	}
+	fwspec.param[2] = IRQ_TYPE_EDGE_RISING;
+	fwspec.param_count = 3;
+
+	parent = of_irq_find_parent(smmu->dev->of_node);
+	if (!parent)
+		return -ENODEV;
+
+	fwspec.fwnode = of_fwnode_handle(parent);
+	virq = irq_create_fwspec_mapping(&fwspec);
+	of_node_put(parent);
+
+	return virq ? virq : -EINVAL;
+}
+
+static int arm_smmu_map_realm_gsiv(struct arm_smmu_device *smmu, u32 gsiv,
+				   int *irq)
+{
+	struct arm_smmu_realm_gsiv *map;
+	int virq;
+
+	if (!gsiv)
 		return -EINVAL;
 
-	if (!existing) {
-		ret = devm_add_action_or_reset(smmu->dev,
-					       __arm_smmu_release_realm_irq_mapping,
-					       (void *)(unsigned long)virq);
-		if (ret)
-			return ret;
-		if (mapping_created)
-			*mapping_created = true;
+	map = devm_kzalloc(smmu->dev, sizeof(*map), GFP_KERNEL);
+	if (!map)
+		return -ENOMEM;
+
+	virq = arm_smmu_register_realm_gsiv(smmu, gsiv);
+	if (virq < 0) {
+		devm_kfree(smmu->dev, map);
+		return virq;
 	}
 
+	map->gsiv = gsiv;
+	map->irq = virq;
 	*irq = virq;
-	return 0;
-}
 
-static void arm_smmu_release_realm_irq_mapping(struct arm_smmu_device *smmu,
-					       int *irq, bool mapping_created)
-{
-	void *data = (void *)(unsigned long)*irq;
-
-	if (mapping_created)
-		devm_release_action(smmu->dev,
-				    __arm_smmu_release_realm_irq_mapping, data);
-
-	*irq = 0;
+	return devm_add_action_or_reset(smmu->dev,
+					arm_smmu_unregister_realm_gsiv, map);
 }
 
 static int arm_smmu_rmm_device_probe(struct arm_smmu_device *smmu)
 {
-	struct irq_domain *domain;
 	unsigned long flags, irq_cfg;
-	bool gerr_mapping_created = false;
 	int ret;
 
 	struct rmi_psmmu_info *psmmu_info __free(free_page) =
@@ -5784,23 +5798,15 @@ static int arm_smmu_rmm_device_probe(struct arm_smmu_device *smmu)
 
 	switch (irq_cfg) {
 	case RMI_PSMMU_IRQCFG_IRQ_WIRED:
-		domain = arm_smmu_get_wired_irq_domain(smmu);
-		if (IS_ERR(domain))
-			return dev_err_probe(smmu->dev, PTR_ERR(domain),
-					     "failed to find wired IRQ domain\n");
-
-		ret = arm_smmu_map_realm_irq(smmu, domain,
-					     psmmu_info->gerror_intr_num,
-					     &smmu->realm.gerr_irq,
-					     &gerr_mapping_created);
+		ret = arm_smmu_map_realm_gsiv(smmu, psmmu_info->gerror_intr_num,
+					      &smmu->realm.gerr_irq);
 		if (ret)
 			goto err_mapping;
 
-		ret = arm_smmu_map_realm_irq(smmu, domain,
-					     psmmu_info->eventq_intr_num,
-					     &smmu->realm.evtq_irq, NULL);
+		ret = arm_smmu_map_realm_gsiv(smmu, psmmu_info->eventq_intr_num,
+					      &smmu->realm.evtq_irq);
 		if (ret)
-			goto err_release_gerr_mapping;
+			goto err_mapping;
 		break;
 	case RMI_PSMMU_IRQCFG_IRQ_MSI:
 		smmu->features |= ARM_SMMU_FEAT_RME_MSI;
@@ -5813,10 +5819,9 @@ static int arm_smmu_rmm_device_probe(struct arm_smmu_device *smmu)
 	smmu->features |= ARM_SMMU_FEAT_RME_IRQ;
 	return 0;
 
-err_release_gerr_mapping:
-	arm_smmu_release_realm_irq_mapping(smmu, &smmu->realm.gerr_irq,
-					   gerr_mapping_created);
 err_mapping:
+	smmu->realm.gerr_irq = 0;
+	smmu->realm.evtq_irq = 0;
 	return dev_err_probe(smmu->dev, ret,
 			     "failed to map Realm IRQ\n");
 }
