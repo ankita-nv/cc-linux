@@ -358,12 +358,20 @@ redo_communicate:
 	return 0;
 }
 
+/*
+ * RMI_BUSY is a transient refusal (DEN0137 SSRHCJ), not a device error: retry
+ * until it clears, aborting only if it makes no progress for this long.
+ */
+#define CCA_DEV_COMM_BUSY_TIMEOUT_MS	10000U
+
 static int do_dev_communicate(enum dev_comm_type type,
 		struct pci_tsm *tsm, struct cca_host_tdi *host_tdi,
 		unsigned long error_state, int *stream_wait)
 {
 	int ret, state;
 	unsigned long rmi_ret;
+	unsigned long busy_deadline = jiffies +
+			msecs_to_jiffies(CCA_DEV_COMM_BUSY_TIMEOUT_MS);
 	struct rmi_dev_comm_enter *io_enter;
 	struct cca_host_pdev_dsc *pdev_dsc = to_cca_pdev_dsc(tsm->dsm_dev);
 
@@ -374,6 +382,10 @@ static int do_dev_communicate(enum dev_comm_type type,
 		*stream_wait = 0;
 
 	ret = _do_dev_communicate(type, tsm, host_tdi, stream_wait);
+	while (ret == -EBUSY && time_before(jiffies, busy_deadline)) {
+		cond_resched();
+		ret = _do_dev_communicate(type, tsm, host_tdi, stream_wait);
+	}
 	if (ret) {
 		if (type == PDEV_COMMUNICATE)
 			rmi_pdev_abort(virt_to_phys(pdev_dsc->rmm_pdev));
@@ -408,13 +420,30 @@ static int wait_for_dev_state(enum dev_comm_type type, struct pci_tsm *tsm,
 		struct cca_host_tdi *host_tdi, unsigned long target_state,
 		unsigned long error_state)
 {
-	int state;
+	int state, prev_state = -1;
 
 	do {
 		state = do_dev_communicate(type, tsm, host_tdi, error_state, NULL);
 
 		if (state == target_state || state == error_state)
 			return state;
+
+		/*
+		 * do_dev_communicate() returns only once the round is complete
+		 * (RmiDevCommExitFlags clear), so an unchanged non-terminal
+		 * state means the RMM is parked awaiting an out-of-band Host
+		 * action this generic waiter cannot supply (e.g. a KROU
+		 * refresh/purge). Re-polling is deterministic and will not
+		 * advance, so give up rather than spin.
+		 */
+		if (state == prev_state) {
+			pci_err(tsm->pdev,
+				"device parked in state %d waiting for %lu, no pending communication; giving up\n",
+				state, target_state);
+			return error_state;
+		}
+		prev_state = state;
+		cond_resched();
 	} while (1);
 
 	/* can't reach */
@@ -860,14 +889,30 @@ redo_communicate:
 
 		mutex_unlock(&pdev_dsc->object_lock);
 
-		/* Wait for peer to make matching progress */
+		/*
+		 * Wait for the peer to match our target, but break too if it
+		 * stopped participating (done[]): its counter is then frozen and
+		 * would never reach the target. If it left short, bail and let
+		 * submit_stream_work()'s completion check report the failure.
+		 */
 		wait_event(stream_work->sync->wq,
-			   atomic_read(&stream_work->sync->val[peer_index]) >= target);
+			   atomic_read(&stream_work->sync->val[peer_index]) >= target ||
+			   atomic_read(&stream_work->sync->done[peer_index]));
+		if (atomic_read(&stream_work->sync->val[peer_index]) < target) {
+			atomic_set(&stream_work->sync->done[my_index], 1);
+			wake_up_all(&stream_work->sync->wq);
+			return;
+		}
 		goto redo_communicate;
 	}
 
-	/* Signal peer if it is waiting on me */
+	/*
+	 * Done (completed or errored): bump the counter to its final value
+	 * before latching done[] so a waiting peer sees the final count and can
+	 * tell whether we matched its target.
+	 */
 	atomic_inc_return(&stream_work->sync->val[my_index]);
+	atomic_set(&stream_work->sync->done[my_index], 1);
 	wake_up_all(&stream_work->sync->wq);
 
 	mutex_unlock(&pdev_dsc->object_lock);
@@ -886,6 +931,8 @@ static int submit_stream_work(struct pci_dev *pdev1, struct pci_dev *pdev2,
 	init_waitqueue_head(&sync.wq);
 	atomic_set(&sync.val[0], 0);
 	atomic_set(&sync.val[1], 0);
+	atomic_set(&sync.done[0], 0);
+	atomic_set(&sync.done[1], 0);
 
 	pdev_dsc1 = to_cca_pdev_dsc(pdev1);
 	INIT_WORK_ONSTACK(&stream_work_pdev1.work, stream_connect_workfn);

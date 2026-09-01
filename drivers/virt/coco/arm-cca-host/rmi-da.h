@@ -43,6 +43,8 @@ struct dev_comm_work {
 struct stream_sync {
 	wait_queue_head_t wq;
 	atomic_t val[2];
+	/* Set once by each side when it stops participating (done or error). */
+	atomic_t done[2];
 };
 
 struct stream_connect_work {
