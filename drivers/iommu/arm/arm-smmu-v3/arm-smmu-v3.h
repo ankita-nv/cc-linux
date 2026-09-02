@@ -1093,6 +1093,7 @@ struct arm_smmu_nested_domain {
 	struct iommu_domain domain;
 	struct arm_vsmmu *vsmmu;
 	bool enable_ats : 1;
+	bool use_bypass_eats : 1;
 
 	__le64 ste[2];
 };

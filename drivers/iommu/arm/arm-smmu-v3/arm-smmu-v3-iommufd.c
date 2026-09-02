@@ -166,6 +166,7 @@ static int arm_smmu_attach_dev_nested(struct iommu_domain *domain,
 		.ssid = IOMMU_NO_PASID,
 	};
 	struct arm_smmu_ste ste;
+	unsigned int cfg;
 	int ret;
 
 	if (nested_domain->vsmmu->smmu != master->smmu)
@@ -181,9 +182,14 @@ static int arm_smmu_attach_dev_nested(struct iommu_domain *domain,
 	 * become incoherent. Since we can't access the actual virtual PCI ATS
 	 * config bit here base this off the EATS value in the STE. If the EATS
 	 * is set then the VM must generate ATC flushes.
+	 *
+	 * Bypass normally retains the automatic ATS policy. Userspace can opt in
+	 * to controlling it with EATS when mirroring a virtual ATS enable bit.
 	 */
-	if (FIELD_GET(STRTAB_STE_0_CFG, le64_to_cpu(nested_domain->ste[0])) ==
-	    STRTAB_STE_0_CFG_S1_TRANS)
+	cfg = FIELD_GET(STRTAB_STE_0_CFG, le64_to_cpu(nested_domain->ste[0]));
+	if (cfg == STRTAB_STE_0_CFG_S1_TRANS ||
+	    (cfg == STRTAB_STE_0_CFG_BYPASS &&
+	     nested_domain->use_bypass_eats))
 		state.disable_ats = !nested_domain->enable_ats;
 	ret = arm_smmu_attach_prepare(&state, domain);
 	if (ret) {
@@ -210,12 +216,14 @@ static const struct iommu_domain_ops arm_smmu_nested_ops = {
 };
 
 static int arm_smmu_validate_vste(struct iommu_hwpt_arm_smmuv3 *arg,
-				  bool *enable_ats)
+				  bool use_bypass_eats, bool *enable_ats)
 {
 	unsigned int eats;
 	unsigned int cfg;
 
 	if (!(arg->ste[0] & cpu_to_le64(STRTAB_STE_0_V))) {
+		if (use_bypass_eats)
+			return -EINVAL;
 		memset(arg->ste, 0, sizeof(arg->ste));
 		return 0;
 	}
@@ -229,6 +237,8 @@ static int arm_smmu_validate_vste(struct iommu_hwpt_arm_smmuv3 *arg,
 	if (cfg != STRTAB_STE_0_CFG_ABORT && cfg != STRTAB_STE_0_CFG_BYPASS &&
 	    cfg != STRTAB_STE_0_CFG_S1_TRANS)
 		return -EIO;
+	if (use_bypass_eats && cfg != STRTAB_STE_0_CFG_BYPASS)
+		return -EINVAL;
 
 	/*
 	 * Only Full ATS or ATS UR is supported
@@ -239,7 +249,7 @@ static int arm_smmu_validate_vste(struct iommu_hwpt_arm_smmuv3 *arg,
 	if (eats != STRTAB_STE_1_EATS_ABT && eats != STRTAB_STE_1_EATS_TRANS)
 		return -EIO;
 
-	if (cfg == STRTAB_STE_0_CFG_S1_TRANS)
+	if (cfg == STRTAB_STE_0_CFG_S1_TRANS || use_bypass_eats)
 		*enable_ats = (eats == STRTAB_STE_1_EATS_TRANS);
 	return 0;
 }
@@ -251,6 +261,7 @@ arm_vsmmu_alloc_domain_nested(struct iommufd_viommu *viommu, u32 flags,
 	struct arm_vsmmu *vsmmu = container_of(viommu, struct arm_vsmmu, core);
 	struct arm_smmu_nested_domain *nested_domain;
 	struct iommu_hwpt_arm_smmuv3 arg;
+	bool use_bypass_eats;
 	bool enable_ats = false;
 	int ret;
 
@@ -261,8 +272,12 @@ arm_vsmmu_alloc_domain_nested(struct iommufd_viommu *viommu, u32 flags,
 					  IOMMU_HWPT_DATA_ARM_SMMUV3, ste);
 	if (ret)
 		return ERR_PTR(ret);
+	if (arg.flags & ~IOMMU_HWPT_ARM_SMMUV3_FLAGS_BYPASS_EATS_VALID)
+		return ERR_PTR(-EOPNOTSUPP);
+	use_bypass_eats = arg.flags &
+			  IOMMU_HWPT_ARM_SMMUV3_FLAGS_BYPASS_EATS_VALID;
 
-	ret = arm_smmu_validate_vste(&arg, &enable_ats);
+	ret = arm_smmu_validate_vste(&arg, use_bypass_eats, &enable_ats);
 	if (ret)
 		return ERR_PTR(ret);
 
@@ -273,6 +288,7 @@ arm_vsmmu_alloc_domain_nested(struct iommufd_viommu *viommu, u32 flags,
 	nested_domain->domain.type = IOMMU_DOMAIN_NESTED;
 	nested_domain->domain.ops = &arm_smmu_nested_ops;
 	nested_domain->enable_ats = enable_ats;
+	nested_domain->use_bypass_eats = use_bypass_eats;
 	nested_domain->vsmmu = vsmmu;
 	nested_domain->ste[0] = arg.ste[0];
 	nested_domain->ste[1] = arg.ste[1] & ~cpu_to_le64(STRTAB_STE_1_EATS);
