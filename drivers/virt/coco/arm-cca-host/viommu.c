@@ -460,6 +460,14 @@ int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
 			vparams->aidr = arg.aidr;
 			for (i = 0; i < ARRAY_SIZE(vparams->idr); i++)
 				vparams->idr[i] = arg.idr[i];
+			/*
+			 * bet3 split the trailing IDR slot into SMMU_IIDR
+			 * (RmiVsmmuParams §B4.6.109, FENIMORE-1601). It keeps the
+			 * same byte offset (0x50) as the old idr[7] tail, so the
+			 * iommufd uapi idr[7] layout is unchanged and existing
+			 * user space keeps working; forward its last element.
+			 */
+			vparams->iidr = arg.idr[ARRAY_SIZE(vparams->idr)];
 
 			ret = kvm_realm_register_vsmmu(kvm, viommu->obj.id,
 						       vparams);

@@ -847,11 +847,16 @@ struct rmi_vsmmu_params {
 			u64 reg_base;
 			u64 reg_top;
 			u64 aidr;
-			u64 idr[7];
+			u64 idr[6];	/* 0x20: SMMU_IDR0..IDR5 */
+			u64 iidr;	/* 0x50: SMMU_IIDR (bet3 §B4.6.109) */
 		};
 		u8 padding0[0x1000];
 	};
 };
+static_assert(offsetof(struct rmi_vsmmu_params, reg_base) == 0x08);
+static_assert(offsetof(struct rmi_vsmmu_params, idr) == 0x20);
+static_assert(offsetof(struct rmi_vsmmu_params, iidr) == 0x50);
+static_assert(sizeof(struct rmi_vsmmu_params) == SZ_4K);
 
 enum rmi_vdev_state {
 	RMI_VDEV_NEW,
