@@ -1323,7 +1323,12 @@ int cca_vsmmu_event_handle(struct pci_tsm_context *context, phys_addr_t psmmu)
 	vsmmu = kvm_realm_vsmmu_phys(host_tdi->vsmmu);
 	pdev = virt_to_phys(pdev_dsc->rmm_pdev);
 	vdev = virt_to_phys(host_tdi->rmm_vdev);
-	ret = rmi_vsmmu_event_handle(psmmu, rd, vsmmu, pdev, vdev, &event);
+	/*
+	 * bet3 RMI_VSMMU_EVENT_HANDLE no longer takes the PSMMU (FENIMORE-1568);
+	 * the RMM derives it from the VSMMU. @psmmu is still received from the
+	 * generic TSM vsmmu_event op but is not forwarded to the RMM.
+	 */
+	ret = rmi_vsmmu_event_handle(rd, vsmmu, pdev, vdev, &event);
 	if (ret)
 		return -EIO;
 

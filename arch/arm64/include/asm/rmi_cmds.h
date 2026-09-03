@@ -699,14 +699,19 @@ struct rmi_vsmmu_event_result {
 	u64 syndrome;
 };
 
+/*
+ * DEN0137 v2.0-bet3 dropped the PSMMU input from RMI_VSMMU_EVENT_HANDLE
+ * (FENIMORE-1568): the RMM derives the owning PSMMU from the VSMMU, so the
+ * host no longer forwards it. X1 now carries the RD.
+ */
 static inline unsigned long
-rmi_vsmmu_event_handle(unsigned long psmmu_phys, unsigned long rd_phys,
+rmi_vsmmu_event_handle(unsigned long rd_phys,
 		       unsigned long vsmmu_phys, unsigned long pdev_phys,
 		       unsigned long vdev_phys,
 		       struct rmi_vsmmu_event_result *event)
 {
 	struct arm_smccc_1_2_regs regs = {
-		SMC_RMI_VSMMU_EVENT_HANDLE, psmmu_phys, rd_phys, vsmmu_phys,
+		SMC_RMI_VSMMU_EVENT_HANDLE, rd_phys, vsmmu_phys,
 		pdev_phys, vdev_phys
 	};
 
