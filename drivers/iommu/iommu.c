@@ -3453,6 +3453,49 @@ out_unlock:
 	return ret ?: count;
 }
 
+/*
+ * A device entered TDISP T=0 when it was probed, but its TDISP state can
+ * change while no driver is bound. Ask the IOMMU driver again before binding
+ * one, and install a translating domain if the device has entered TDISP T=1.
+ *
+ * The driver takes ATS over in TDISP T=1, and pci_prepare_ats() refuses a
+ * device that already has ATS enabled. Disable the core-owned ATS state first
+ * and restore it if the device remains in TDISP T=0.
+ *
+ * The domain must be installed before the transition is complete. On failure,
+ * undo the driver setup and return the device to TDISP T=0 so a later bind can
+ * retry the whole transition.
+ */
+static int iommu_tdisp_enter_t1(struct device *dev)
+{
+	struct iommu_group *group = dev->iommu_group;
+	const struct iommu_ops *ops = dev_iommu_ops(dev);
+	int ret;
+
+	lockdep_assert_held(&group->mutex);
+
+	if (!iommu_using_t0_stream(dev) || !ops->tdisp_enter_t1 ||
+	    group->owner_cnt)
+		return 0;
+
+	iommu_tdisp_exit_t0(dev);
+	dev->iommu->tdisp_t1 = 1;
+
+	ret = ops->tdisp_enter_t1(dev);
+	if (ret > 0) {
+		ret = iommu_setup_default_domain(group, 0);
+		if (!ret) {
+			iommu_setup_dma_ops(dev, group->default_domain);
+			return 0;
+		}
+		dma_set_cc_private(dev, false);
+	}
+
+	dev->iommu->tdisp_t1 = 0;
+	iommu_tdisp_enter_t0(dev);
+	return ret;
+}
+
 /**
  * iommu_device_use_default_domain() - Device driver wants to handle device
  *                                     DMA through the kernel DMA API.
@@ -3483,6 +3526,10 @@ int iommu_device_use_default_domain(struct device *dev)
 			goto unlock_out;
 		}
 	}
+
+	ret = iommu_tdisp_enter_t1(dev);
+	if (ret)
+		goto unlock_out;
 
 	group->owner_cnt++;
 

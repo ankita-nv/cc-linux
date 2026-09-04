@@ -661,6 +661,10 @@ __iommu_copy_struct_to_user(const struct iommu_user_data *dst_data,
  * @domain_alloc_nested: Allocate an iommu_domain for nested translation.
  * @probe_device: Add device to iommu driver handling
  * @release_device: Remove device from iommu driver handling
+ * @tdisp_enter_t1: Ask whether a device in TDISP T=0 has entered TDISP T=1,
+ *                  and finish the setup that probe_device() omitted for it.
+ *                  The core has disabled its T=0 ATS state first. Return 1
+ *                  if it entered T=1, 0 if it remains in T=0, or an errno.
  * @probe_finalize: Do final setup work after the device is added to an IOMMU
  *                  group and attached to the groups domain
  * @device_group: find iommu group for a particular device
@@ -723,6 +727,7 @@ struct iommu_ops {
 
 	struct iommu_device *(*probe_device)(struct device *dev);
 	void (*release_device)(struct device *dev);
+	int (*tdisp_enter_t1)(struct device *dev);
 	void (*probe_finalize)(struct device *dev);
 	struct iommu_group *(*device_group)(struct device *dev);
 
