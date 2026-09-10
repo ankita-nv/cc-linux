@@ -5055,6 +5055,9 @@ static int cxl_reset_bus_function(struct pci_dev *dev, bool probe)
 	if (!dvsec)
 		return -ENOTTY;
 
+	if (dev->multifunction || pci_num_vf(dev))
+		return -ENOTTY;
+
 	if (probe)
 		return 0;
 
@@ -5081,6 +5084,9 @@ static int cxl_reset_bus_function(struct pci_dev *dev, bool probe)
 	if (reg != val)
 		pci_write_config_word(bridge, dvsec + PCI_DVSEC_CXL_PORT_CTL,
 				      reg);
+
+	if (!rc)
+		rc = cxl_restore_state_after_pci_reset(dev);
 
 	pci_dev_reset_iommu_done(dev);
 	return rc;
