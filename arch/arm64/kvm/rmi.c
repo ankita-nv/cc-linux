@@ -1194,6 +1194,22 @@ retry:
 	return 0;
 }
 
+static int realm_get_ripas(struct kvm *kvm, unsigned long addr,
+			   enum rmi_ripas *ripas)
+{
+	struct realm *realm = &kvm->arch.realm;
+	struct rtt_entry rtt_entry;
+	unsigned long rd = virt_to_phys(realm->rd);
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	if (rmi_rtt_read_entry(rd, addr, KVM_PGTABLE_LAST_LEVEL, &rtt_entry))
+		return -ENOENT;
+
+	*ripas = rtt_entry.ripas;
+	return 0;
+}
+
 static int __kvm_realm_unmap_range(struct kvm *kvm, unsigned long start,
 				   unsigned long size, bool unmap_private,
 				   bool may_block,
@@ -1201,6 +1217,7 @@ static int __kvm_realm_unmap_range(struct kvm *kvm, unsigned long start,
 {
 	unsigned long end = start + size;
 	struct realm *realm = &kvm->arch.realm;
+	enum rmi_ripas src_ripas;
 	int ret;
 
 	if (!kvm_realm_is_created(kvm))
@@ -1211,6 +1228,10 @@ static int __kvm_realm_unmap_range(struct kvm *kvm, unsigned long start,
 	ret = realm_unmap_shared_range(kvm, start, end, may_block, sro);
 	if (ret || !unmap_private)
 		return ret;
+
+	/* An unmap request won't mix different RIPAS ranges. */
+	if (!realm_get_ripas(kvm, start, &src_ripas) && src_ripas == RMI_DEV)
+		return __realm_dev_mem_unmap(kvm, start, end, may_block);
 
 	return realm_unmap_private_range(kvm, start, end, may_block, sro);
 }
