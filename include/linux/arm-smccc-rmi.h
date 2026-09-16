@@ -708,8 +708,6 @@ enum rmi_pdev_stream_type {
 	RMI_PDEV_STREAM_COH,
 	RMI_PDEV_STREAM_NCOH_SYS,
 	RMI_PDEV_STREAM_COH_SYS,
-	RMI_PDEV_STREAM_NCOH_P2P,
-	RMI_PDEV_STREAM_COH_CMEM,
 };
 
 struct rmi_addr_range {
@@ -722,20 +720,20 @@ struct rmi_pdev_stream_params {
 		struct {
 			u64 flags;
 			union {
-				u8 type;
-				u8 padding1[8];
+				u8 stream_type;
+				u8 padding0[8];
 			};
 			u64 pdev_1;
 			u64 pdev_2;
 			u64 ide_sid;
 			u64 num_addr_range;
 		};
-		u8 padding2[0x100];
+		u8 padding1[0x100];
 	};
 
 	union { /* 0x100 */
 		struct rmi_addr_range addr_range[MAX_STREAM_ADDR_RANGE];
-		u8 padding3[0xF00];
+		u8 padding2[0xF00];
 	};
 };
 

@@ -236,7 +236,7 @@ static int cca_pdev_create_ncoh_stream(struct pci_dev *pdev, unsigned long strea
 	}
 
 	params->flags = 0;
-	params->type = RMI_PDEV_STREAM_NCOH;
+	params->stream_type = RMI_PDEV_STREAM_NCOH;
 	params->pdev_1 = virt_to_phys(pf0_ep_dsc->pdev.rmm_pdev);
 	params->pdev_2 = virt_to_phys(rp_dsc->pdev.rmm_pdev);
 	params->ide_sid = stream_id;
@@ -264,7 +264,7 @@ static int cca_pdev_create_ncoh_sys_stream(struct pci_dev *pdev)
 		return -ENOMEM;
 
 	params->flags = 0;
-	params->type = RMI_PDEV_STREAM_NCOH_SYS;
+	params->stream_type = RMI_PDEV_STREAM_NCOH_SYS;
 	params->pdev_1 = virt_to_phys(pf0_ep_dsc->pdev.rmm_pdev);
 	params->pdev_2 = 0; /* ignored */
 	params->ide_sid = 0; /* ignored */
