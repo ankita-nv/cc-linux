@@ -17,6 +17,7 @@
 
 #include <asm/kvm_emulate.h>
 #include <asm/rmi_cmds.h>
+#include <uapi/asm/rmi-da.h>
 
 #include "rmi-da.h"
 
@@ -250,8 +251,10 @@ static ssize_t cca_vdevice_tsm_req(struct iommufd_vdevice *vdev,
 {
 	struct cca_vdevice *cca_vdev =
 		container_of(vdev, struct cca_vdevice, core);
+	struct cca_host_tdi *host_tdi = &cca_vdev->host_tdi;
 	struct pci_tsm_context *context = cca_vdev->tsm_context;
 	struct pci_tsm_pf0 *pf0;
+	struct pci_dev *pdev;
 
 	(void)tsm_code;
 	if (!context)
@@ -260,9 +263,21 @@ static ssize_t cca_vdevice_tsm_req(struct iommufd_vdevice *vdev,
 		return -EINVAL;
 	if (info->req.is_kernel || info->resp.is_kernel)
 		return -EINVAL;
+
+	pdev = to_pci_dev(iommufd_vdevice_to_device(vdev));
 	pf0 = pci_tsm_context_pf0(context);
 	guard(mutex)(&pf0->lock);
 	switch (info->op) {
+	case TSM_REQ_VALIDATE_MMIO: {
+		struct arm64_vdev_validate_mmio_guest_req req;
+
+		if (info->req_len != sizeof(req))
+			return -EINVAL;
+		if (copy_from_sockptr(&req, info->req, sizeof(req)))
+			return -EFAULT;
+		return cca_vdev_device_map(host_tdi, pdev, req.gpa_base,
+					  req.gpa_top, req.pa_base);
+	}
 	default:
 		return -EINVAL;
 	}
