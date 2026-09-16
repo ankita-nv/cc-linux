@@ -4,7 +4,9 @@
  */
 
 #include <linux/arm-smccc-rmi.h>
+#include <linux/arm-smmu-v3.h>
 #include <linux/interrupt.h>
+#include <linux/msi.h>
 
 #include <asm/rmi_cmds.h>
 
@@ -131,4 +133,50 @@ void arm_smmu_setup_realm_irqs(struct arm_smmu_device *smmu)
 			dev_warn(smmu->dev, "no realm priq irq - PRI will be broken\n");
 		}
 	}
+}
+
+static int get_irq_data(int irq, u64 *msi_addr, u64 *msi_data)
+{
+	struct msi_desc *desc;
+
+	desc = irq_get_msi_desc(irq);
+	if (!desc)
+		return -EINVAL;
+
+	*msi_addr = (((u64)desc->msg.address_hi) << 32) | desc->msg.address_lo;
+	*msi_data = desc->msg.data;
+	return 0;
+}
+
+int arm_smmu_get_realm_params(struct device *dev,
+			      struct arm_smmu_realm_params *params)
+{
+	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
+	struct arm_smmu_device *smmu;
+
+	if (!master || !params)
+		return -EINVAL;
+	smmu = master->smmu;
+	if (!(smmu->features & ARM_SMMU_FEAT_RME))
+		return -EOPNOTSUPP;
+
+	memset(params, 0, sizeof(*params));
+	params->psmmu_phys = smmu->base_phys;
+	params->l2_sid = ALIGN_DOWN(master->streams[0].id,
+				    STRTAB_NUM_L2_STES);
+
+	/* No ATS and PRI support */
+	if (!(smmu->features & ARM_SMMU_FEAT_RME_MSI)) {
+		params->irq_flags = RMI_PSMMU_IRQCFG_IRQ_WIRED;
+		return 0;
+	}
+
+	params->irq_flags = RMI_PSMMU_IRQCFG_IRQ_MSI;
+	if (get_irq_data(smmu->realm.gerr_irq,
+			 &params->gerr_addr, &params->gerr_data))
+		return -EINVAL;
+	if (get_irq_data(smmu->realm.evtq_irq,
+			 &params->eventq_addr, &params->eventq_data))
+		return -EINVAL;
+	return 0;
 }

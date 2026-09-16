@@ -13,6 +13,7 @@
 #include <linux/iommufd.h>
 #include <linux/kernel.h>
 #include <linux/mmzone.h>
+#include <linux/refcount.h>
 #include <linux/sizes.h>
 
 struct arm_smmu_device;
@@ -1292,6 +1293,12 @@ size_t arm_smmu_get_viommu_size(struct device *dev,
 int arm_vsmmu_init(struct iommufd_viommu *viommu,
 		   struct iommu_domain *parent_domain,
 		   const struct iommu_user_data *user_data);
+int arm_smmu_viommu_validate_parent(struct device *dev,
+				     enum iommu_viommu_type viommu_type,
+				     struct iommu_domain *parent_domain);
+int arm_smmu_viommu_get_params(struct device *dev,
+			       enum iommu_viommu_type viommu_type,
+			       void *params, size_t params_size);
 int arm_smmu_attach_prepare_vmaster(struct arm_smmu_attach_state *state,
 				    struct arm_smmu_nested_domain *nested_domain);
 void arm_smmu_attach_commit_vmaster(struct arm_smmu_attach_state *state);
@@ -1306,6 +1313,8 @@ int arm_vsmmu_cache_invalidate(struct iommufd_viommu *viommu,
 #define arm_smmu_get_viommu_size NULL
 #define arm_smmu_hw_info NULL
 #define arm_vsmmu_init NULL
+#define arm_smmu_viommu_validate_parent NULL
+#define arm_smmu_viommu_get_params NULL
 #define arm_vsmmu_alloc_domain_nested NULL
 #define arm_vsmmu_cache_invalidate NULL
 
@@ -1334,4 +1343,8 @@ static inline int arm_vmaster_report_event(struct arm_smmu_vmaster *vmaster,
 #endif /* CONFIG_ARM_SMMU_V3_IOMMUFD */
 
 void arm_smmu_setup_realm_irqs(struct arm_smmu_device *smmu);
+struct arm_smmu_realm_params;
+int arm_smmu_get_realm_params(struct device *dev,
+			      struct arm_smmu_realm_params *params);
+
 #endif /* _ARM_SMMU_V3_H */
