@@ -435,6 +435,9 @@ struct iommu_user_data {
 	size_t len;
 };
 
+int iommu_viommu_validate_parent(struct device *dev,
+		enum iommu_viommu_type type, struct iommu_domain *parent_domain);
+
 /**
  * struct iommu_user_data_array - iommu driver specific user space data array
  * @type: The data type of all the entries in the user buffer array
@@ -679,6 +682,8 @@ __iommu_copy_struct_to_user(const struct iommu_user_data *dst_data,
  *               resources shared/passed to user space IOMMU instance. Associate
  *               it with a nesting @parent_domain. It is required for driver to
  *               set @viommu->ops pointing to its own viommu_ops
+ * @viommu_validate_parent: Validate that @parent_domain is compatible with
+ *                          @dev for @viommu_type.
  * @owner: Driver module providing these ops
  * @identity_domain: An always available, always attachable identity
  *                   translation.
@@ -734,6 +739,9 @@ struct iommu_ops {
 	int (*viommu_init)(struct iommufd_viommu *viommu,
 			   struct iommu_domain *parent_domain,
 			   const struct iommu_user_data *user_data);
+	int (*viommu_validate_parent)(struct device *dev,
+				      enum iommu_viommu_type viommu_type,
+				      struct iommu_domain *parent_domain);
 
 	/*
 	 * Per device MPAM QoS hooks. Both operate on a single device so the

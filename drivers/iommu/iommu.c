@@ -47,6 +47,17 @@ static unsigned int iommu_def_domain_type __read_mostly;
 static bool iommu_dma_strict __read_mostly = IS_ENABLED(CONFIG_IOMMU_DEFAULT_DMA_STRICT);
 static u32 iommu_cmd_line __read_mostly;
 
+int iommu_viommu_validate_parent(struct device *dev,
+		enum iommu_viommu_type type, struct iommu_domain *parent_domain)
+{
+	const struct iommu_ops *ops = dev_iommu_ops(dev);
+
+	if (!ops->viommu_validate_parent)
+		return -EOPNOTSUPP;
+	return ops->viommu_validate_parent(dev, type, parent_domain);
+}
+EXPORT_SYMBOL_GPL(iommu_viommu_validate_parent);
+
 /* Tags used with xa_tag_pointer() in group->pasid_array */
 enum { IOMMU_PASID_ARRAY_DOMAIN = 0, IOMMU_PASID_ARRAY_HANDLE = 1 };
 
