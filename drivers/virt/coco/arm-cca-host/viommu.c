@@ -31,12 +31,24 @@ struct cca_viommu {
 	struct cca_psmmu *psmmu;
 };
 
+struct cca_vdevice {
+	struct iommufd_vdevice core;
+	struct pci_tsm_context *tsm_context;
+	struct cca_host_tdi host_tdi;
+	u32 l2_sid;
+};
+
 static LIST_HEAD(cca_psmmus);
 static DEFINE_MUTEX(cca_psmmus_lock);
 
 static struct cca_viommu *to_cca_viommu(struct iommufd_viommu *viommu)
 {
 	return container_of(viommu, struct cca_viommu, core);
+}
+
+static struct tsm_dev *cca_viommu_tsm_dev(struct iommufd_viommu *viommu)
+{
+	return viommu->provider_data;
 }
 
 static struct cca_psmmu *
@@ -98,3 +110,192 @@ static void cca_psmmu_put(struct cca_psmmu *psmmu)
 	list_del(&psmmu->node);
 	kfree(psmmu);
 }
+
+static void cca_viommu_destroy(struct iommufd_viommu *viommu)
+{
+	struct cca_viommu *cca = to_cca_viommu(viommu);
+
+	if (cca->psmmu)
+		cca_psmmu_put(cca->psmmu);
+}
+
+static int cca_psmmu_create_l2(struct cca_psmmu *psmmu, u32 l2_sid)
+{
+	unsigned long rmi_ret = 0;
+	int ret;
+
+	guard(mutex)(&cca_psmmus_lock);
+	ret = rmi_psmmu_st_l2_create(psmmu->phys, l2_sid, &rmi_ret);
+	if (!ret && !rmi_ret)
+		return 0;
+	if (RMI_RETURN_STATUS(rmi_ret) == RMI_ERROR_PSMMU_ST &&
+	    RMI_RETURN_INDEX(rmi_ret) == 2)
+		return 0;
+	return -EIO;
+}
+
+static void cca_psmmu_destroy_l2(struct cca_psmmu *psmmu, u32 l2_sid,
+				 struct device *dev)
+{
+	unsigned long rmi_ret = 0;
+	int ret;
+
+	guard(mutex)(&cca_psmmus_lock);
+	ret = rmi_psmmu_st_l2_destroy(psmmu->phys, l2_sid, &rmi_ret);
+	if (!ret && !rmi_ret)
+		return;
+	if (RMI_RETURN_STATUS(rmi_ret) == RMI_ERROR_PSMMU_ST &&
+	    RMI_RETURN_INDEX(rmi_ret) == 2)
+		return;
+	dev_warn(dev, "failed to destroy Realm stream mapping\n");
+}
+
+static void cca_vdevice_destroy(struct iommufd_vdevice *vdev)
+{
+	struct cca_vdevice *cca_vdev =
+		container_of(vdev, struct cca_vdevice, core);
+	struct cca_viommu *cca = to_cca_viommu(vdev->viommu);
+	struct device *dev = iommufd_vdevice_to_device(vdev);
+	struct pci_tsm_context *context = cca_vdev->tsm_context;
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct pci_tsm_pf0 *pf0 = pci_tsm_context_pf0(context);
+	struct pci_dev *dsm_dev = pci_tsm_context_dsm_dev(context);
+	struct cca_host_tdi *host_tdi = &cca_vdev->host_tdi;
+	struct realm *realm = &host_tdi->kvm->arch.realm;
+
+	scoped_guard(mutex, &pf0->lock) {
+		cca_vdev_destroy(host_tdi, realm, pdev, dsm_dev);
+		kvfree(host_tdi->interface_report);
+		kvfree(host_tdi->measurements);
+		cca_psmmu_destroy_l2(cca->psmmu, cca_vdev->l2_sid, dev);
+	}
+	pci_tsm_context_put(context);
+}
+
+static int cca_vdevice_init(struct iommufd_vdevice *vdev)
+{
+	struct cca_vdevice *cca_vdev =
+		container_of(vdev, struct cca_vdevice, core);
+	struct arm_smmu_realm_params params;
+	struct cca_viommu *cca = to_cca_viommu(vdev->viommu);
+	struct cca_psmmu *psmmu = cca->psmmu;
+	struct device *dev = iommufd_vdevice_to_device(vdev);
+	struct tsm_dev *tsm_dev = cca_viommu_tsm_dev(vdev->viommu);
+	struct pci_tsm_context *context;
+	struct pci_dev *pdev;
+	struct pci_tsm_pf0 *pf0;
+	struct pci_dev *dsm_dev;
+	struct cca_host_tdi *host_tdi = &cca_vdev->host_tdi;
+	struct kvm *kvm = vdev->viommu->kvm_file->private_data;
+	void *rmm_vdev;
+	int ret;
+
+	if (!dev_is_pci(dev))
+		return 0;
+	/* Devices without a Link TSM remain ordinary vdevices. */
+	pdev = to_pci_dev(dev);
+	context = pci_tsm_context_get(pdev);
+	if (IS_ERR(context)) {
+		if (PTR_ERR(context) == -EOPNOTSUPP)
+			return 0;
+		return PTR_ERR(context);
+	}
+	if (pci_tsm_context_tsm_dev(context) != tsm_dev) {
+		ret = -EXDEV;
+		goto out_put_context;
+	}
+
+	ret = iommu_viommu_get_params(dev,
+		IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3, &params,
+		sizeof(params));
+	if (ret)
+		goto out_put_context;
+	if (params.psmmu_phys != psmmu->phys) {
+		ret = -EINVAL;
+		goto out_put_context;
+	}
+
+	host_tdi->kvm = kvm;
+	cca_vdev->l2_sid = params.l2_sid;
+	pf0 = pci_tsm_context_pf0(context);
+	dsm_dev = pci_tsm_context_dsm_dev(context);
+
+	scoped_guard(mutex, &pf0->lock) {
+		ret = cca_psmmu_create_l2(psmmu, params.l2_sid);
+		if (!ret) {
+			rmm_vdev = cca_vdev_create(host_tdi, &kvm->arch.realm,
+						   pdev, dsm_dev, vdev->virt_id);
+			if (IS_ERR_OR_NULL(rmm_vdev)) {
+				ret = rmm_vdev ? PTR_ERR(rmm_vdev) : -ENOMEM;
+				cca_psmmu_destroy_l2(psmmu, params.l2_sid, dev);
+			}
+		}
+		if (!ret)
+			pci_tsm_context_mark_bound(context);
+	}
+	if (ret)
+		goto out_put_context;
+	cca_vdev->tsm_context = context;
+	vdev->destroy = cca_vdevice_destroy;
+	return 0;
+
+out_put_context:
+	pci_tsm_context_put(context);
+	return ret;
+}
+
+static const struct iommufd_viommu_ops cca_viommu_ops = {
+	.destroy = cca_viommu_destroy,
+	.vdevice_size = VDEVICE_STRUCT_SIZE(struct cca_vdevice, core),
+	.vdevice_init = cca_vdevice_init,
+};
+
+size_t cca_viommu_get_size(struct device *dev, enum iommu_viommu_type type)
+{
+	struct arm_smmu_realm_params params;
+
+	if (type != IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3)
+		return 0;
+	if (iommu_viommu_get_params(dev, type, &params, sizeof(params)))
+		return 0;
+	return VIOMMU_STRUCT_SIZE(struct cca_viommu, core);
+}
+
+int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
+		    struct iommu_domain *parent,
+		    const struct iommu_user_data *user_data)
+{
+	struct arm_smmu_realm_params params;
+	struct cca_viommu *cca = to_cca_viommu(viommu);
+	struct cca_psmmu *psmmu;
+	struct kvm *kvm;
+	int ret;
+
+	(void)user_data;
+
+	if (viommu->type != IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3)
+		return -EOPNOTSUPP;
+	if (!viommu->kvm_file)
+		return -EINVAL;
+	kvm = viommu->kvm_file->private_data;
+	ret = kvm_realm_ensure_created(kvm);
+	if (ret)
+		return ret;
+
+	ret = iommu_viommu_validate_parent(dev, viommu->type, parent);
+	if (ret)
+		return ret;
+	ret = iommu_viommu_get_params(dev, viommu->type, &params,
+				      sizeof(params));
+	if (ret)
+		return ret;
+
+	psmmu = cca_psmmu_get(&params);
+	if (IS_ERR(psmmu))
+		return PTR_ERR(psmmu);
+	cca->psmmu = psmmu;
+	viommu->ops = &cca_viommu_ops;
+	return 0;
+}
+
+MODULE_IMPORT_NS("IOMMUFD");

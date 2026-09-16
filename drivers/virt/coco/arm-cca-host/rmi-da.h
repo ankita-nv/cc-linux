@@ -16,6 +16,11 @@
 #include <linux/atomic.h>
 #include <linux/kref.h>
 #include <linux/wait.h>
+#include <uapi/linux/iommufd.h>
+
+struct iommufd_viommu;
+struct iommu_domain;
+struct iommu_user_data;
 
 #define MAX_CACHE_OBJ_SIZE	SZ_16M
 #define CACHE_CHUNK_SIZE	SZ_4K
@@ -118,6 +123,11 @@ struct cca_host_rp_dsc {
 struct cca_host_fn_dsc {
 	struct pci_tsm pci;
 };
+
+size_t cca_viommu_get_size(struct device *dev, enum iommu_viommu_type type);
+int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
+		    struct iommu_domain *parent,
+		    const struct iommu_user_data *user_data);
 
 enum dev_comm_type {
 	PDEV_COMMUNICATE = 0x1,

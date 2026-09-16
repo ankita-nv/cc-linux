@@ -7,6 +7,7 @@ config ARM_CCA_HOST
 	depends on ARM64
 	depends on PCI
 	depends on ARM_RMM
+	depends on IOMMUFD
 	depends on HAVE_ARM_SMCCC_DISCOVERY
 	select PCI_TSM
 	select KEYS

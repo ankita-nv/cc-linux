@@ -5,6 +5,7 @@
 
 #include <linux/arm-smccc.h>
 #include <linux/arm-smccc-bus.h>
+#include <linux/iommufd.h>
 #include <linux/pci-tsm.h>
 #include <linux/pci-ide.h>
 #include <linux/module.h>
@@ -427,6 +428,24 @@ static struct pci_tsm_ops cca_link_pci_ops = {
 	.disconnect = cca_tsm_disconnect,
 };
 
+static void cca_viommu_provider_release(void *data)
+{
+	tsm_put(data);
+}
+
+static const struct iommufd_viommu_provider_ops cca_viommu_provider_ops = {
+	.owner = THIS_MODULE,
+	.type = IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3,
+	.get_size = cca_viommu_get_size,
+	.init = cca_viommu_init,
+	.release = cca_viommu_provider_release,
+};
+
+static void cca_viommu_provider_remove(void *provider)
+{
+	iommufd_unregister_viommu_provider(provider);
+}
+
 static void cca_link_tsm_remove(void *tsm_dev)
 {
 	tsm_unregister(tsm_dev);
@@ -439,7 +458,9 @@ static bool rmi_has_reg2_feature(unsigned long feature)
 
 static int cca_link_tsm_probe(struct arm_smccc_device *sdev)
 {
+	struct iommufd_viommu_provider *provider;
 	struct tsm_dev *tsm_dev;
+	int ret;
 
 	if (!rmi_has_reg2_feature(RMI_FEATURE_REGISTER_2_DA))
 		return -ENODEV;
@@ -448,8 +469,22 @@ static int cca_link_tsm_probe(struct arm_smccc_device *sdev)
 	if (IS_ERR(tsm_dev))
 		return PTR_ERR(tsm_dev);
 
-	return devm_add_action_or_reset(&sdev->dev, cca_link_tsm_remove,
-					tsm_dev);
+	ret = devm_add_action_or_reset(&sdev->dev, cca_link_tsm_remove, tsm_dev);
+	if (ret)
+		return ret;
+
+	/* Retain PCI/TSM resources until the last provider user is released. */
+	tsm_get(tsm_dev);
+	provider = iommufd_register_viommu_provider(&cca_viommu_provider_ops,
+						  tsm_dev);
+	if (IS_ERR(provider)) {
+		tsm_put(tsm_dev);
+		return PTR_ERR(provider);
+	}
+
+	/* Remove from lookup before the earlier TSM unregister action runs. */
+	return devm_add_action_or_reset(&sdev->dev, cca_viommu_provider_remove,
+					provider);
 }
 
 static const struct arm_smccc_device_id cca_link_tsm_id_table[] = {
