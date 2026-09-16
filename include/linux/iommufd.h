@@ -27,6 +27,7 @@ struct iommufd_viommu_ops;
 struct iommufd_viommu_provider;
 struct module;
 struct page;
+struct tsm_guest_req_info;
 
 /**
  * struct iommufd_viommu_provider_ops - External vIOMMU implementation
@@ -199,6 +200,7 @@ struct iommufd_hw_queue {
  *                include/uapi/linux/iommufd.h)
  *                If driver has a deinit function to revert what vdevice_init op
  *                does, it should set it to the @vdev->destroy function pointer
+ * @vdevice_tsm_req: Forward a guest TSM request to a driver-owned vDEVICE
  * @get_hw_queue_size: Get the size of a driver-defined HW queue structure for a
  *                     given @viommu corresponding to @queue_type. Driver should
  *                     return 0 if HW queue aren't supported accordingly. It is
@@ -225,6 +227,9 @@ struct iommufd_viommu_ops {
 				struct iommu_user_data_array *array);
 	const size_t vdevice_size;
 	int (*vdevice_init)(struct iommufd_vdevice *vdev);
+	ssize_t (*vdevice_tsm_req)(struct iommufd_vdevice *vdev,
+				   struct tsm_guest_req_info *info,
+				   u64 *tsm_code);
 	size_t (*get_hw_queue_size)(struct iommufd_viommu *viommu,
 				    enum iommu_hw_queue_type queue_type);
 	/* AMD's HW will add hw_queue_init simply using @hw_queue->base_addr */
