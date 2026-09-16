@@ -58,6 +58,17 @@ int iommu_viommu_validate_parent(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(iommu_viommu_validate_parent);
 
+int iommu_viommu_get_params(struct device *dev,
+		enum iommu_viommu_type type, void *params, size_t params_size)
+{
+	const struct iommu_ops *ops = dev_iommu_ops(dev);
+
+	if (!ops->viommu_get_params)
+		return -EOPNOTSUPP;
+	return ops->viommu_get_params(dev, type, params, params_size);
+}
+EXPORT_SYMBOL_GPL(iommu_viommu_get_params);
+
 /* Tags used with xa_tag_pointer() in group->pasid_array */
 enum { IOMMU_PASID_ARRAY_DOMAIN = 0, IOMMU_PASID_ARRAY_HANDLE = 1 };
 
