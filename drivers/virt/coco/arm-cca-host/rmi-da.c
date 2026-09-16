@@ -440,17 +440,14 @@ static int parse_certificate_chain(struct pci_tsm *tsm)
 
 		/* The key in the last cert in the chain is used */
 		if (offset + cert_len == chain_size) {
+			char *signature_algorithm __free(kfree) = NULL;
 			void *public_key __free(kfree) =
 				kzalloc(cert->pub->keylen, GFP_KERNEL);
 
 			if (!public_key)
 				return -ENOMEM;
 
-			if (!strcmp("ecdsa-nist-p256", cert->pub->pkey_algo)) {
-				pf0_ep_dsc->rmi_signature_algorithm = RMI_SIG_ECDSA_P256;
-			} else if (!strcmp("ecdsa-nist-p384", cert->pub->pkey_algo)) {
-				pf0_ep_dsc->rmi_signature_algorithm = RMI_SIG_ECDSA_P384;
-			} else if (!strcmp("rsa", cert->pub->pkey_algo)) {
+			if (!strcmp("rsa", cert->pub->pkey_algo)) {
 				struct rsa_key rsa_key = {0};
 				size_t skip = 0;
 				int ret;
@@ -466,13 +463,18 @@ static int parse_certificate_chain(struct pci_tsm *tsm)
 				/* check we have 3072 bits len */
 				if ((rsa_key.n_sz - skip) != (3072 >> 3))
 					return -EINVAL;
-
-				pf0_ep_dsc->rmi_signature_algorithm = RMI_SIG_RSASSA_3072;
-			} else {
+			} else if (strcmp("ecdsa-nist-p256", cert->pub->pkey_algo) &&
+				   strcmp("ecdsa-nist-p384", cert->pub->pkey_algo)) {
 				return -EINVAL;
 			}
 
+			signature_algorithm = kstrdup(cert->pub->pkey_algo, GFP_KERNEL);
+			if (!signature_algorithm)
+				return -ENOMEM;
+
 			memcpy(public_key, cert->pub->key, cert->pub->keylen);
+			pf0_ep_dsc->rmi_signature_algorithm =
+				no_free_ptr(signature_algorithm);
 			pf0_ep_dsc->cert_chain.public_key = no_free_ptr(public_key);
 			pf0_ep_dsc->cert_chain.public_key_size = cert->pub->keylen;
 			pf0_ep_dsc->cert_chain.valid = true;
@@ -514,26 +516,20 @@ static int pdev_set_public_key(struct pci_tsm *tsm)
 	if (!pf0_ep_dsc->cert_chain.valid)
 		return -EINVAL;
 
+	u8 *key __free(free_page) = (u8 *)get_zeroed_page(GFP_KERNEL);
+	u8 *metadata __free(free_page) = (u8 *)get_zeroed_page(GFP_KERNEL);
 	struct rmi_public_key_params *key_params __free(key_param_free) =
 		(struct rmi_public_key_params *)get_zeroed_page(GFP_KERNEL);
-	if (!key_params)
+	if (!key_params || !key || !metadata)
 		return -ENOMEM;
 
-	key_params->rmi_signature_algorithm = pf0_ep_dsc->rmi_signature_algorithm;
-
-	switch (key_params->rmi_signature_algorithm) {
-	case RMI_SIG_ECDSA_P384:
-	case RMI_SIG_ECDSA_P256:
-	{
-		key_params->public_key_len = pf0_ep_dsc->cert_chain.public_key_size;
-		memcpy(key_params->public_key,
-		       pf0_ep_dsc->cert_chain.public_key,
+	if (!strcmp("ecdsa-nist-p384", pf0_ep_dsc->rmi_signature_algorithm) ||
+	    !strcmp("ecdsa-nist-p256", pf0_ep_dsc->rmi_signature_algorithm)) {
+		key_params->key_len = pf0_ep_dsc->cert_chain.public_key_size;
+		memcpy(key, pf0_ep_dsc->cert_chain.public_key,
 		       pf0_ep_dsc->cert_chain.public_key_size);
 		key_params->metadata_len = 0;
-		break;
-	}
-	case RMI_SIG_RSASSA_3072:
-	{
+	} else if (!strcmp("rsa", pf0_ep_dsc->rmi_signature_algorithm)) {
 		int ret;
 		struct rsa_key rsa_key = {0};
 
@@ -543,15 +539,15 @@ static int pdev_set_public_key(struct pci_tsm *tsm)
 		if (ret)
 			return ret;
 
-		key_params->public_key_len = copy_key_part(key_params->public_key,
-							   rsa_key.n, rsa_key.n_sz);
-		key_params->metadata_len = copy_key_part(key_params->metadata,
+		key_params->key_len = copy_key_part(key, rsa_key.n, rsa_key.n_sz);
+		key_params->metadata_len = copy_key_part(metadata,
 							 rsa_key.e, rsa_key.e_sz);
-		break;
-	}
-	default:
+	} else {
 		return -EINVAL;
 	}
+
+	key_params->key_addr = virt_to_phys(key);
+	key_params->metadata_addr = virt_to_phys(metadata);
 
 	if (rmi_pdev_set_pubkey(virt_to_phys(pf0_ep_dsc->pdev.rmm_pdev),
 				virt_to_phys(key_params)))
@@ -724,6 +720,7 @@ void cca_pdev_stop_and_destroy(struct pci_dev *pdev)
 		return;
 
 	if (pf0_ep_dsc) {
+		kfree(pf0_ep_dsc->rmi_signature_algorithm);
 		kfree(pf0_ep_dsc->cert_chain.public_key);
 		kvfree(pf0_ep_dsc->cert_chain.cache);
 		kvfree(pf0_ep_dsc->vca);

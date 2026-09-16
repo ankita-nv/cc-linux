@@ -86,7 +86,7 @@ struct cca_host_pf0_ep_dsc {
 	struct pci_ide *sel_stream;
 	unsigned long stream_handle;
 
-	uint8_t rmi_signature_algorithm;
+	char *rmi_signature_algorithm;
 	struct {
 		struct cache_object *cache;
 

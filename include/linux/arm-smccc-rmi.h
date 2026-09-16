@@ -682,18 +682,19 @@ struct rmi_dev_comm_data {
 	};
 };
 
-#define RMI_SIG_RSASSA_3072	0
-#define RMI_SIG_ECDSA_P256	1
-#define RMI_SIG_ECDSA_P384	2
-
 struct rmi_public_key_params {
 	union {
 		struct {
-			u8 public_key[1024];
-			u8 metadata[1024];
-			u64 public_key_len;
+			union { /* 0x0 */
+				u64 key_addr;
+				u8 padding0[0x400];
+			};
+			union { /* 0x400 */
+				u64 metadata_addr;
+				u8 padding1[0x400];
+			};
+			u64 key_len;
 			u64 metadata_len;
-			u8 rmi_signature_algorithm;
 		};
 		u8 padding[0x1000];
 	};
