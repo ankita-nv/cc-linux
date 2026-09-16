@@ -57,6 +57,7 @@ enum realm_state {
  * @sro: Preallocated SRO state context for Realm MMU operations
  * @state: The lifetime state machine for the realm
  * @ia_bits: Number of valid Input Address bits in the IPA
+ * @dev_mappings: RMM VDEV mapping ranges, protected by kvm->mmu_lock
  * @stage2_unmapped: The Realm stage-2 mappings have been removed
  * @stage2_unmap_failed: An unmap could not be completed (retry required)
  * @rtts_destroyed: The non-root RTTs have been torn down
@@ -76,6 +77,7 @@ struct realm {
 	struct rmi_sro_state *sro;
 	enum realm_state state;
 	unsigned int ia_bits;
+	struct list_head dev_mappings;
 	bool stage2_unmapped;
 	bool stage2_unmap_failed;
 	bool rtts_destroyed;
@@ -175,5 +177,7 @@ static inline bool kvm_realm_is_private_address(struct realm *realm,
 {
 	return !(addr & BIT(realm->ia_bits - 1));
 }
+
+int realm_dev_mem_unmap(struct kvm *kvm, unsigned long vdev_phys);
 
 #endif /* __ASM_KVM_RMI_H */
