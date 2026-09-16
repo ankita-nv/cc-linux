@@ -968,6 +968,30 @@ static int _test_cmd_trigger_iopf(int fd, __u32 device_id, __u32 pasid,
 	ASSERT_EQ(0, _test_cmd_trigger_iopf(self->fd, device_id, \
 					    pasid, fault_fd))
 
+static int _test_cmd_viommu_provider(int fd, __u32 action, __u32 mode,
+				   __u32 *id, __u32 *init_calls,
+				   __u32 *releases)
+{
+	struct iommu_test_cmd cmd = {
+		.size = sizeof(cmd),
+		.op = IOMMU_TEST_OP_VIOMMU_PROVIDER,
+		.id = id ? *id : 0,
+		.viommu_provider = { .action = action, .mode = mode },
+	};
+	int rc;
+
+	rc = ioctl(fd, IOMMU_TEST_CMD, &cmd);
+	if (rc)
+		return rc;
+	if (id && action == MOCK_VIOMMU_PROVIDER_REGISTER)
+		*id = cmd.viommu_provider.out_id;
+	if (init_calls)
+		*init_calls = cmd.viommu_provider.out_init_calls;
+	if (releases)
+		*releases = cmd.viommu_provider.out_releases;
+	return 0;
+}
+
 static int _test_cmd_viommu_alloc(int fd, __u32 device_id, __u32 hwpt_id,
 				  __u32 flags, __u32 type, void *data,
 				  __u32 data_len, __u32 *viommu_id)

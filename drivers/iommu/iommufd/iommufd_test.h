@@ -31,6 +31,20 @@ enum {
 	IOMMU_TEST_OP_PASID_CHECK_HWPT,
 	IOMMU_TEST_OP_DMABUF_GET,
 	IOMMU_TEST_OP_DMABUF_REVOKE,
+	IOMMU_TEST_OP_VIOMMU_PROVIDER,
+};
+
+enum {
+	MOCK_VIOMMU_PROVIDER_REGISTER,
+	MOCK_VIOMMU_PROVIDER_UNREGISTER,
+	MOCK_VIOMMU_PROVIDER_QUERY,
+};
+
+enum {
+	MOCK_VIOMMU_PROVIDER_SUCCESS,
+	MOCK_VIOMMU_PROVIDER_NO_SIZE,
+	MOCK_VIOMMU_PROVIDER_UNSUPPORTED,
+	MOCK_VIOMMU_PROVIDER_INIT_ERROR,
 };
 
 enum {
@@ -193,6 +207,13 @@ struct iommu_test_cmd {
 			__s32 dmabuf_fd;
 			__u32 revoked;
 		} dmabuf_revoke;
+		struct {
+			__u32 action;
+			__u32 mode;
+			__u32 out_id;
+			__u32 out_init_calls;
+			__u32 out_releases;
+		} viommu_provider;
 	};
 	__u32 last;
 };
@@ -244,6 +265,7 @@ struct iommu_hwpt_invalidate_selftest {
 };
 
 #define IOMMU_VIOMMU_TYPE_SELFTEST 0xdeadbeef
+#define IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER 0xdeadbeee
 
 /**
  * struct iommu_viommu_selftest - vIOMMU data for Mock driver

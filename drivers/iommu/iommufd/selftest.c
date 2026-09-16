@@ -172,6 +172,15 @@ to_mock_hw_queue(struct iommufd_hw_queue *hw_queue)
 
 enum selftest_obj_type {
 	TYPE_IDEV,
+	TYPE_VIOMMU_PROVIDER,
+};
+
+struct mock_viommu_provider {
+	struct iommufd_viommu_provider_ops ops;
+	refcount_t users;
+	atomic_t init_calls;
+	atomic_t releases;
+	int init_error;
 };
 
 struct mock_dev {
@@ -203,6 +212,11 @@ struct selftest_obj {
 			struct iommufd_ctx *ictx;
 			struct mock_dev *mock_dev;
 		} idev;
+		struct {
+			struct mutex lock;
+			struct iommufd_viommu_provider *handle;
+			struct mock_viommu_provider *data;
+		} provider;
 	};
 };
 
@@ -785,7 +799,8 @@ static struct iommufd_viommu_ops mock_viommu_ops = {
 static size_t mock_get_viommu_size(struct device *dev,
 				   enum iommu_viommu_type viommu_type)
 {
-	if (viommu_type != IOMMU_VIOMMU_TYPE_SELFTEST)
+	if (viommu_type != IOMMU_VIOMMU_TYPE_SELFTEST &&
+	    viommu_type != IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER)
 		return 0;
 	return VIOMMU_STRUCT_SIZE(struct mock_viommu, core);
 }
@@ -842,6 +857,145 @@ err_destroy_mmap:
 				    mock_viommu->mmap_offset);
 err_free_page:
 	free_pages((unsigned long)mock_viommu->page, 1);
+	return rc;
+}
+
+static void mock_viommu_provider_put(struct mock_viommu_provider *data)
+{
+	if (refcount_dec_and_test(&data->users))
+		kfree(data);
+}
+
+static void mock_viommu_provider_release(void *private)
+{
+	struct mock_viommu_provider *data = private;
+
+	atomic_inc(&data->releases);
+	mock_viommu_provider_put(data);
+}
+
+static size_t mock_provider_get_size(struct device *dev,
+				     enum iommu_viommu_type type)
+{
+	if (!iommufd_selftest_is_mock_dev(dev))
+		return 0;
+	return mock_get_viommu_size(dev, type);
+}
+
+static size_t mock_provider_no_size(struct device *dev,
+				    enum iommu_viommu_type type)
+{
+	return 0;
+}
+
+static int mock_provider_init(struct iommufd_viommu *viommu, struct device *dev,
+			      struct iommu_domain *parent,
+			      const struct iommu_user_data *user_data)
+{
+	struct mock_viommu_provider *data = viommu->provider_data;
+
+	atomic_inc(&data->init_calls);
+	if (data->init_error)
+		return data->init_error;
+	return mock_viommu_init(viommu, parent, user_data);
+}
+
+static int iommufd_test_register_provider(struct iommufd_ucmd *ucmd,
+					struct iommu_test_cmd *cmd)
+{
+	struct mock_viommu_provider *data;
+	struct selftest_obj *sobj;
+	u32 mode = cmd->viommu_provider.mode;
+	int rc;
+
+	if (mode > MOCK_VIOMMU_PROVIDER_INIT_ERROR)
+		return -EINVAL;
+	sobj = iommufd_object_alloc(ucmd->ictx, sobj, IOMMUFD_OBJ_SELFTEST);
+	if (IS_ERR(sobj))
+		return PTR_ERR(sobj);
+	data = kzalloc_obj(*data);
+	if (!data) {
+		rc = -ENOMEM;
+		goto out_abort;
+	}
+	data->ops = (struct iommufd_viommu_provider_ops) {
+		.owner = THIS_MODULE,
+		.type = IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER,
+		.get_size = mode == MOCK_VIOMMU_PROVIDER_NO_SIZE ?
+			mock_provider_no_size : mock_provider_get_size,
+		.init = mock_provider_init,
+		.release = mock_viommu_provider_release,
+	};
+	if (mode == MOCK_VIOMMU_PROVIDER_UNSUPPORTED)
+		data->init_error = -EOPNOTSUPP;
+	else if (mode == MOCK_VIOMMU_PROVIDER_INIT_ERROR)
+		data->init_error = -EIO;
+	/* The test object retains counters after provider unregistration. */
+	refcount_set(&data->users, 2);
+	sobj->type = TYPE_VIOMMU_PROVIDER;
+	mutex_init(&sobj->provider.lock);
+	sobj->provider.data = data;
+	sobj->provider.handle = iommufd_register_viommu_provider(&data->ops, data);
+	if (IS_ERR(sobj->provider.handle)) {
+		rc = PTR_ERR(sobj->provider.handle);
+		kfree(data);
+		goto out_mutex;
+	}
+	cmd->viommu_provider.out_id = sobj->obj.id;
+	rc = iommufd_ucmd_respond(ucmd, sizeof(*cmd));
+	if (rc) {
+		iommufd_unregister_viommu_provider(sobj->provider.handle);
+		mock_viommu_provider_put(data);
+		goto out_mutex;
+	}
+	iommufd_object_finalize(ucmd->ictx, &sobj->obj);
+	return 0;
+
+out_mutex:
+	mutex_destroy(&sobj->provider.lock);
+out_abort:
+	iommufd_object_abort(ucmd->ictx, &sobj->obj);
+	return rc;
+}
+
+static int iommufd_test_viommu_provider(struct iommufd_ucmd *ucmd,
+				       struct iommu_test_cmd *cmd)
+{
+	struct iommufd_object *obj;
+	struct selftest_obj *sobj;
+	int rc = 0;
+
+	if (cmd->viommu_provider.action == MOCK_VIOMMU_PROVIDER_REGISTER)
+		return iommufd_test_register_provider(ucmd, cmd);
+	if (cmd->viommu_provider.action != MOCK_VIOMMU_PROVIDER_UNREGISTER &&
+	    cmd->viommu_provider.action != MOCK_VIOMMU_PROVIDER_QUERY)
+		return -EINVAL;
+	obj = iommufd_get_object(ucmd->ictx, cmd->id, IOMMUFD_OBJ_SELFTEST);
+	if (IS_ERR(obj))
+		return PTR_ERR(obj);
+	sobj = to_selftest_obj(obj);
+	if (sobj->type != TYPE_VIOMMU_PROVIDER) {
+		rc = -EINVAL;
+		goto out_put;
+	}
+	mutex_lock(&sobj->provider.lock);
+	if (cmd->viommu_provider.action == MOCK_VIOMMU_PROVIDER_UNREGISTER) {
+		if (!sobj->provider.handle) {
+			rc = -ENOENT;
+			goto out_unlock;
+		}
+		iommufd_unregister_viommu_provider(sobj->provider.handle);
+		sobj->provider.handle = NULL;
+	}
+	cmd->viommu_provider.out_init_calls =
+		atomic_read(&sobj->provider.data->init_calls);
+	cmd->viommu_provider.out_releases =
+		atomic_read(&sobj->provider.data->releases);
+	rc = iommufd_ucmd_respond(ucmd, sizeof(*cmd));
+out_unlock:
+	mutex_unlock(&sobj->provider.lock);
+out_put:
+	iommufd_put_object(ucmd->ictx, obj);
 	return rc;
 }
 
@@ -1953,6 +2107,12 @@ void iommufd_selftest_destroy(struct iommufd_object *obj)
 		iommufd_device_unbind(sobj->idev.idev);
 		mock_dev_destroy(sobj->idev.mock_dev);
 		break;
+	case TYPE_VIOMMU_PROVIDER:
+		if (sobj->provider.handle)
+			iommufd_unregister_viommu_provider(sobj->provider.handle);
+		mock_viommu_provider_put(sobj->provider.data);
+		mutex_destroy(&sobj->provider.lock);
+		break;
 	}
 }
 
@@ -2100,6 +2260,8 @@ int iommufd_test(struct iommufd_ucmd *ucmd)
 	struct iommu_test_cmd *cmd = ucmd->cmd;
 
 	switch (cmd->op) {
+	case IOMMU_TEST_OP_VIOMMU_PROVIDER:
+		return iommufd_test_viommu_provider(ucmd, cmd);
 	case IOMMU_TEST_OP_ADD_RESERVED:
 		return iommufd_test_add_reserved(ucmd, cmd->id,
 						 cmd->add_reserved.start,

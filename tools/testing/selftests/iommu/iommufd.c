@@ -2880,6 +2880,118 @@ TEST_F(iommufd_viommu, viommu_auto_destroy)
 {
 }
 
+TEST_F(iommufd_viommu, provider_lifetime)
+{
+	uint32_t provider_id = 0, calls, releases;
+	uint32_t first, second, fallback;
+
+	if (!variant->viommu)
+		SKIP(return, "Needs a mock IOMMU device");
+
+	/* The fallback driver supports this exact type without a provider. */
+	test_cmd_viommu_alloc(self->device_id, self->hwpt_id,
+			      IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER, NULL, 0, &fallback);
+	test_ioctl_destroy(fallback);
+	ASSERT_EQ(0, _test_cmd_viommu_provider(
+		self->fd, MOCK_VIOMMU_PROVIDER_REGISTER,
+		MOCK_VIOMMU_PROVIDER_SUCCESS, &provider_id, NULL, NULL));
+	EXPECT_ERRNO(EBUSY, _test_cmd_viommu_provider(
+		self->fd, MOCK_VIOMMU_PROVIDER_REGISTER,
+		MOCK_VIOMMU_PROVIDER_SUCCESS, NULL, NULL, NULL));
+
+	test_cmd_viommu_alloc(self->device_id, self->hwpt_id,
+			      IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER, NULL, 0, &first);
+	test_cmd_viommu_alloc(self->device_id, self->hwpt_id,
+			      IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER, NULL, 0, &second);
+	ASSERT_EQ(0, _test_cmd_viommu_provider(
+		self->fd, MOCK_VIOMMU_PROVIDER_UNREGISTER, 0,
+		&provider_id, &calls, &releases));
+	EXPECT_EQ(2, calls);
+	EXPECT_EQ(0, releases);
+
+	/* Unregister stops lookup, but does not release either live user. */
+	test_cmd_viommu_alloc(self->device_id, self->hwpt_id,
+			      IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER, NULL, 0, &fallback);
+	test_ioctl_destroy(fallback);
+	test_ioctl_destroy(first);
+	ASSERT_EQ(0, _test_cmd_viommu_provider(
+		self->fd, MOCK_VIOMMU_PROVIDER_QUERY, 0,
+		&provider_id, &calls, &releases));
+	EXPECT_EQ(2, calls);
+	EXPECT_EQ(0, releases);
+	test_ioctl_destroy(second);
+	ASSERT_EQ(0, _test_cmd_viommu_provider(
+		self->fd, MOCK_VIOMMU_PROVIDER_QUERY, 0,
+		&provider_id, &calls, &releases));
+	EXPECT_EQ(1, releases);
+	test_ioctl_destroy(provider_id);
+}
+
+TEST_F(iommufd_viommu, provider_errors_do_not_fallback)
+{
+	uint32_t fallback;
+
+	if (!variant->viommu)
+		SKIP(return, "Needs a mock IOMMU device");
+
+	/* A wrong fallback would succeed, making the following checks fail. */
+	test_cmd_viommu_alloc(self->device_id, self->hwpt_id,
+			      IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER, NULL, 0, &fallback);
+	test_ioctl_destroy(fallback);
+	for (unsigned int mode = MOCK_VIOMMU_PROVIDER_NO_SIZE;
+	     mode <= MOCK_VIOMMU_PROVIDER_INIT_ERROR; mode++) {
+		uint32_t provider_id = 0, calls, releases;
+		int error = mode == MOCK_VIOMMU_PROVIDER_INIT_ERROR ?
+			EIO : EOPNOTSUPP;
+
+		ASSERT_EQ(0, _test_cmd_viommu_provider(
+			self->fd, MOCK_VIOMMU_PROVIDER_REGISTER, mode,
+			&provider_id, NULL, NULL));
+		test_err_viommu_alloc(error, self->device_id, self->hwpt_id,
+				      IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER,
+				      NULL, 0, NULL);
+		ASSERT_EQ(0, _test_cmd_viommu_provider(
+			self->fd, MOCK_VIOMMU_PROVIDER_UNREGISTER, 0,
+			&provider_id, &calls, &releases));
+		EXPECT_EQ(mode != MOCK_VIOMMU_PROVIDER_NO_SIZE, calls);
+		/* Failed allocation must not retain a provider reference. */
+		EXPECT_EQ(1, releases);
+		test_ioctl_destroy(provider_id);
+	}
+}
+
+TEST_F(iommufd_viommu, provider_reregister_with_live_viommu)
+{
+	uint32_t old_id = 0, new_id = 0, old_viommu, new_viommu;
+	uint32_t calls, releases;
+
+	if (!variant->viommu)
+		SKIP(return, "Needs a mock IOMMU device");
+
+	ASSERT_EQ(0, _test_cmd_viommu_provider(
+		self->fd, MOCK_VIOMMU_PROVIDER_REGISTER,
+		MOCK_VIOMMU_PROVIDER_SUCCESS, &old_id, NULL, NULL));
+	test_cmd_viommu_alloc(self->device_id, self->hwpt_id,
+			      IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER,
+			      NULL, 0, &old_viommu);
+	/* Drop the test object too; the vIOMMU must retain the private data. */
+	test_ioctl_destroy(old_id);
+	ASSERT_EQ(0, _test_cmd_viommu_provider(
+		self->fd, MOCK_VIOMMU_PROVIDER_REGISTER,
+		MOCK_VIOMMU_PROVIDER_SUCCESS, &new_id, NULL, NULL));
+	test_cmd_viommu_alloc(self->device_id, self->hwpt_id,
+			      IOMMU_VIOMMU_TYPE_SELFTEST_PROVIDER,
+			      NULL, 0, &new_viommu);
+	test_ioctl_destroy(old_viommu);
+	ASSERT_EQ(0, _test_cmd_viommu_provider(
+		self->fd, MOCK_VIOMMU_PROVIDER_QUERY, 0,
+		&new_id, &calls, &releases));
+	EXPECT_EQ(1, calls);
+	EXPECT_EQ(0, releases);
+	test_ioctl_destroy(new_viommu);
+	test_ioctl_destroy(new_id);
+}
+
 TEST_F(iommufd_viommu, viommu_negative_tests)
 {
 	uint32_t device_id = self->device_id;
