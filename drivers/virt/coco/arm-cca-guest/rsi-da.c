@@ -39,8 +39,7 @@ struct page *alloc_shared_pages(int nid, gfp_t gfp_mask, unsigned long min_size)
 {
 	int ret;
 	struct page *page;
-	/* We should normalize the size based on hypervisor page size */
-	int page_order = get_order(min_size);
+	int page_order = get_order(mem_cc_align_to_shared_granule(min_size));
 
 	page = alloc_pages_node(nid, gfp_mask | __GFP_ZERO, page_order);
 	if (!page)
@@ -63,7 +62,7 @@ int free_shared_pages(struct page *page, unsigned long size)
 {
 	int ret;
 	/* We should normalize the size based on hypervisor page size */
-	int page_order = get_order(size);
+	int page_order = get_order(mem_cc_align_to_shared_granule(size));
 
 	ret = set_memory_encrypted((unsigned long)page_address(page), 1 << page_order);
 	/* If we fail to mark it encrypted don't free it back */
@@ -135,9 +134,9 @@ static int cca_apply_evidence_report_range(struct pci_dev *pdev,
 			ret = rsi_validate_dev_mapping(vdev_id, res->start,
 						       res->end + 1, entry->tsm_offset,
 						       mmio_flags,
-						       dsc->dev_info.lock_nonce,
-						       dsc->dev_info.meas_nonce,
-						       dsc->dev_info.report_nonce);
+						       dsc->dev_info.lock_seq,
+						       dsc->dev_info.meas_seq,
+						       dsc->dev_info.report_seq);
 		else
 			ret = rsi_invalidate_dev_mapping(res->start, res->end + 1);
 		if (ret)
@@ -156,7 +155,9 @@ int cca_unmap_evidence_report_range(struct pci_dev *pdev)
 	struct cca_guest_dsc *dsc = to_cca_guest_dsc(pdev);
 	struct pci_tsm_mmio *tsm_mmio = dsc->pci.mmio;
 
-	return cca_apply_evidence_report_range(pdev, tsm_mmio, false);
+	if (tsm_mmio)
+		return cca_apply_evidence_report_range(pdev, tsm_mmio, false);
+	return 0;
 }
 
 int cca_verify_digest(u64 hash_algo, uint8_t *report,
@@ -234,23 +235,24 @@ int cca_verify_digests(u64 hash_algo,
 static inline int rsi_vdev_enable_dma(int vdev_id, struct dsm_device_info *dev_info)
 {
 	/* No ATS support */
-	return __rsi_vdev_dma_enable(vdev_id, 0, 0, dev_info->lock_nonce,
-				     dev_info->meas_nonce, dev_info->report_nonce);
+	return __rsi_vdev_dma_enable(vdev_id, 0, 0, dev_info->lock_seq,
+				     dev_info->meas_seq, dev_info->report_seq);
 }
 
-int cca_device_accept(struct pci_dev *pdev, unsigned long lock_nonce)
+int cca_device_accept(struct pci_dev *pdev, unsigned long lock_seq)
 {
 	int ret;
+	struct pci_tsm_mmio *tsm_mmio;
 	int vdev_id = rsi_vdev_id(pdev);
 	struct cca_guest_dsc *dsc = to_cca_guest_dsc(pdev);
 
-	if (lock_nonce != dsc->dev_info.lock_nonce) {
+	if (lock_seq != dsc->dev_info.lock_seq) {
 		pci_err(pdev, "Device evidence generation mismatch\n");
 		return -EIO;
 	}
 
 	/* Allocation private mmio range based on interface report. */
-	struct pci_tsm_mmio *tsm_mmio __free(kfree) = pci_tsm_mmio_alloc(pdev);
+	tsm_mmio = pci_tsm_mmio_alloc(pdev);
 	if (!tsm_mmio) {
 		pci_err(pdev, "Protected mmio range allocation failure\n");
 		return -ENOMEM;
@@ -263,27 +265,32 @@ int cca_device_accept(struct pci_dev *pdev, unsigned long lock_nonce)
 	ret = pci_tsm_mmio_setup(pdev, tsm_mmio);
 	if (ret) {
 		pci_err(pdev, "Protected mmio setup failure\n");
-		return ret;
+		goto err_mmio_setup;
 	}
 
 	ret = cca_map_evidence_report_range(pdev, tsm_mmio);
 	if (ret) {
 		pci_err(pdev, "failed to validate the interface report\n");
-		return ret;
+		goto err_evidence_report_map;
 	}
 
 	ret = rhi_vdev_set_tdi_state(pdev, RHI_DA_TDI_CONFIG_RUN);
 	if (ret) {
 		pci_err(pdev, "failed to switch the device (%u) to RUN state\n", ret);
-		return ret;
+		goto err_tdi_config_run;
 	}
 
-	if (rsi_vdev_enable_dma(vdev_id, &dsc->dev_info)) {
-		rhi_vdev_set_tdi_state(pdev, RHI_DA_TDI_CONFIG_LOCKED);
+	if (rsi_vdev_enable_dma(vdev_id, &dsc->dev_info))
 		pci_err(pdev, "failed to enable DMA from the device\n");
-		return -EIO;
-	}
 
 	dsc->pci.mmio = no_free_ptr(tsm_mmio);
 	return 0;
+
+err_tdi_config_run:
+	cca_unmap_evidence_report_range(pdev);
+err_evidence_report_map:
+	pci_tsm_mmio_teardown(tsm_mmio);
+err_mmio_setup:
+	pci_tsm_mmio_free(pdev, tsm_mmio);
+	return ret;
 }

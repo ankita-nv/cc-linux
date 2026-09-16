@@ -200,14 +200,11 @@ struct rsi_vdevice_info {
 				u8 hash_algo;
 				u64 padding0;
 			};
-			u64 lock_nonce;
-			u64 meas_nonce;
-			u64 report_nonce;
-			union {
-				u8 format_type;
-				u64 padding1;
-			};
-			u64 format_version;
+			u64 lock_seq;
+			u64 meas_seq;
+			u64 report_seq;
+			u64 padding1;
+			u64 tdisp_version;
 			union {
 				u8 state;
 				u64 padding2;

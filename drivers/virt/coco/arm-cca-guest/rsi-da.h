@@ -14,9 +14,9 @@
 #define MAX_CACHE_OBJ_SIZE	SZ_16M
 
 struct dsm_device_info {
-	u64 lock_nonce;
-	u64 meas_nonce;
-	u64 report_nonce;
+	u64 lock_seq;
+	u64 meas_seq;
+	u64 report_seq;
 	u8 cert_digest[SHA512_DIGEST_SIZE];
 	u8 vca_digest[SHA512_DIGEST_SIZE];
 	u8 meas_digest[SHA512_DIGEST_SIZE];

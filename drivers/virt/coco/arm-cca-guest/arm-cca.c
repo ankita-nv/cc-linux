@@ -179,7 +179,7 @@ cca_update_dev_measurements(struct pci_dev *pdev, const u8 *nonce)
 {
 	int ret;
 	void *measurements;
-	int measurements_size;
+	size_t measurements_size;
 	int vdev_id = rsi_vdev_id(pdev);
 	struct pci_tsm_evidence *evidence;
 	struct rsi_vdevice_info *dev_info;
@@ -213,7 +213,7 @@ cca_update_dev_measurements(struct pci_dev *pdev, const u8 *nonce)
 	}
 
 	/* Make sure no unexpected lock/unlock operation happened from guest */
-	if (dsc->dev_info.lock_nonce != dev_info->lock_nonce) {
+	if (dsc->dev_info.lock_seq!= dev_info->lock_seq) {
 		pci_err(pdev, "Unexpected lock/unlock operation from host (%d)\n", ret);
 		ret = -EIO;
 		goto free_dev_info;
@@ -235,7 +235,7 @@ cca_update_dev_measurements(struct pci_dev *pdev, const u8 *nonce)
 
 	/* Now update the evidence under lock. */
 	down_write(&evidence->lock);
-	evidence->generation = dev_info->meas_nonce;
+	evidence->generation = dev_info->meas_seq;
 
 	obj = &evidence->obj[PCI_TSM_EVIDENCE_TYPE_MEASUREMENTS];
 	if (obj->data)
@@ -243,7 +243,7 @@ cca_update_dev_measurements(struct pci_dev *pdev, const u8 *nonce)
 	obj->data = measurements;
 	obj->len = measurements_size;
 
-	dsc->dev_info.meas_nonce    = dev_info->meas_nonce;
+	dsc->dev_info.meas_seq = dev_info->meas_seq;
 	memcpy(dsc->dev_info.meas_digest, dev_info->meas_digest, SHA512_DIGEST_SIZE);
 	up_write(&evidence->lock);
 
@@ -265,7 +265,7 @@ static int cca_collect_dev_evidence(struct pci_dev *pdev, struct cca_guest_dsc *
 	struct rsi_vdevice_info *dev_info;
 	struct pci_tsm_evidence_object *obj;
 	void *certificate, *vca, *interface_report, *measurements;
-	int certificate_size, vca_size, interface_report_size, measurements_size;
+	size_t certificate_size, vca_size, interface_report_size, measurements_size;
 
 	/* Regenerate interface report and measurement from the device */
 	ret = cca_update_device_object_cache(pdev, NULL);
@@ -314,7 +314,7 @@ static int cca_collect_dev_evidence(struct pci_dev *pdev, struct cca_guest_dsc *
 	}
 
 	/* Make sure no unexpected lock/unlock operation happened from guest */
-	if (dsc->dev_info.lock_nonce != dev_info->lock_nonce) {
+	if (dsc->dev_info.lock_seq!= dev_info->lock_seq) {
 		pci_err(pdev, "Unexpected lock/unlock operation from host (%d)\n", ret);
 		ret = -EIO;
 		goto free_dev_info;
@@ -338,7 +338,7 @@ static int cca_collect_dev_evidence(struct pci_dev *pdev, struct cca_guest_dsc *
 
 	/* Now update the evidence under lock. */
 	down_write(&evidence->lock);
-	evidence->generation = dev_info->meas_nonce;
+	evidence->generation = dev_info->meas_seq;
 
 	/* we default to slot 0 in pdev_create */
 	obj = &evidence->obj[PCI_TSM_EVIDENCE_TYPE_CERT0];
@@ -361,8 +361,8 @@ static int cca_collect_dev_evidence(struct pci_dev *pdev, struct cca_guest_dsc *
 	obj->data = measurements;
 	obj->len = measurements_size;
 
-	dsc->dev_info.meas_nonce    = dev_info->meas_nonce;
-	dsc->dev_info.report_nonce  = dev_info->report_nonce;
+	dsc->dev_info.meas_seq = dev_info->meas_seq;
+	dsc->dev_info.report_seq  = dev_info->report_seq;
 	memcpy(dsc->dev_info.cert_digest, dev_info->identity_digest, SHA512_DIGEST_SIZE);
 	memcpy(dsc->dev_info.vca_digest, dev_info->protocol_data_digest, SHA512_DIGEST_SIZE);
 	memcpy(dsc->dev_info.meas_digest, dev_info->meas_digest, SHA512_DIGEST_SIZE);
@@ -417,7 +417,7 @@ static struct pci_tsm *cca_tsm_lock(struct tsm_dev *tsm_dev, struct pci_dev *pde
 	}
 
 	/* collect the lock nonce */
-	cca_dsc->dev_info.lock_nonce = dev_info->lock_nonce;
+	cca_dsc->dev_info.lock_seq = dev_info->lock_seq;
 
 	switch (dev_info->hash_algo) {
 	case RSI_HASH_SHA_256:
@@ -464,21 +464,23 @@ static void cca_tsm_unlock(struct pci_tsm *tsm)
 	}
 
 	cca_device_unlock(tsm->pdev);
-	pci_tsm_mmio_teardown(cca_dsc->pci.mmio);
+	if (cca_dsc->pci.mmio)
+		pci_tsm_mmio_teardown(cca_dsc->pci.mmio);
 
 err_out:
 	/*
 	 * No error handling from this function. Leave the device locked
 	 */
-	pci_tsm_mmio_free(tsm->pdev, cca_dsc->pci.mmio);
+	if (cca_dsc->pci.mmio)
+		pci_tsm_mmio_free(tsm->pdev, cca_dsc->pci.mmio);
 	kfree(cca_dsc);
 }
 
-static int __cca_tsm_accept(struct pci_dev *pdev, unsigned long lock_nonce)
+static int __cca_tsm_accept(struct pci_dev *pdev, unsigned long lock_seq)
 {
 	int ret;
 
-	ret = cca_device_accept(pdev, lock_nonce);
+	ret = cca_device_accept(pdev, lock_seq);
 	if (ret) {
 		pci_err(pdev, "failed to transition the device to run state (%d)\n", ret);
 		return ret;
@@ -490,7 +492,7 @@ static int cca_tsm_accept(struct pci_dev *pdev)
 {
 	struct cca_guest_dsc *dsc = to_cca_guest_dsc(pdev);
 
-	return __cca_tsm_accept(pdev, dsc->dev_info.lock_nonce);
+	return __cca_tsm_accept(pdev, dsc->dev_info.lock_seq);
 }
 
 static struct pci_tsm_ops cca_devsec_pci_ops = {

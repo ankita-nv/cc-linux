@@ -44,9 +44,9 @@ bool rhi_has_da_support(void)
 	int ret;
 
 	struct rsi_host_call *rhi_call __free(kfree) =
-		kmalloc(sizeof(*rhi_call), GFP_KERNEL);
+		kzalloc(sizeof(*rhi_call), GFP_KERNEL);
 	if (!rhi_call)
-		return -ENOMEM;
+		return false;
 
 	rhi_call->imm = 0;
 	rhi_call->gprs[0] = RHI_DA_FEATURES;
@@ -67,7 +67,7 @@ static inline int rhi_vdev_continue(unsigned long vdev_id, unsigned long cookie)
 	unsigned long ret;
 
 	struct rsi_host_call *rhi_call __free(kfree) =
-		kmalloc(sizeof(*rhi_call), GFP_KERNEL);
+		kzalloc(sizeof(*rhi_call), GFP_KERNEL);
 	if (!rhi_call)
 		return -ENOMEM;
 
@@ -87,7 +87,7 @@ static int __rhi_vdev_abort(unsigned long vdev_id, unsigned long *da_error)
 {
 	unsigned long ret;
 	struct rsi_host_call *rhi_call __free(kfree) =
-		kmalloc(sizeof(struct rsi_host_call), GFP_KERNEL);
+		kzalloc(sizeof(struct rsi_host_call), GFP_KERNEL);
 	if (!rhi_call)
 		return -ENOMEM;
 
@@ -125,7 +125,7 @@ static int __rhi_vdev_set_tdi_state(unsigned long vdev_id,
 	unsigned long ret;
 
 	struct rsi_host_call *rhi_call __free(kfree) =
-		kmalloc(sizeof(struct rsi_host_call), GFP_KERNEL);
+		kzalloc(sizeof(struct rsi_host_call), GFP_KERNEL);
 	if (!rhi_call)
 		return -ENOMEM;
 
@@ -170,7 +170,7 @@ static inline int rhi_vdev_get_interface_report(unsigned long vdev_id,
 	unsigned long ret;
 
 	struct rsi_host_call *rhi_call __free(kfree) =
-		kmalloc(sizeof(struct rsi_host_call), GFP_KERNEL);
+		kzalloc(sizeof(struct rsi_host_call), GFP_KERNEL);
 	if (!rhi_call)
 		return -ENOMEM;
 
@@ -214,7 +214,7 @@ static inline int rhi_vdev_get_measurements(unsigned long vdev_id,
 	unsigned long ret;
 
 	struct rsi_host_call *rhi_call __free(kfree) =
-		kmalloc(sizeof(*rhi_call), GFP_KERNEL);
+		kzalloc(sizeof(*rhi_call), GFP_KERNEL);
 	if (!rhi_call)
 		return -ENOMEM;
 
@@ -286,10 +286,10 @@ int rhi_update_vdev_measurements_cache(struct pci_dev *pdev, const u8 *nonce)
 	return ret;
 }
 
-int rhi_read_cached_object(int vdev_id, int da_object_type, void **object, int *object_size)
+int rhi_read_cached_object(int vdev_id, int da_object_type, void **object, size_t *object_size)
 {
 	int ret;
-	int data_size;
+	size_t data_size;
 	void *data_buf_shared;
 	struct page *shared_pages;
 
@@ -297,7 +297,7 @@ int rhi_read_cached_object(int vdev_id, int da_object_type, void **object, int *
 	*object = NULL;
 
 	struct rsi_host_call *rhicall __free(kfree) =
-		kmalloc(sizeof(struct rsi_host_call), GFP_KERNEL);
+		kzalloc(sizeof(struct rsi_host_call), GFP_KERNEL);
 	if (!rhicall)
 		return -ENOMEM;
 
