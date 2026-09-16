@@ -589,6 +589,58 @@ static inline unsigned long rmi_pdev_stream_disconnect(unsigned long pdev1_phys,
 	return res.a0;
 }
 
+static inline unsigned long rmi_psmmu_info(unsigned long psmmu_phys,
+		unsigned long psmmu_info_phys)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(SMC_RMI_PSMMU_INFO,
+			     psmmu_phys, psmmu_info_phys, &res);
+
+	return res.a0;
+}
+
+struct rmi_psmmu_event_details {
+	u64 flags;
+	u64 event_num;
+	u64 stream_id; /* valid only if we have VSMMU event */
+	u64 fetch_addr;
+	u64 input_addr;
+	u64 syndrome;
+};
+
+static inline unsigned long rmi_psmmu_irq_notify(unsigned long psmmu_phys,
+		unsigned long irqs, struct rmi_psmmu_event_details *event)
+{
+	struct arm_smccc_1_2_regs regs = {
+		.a0 = SMC_RMI_PSMMU_IRQ_NOTIFY,
+		.a1 = psmmu_phys,
+		.a2 = irqs,
+	};
+
+	arm_smccc_1_2_invoke(&regs, &regs);
+
+	event->flags      = regs.a1;
+	event->event_num  = regs.a2;
+	event->stream_id  = regs.a3;
+	event->fetch_addr = regs.a4;
+	event->input_addr = regs.a5;
+	event->syndrome   = regs.a6;
+
+	return regs.a0;
+}
+
+static inline unsigned long rmi_psmmu_event_consume(unsigned long psmmu_phys,
+		unsigned long irqs)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(SMC_RMI_PSMMU_EVENT_CONSUME,
+			     psmmu_phys, irqs, &res);
+
+	return res.a0;
+}
+
 static inline unsigned long rmi_vdev_communicate(unsigned long rd_phys,
 		unsigned long pdev_phys, unsigned long vdev_phys,
 		unsigned long vdev_comm_data_phys)

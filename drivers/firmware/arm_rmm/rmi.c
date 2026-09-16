@@ -1411,6 +1411,65 @@ static int rmi_check_version(void)
 	return 0;
 }
 
+int rmi_psmmu_activate(unsigned long psmmu_phys,
+	       unsigned long psmmu_params_phys, unsigned long *rmi_ret)
+{
+	struct rmi_sro_state *sro __free(kfree) = kzalloc_obj(*sro);
+	if (!sro)
+		return -ENOMEM;
+
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_PSMMU_ACTIVATE, psmmu_phys, psmmu_params_phys
+	};
+	*rmi_ret = rmi_sro_execute(sro, GFP_KERNEL, NULL);
+	rmi_sro_free(sro);
+	return 0;
+}
+
+int rmi_psmmu_deactivate(unsigned long psmmu_phys, unsigned long *rmi_ret)
+{
+	struct rmi_sro_state *sro __free(kfree) = kzalloc_obj(*sro);
+	if (!sro)
+		return -ENOMEM;
+
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_PSMMU_DEACTIVATE, psmmu_phys
+	};
+	*rmi_ret = rmi_sro_execute(sro, GFP_KERNEL, NULL);
+	rmi_sro_free(sro);
+	return 0;
+}
+
+int rmi_psmmu_st_l2_create(unsigned long psmmu_phys,
+		   unsigned long stream_id, unsigned long *rmi_ret)
+{
+	struct rmi_sro_state *sro __free(kfree) = kzalloc_obj(*sro);
+	if (!sro)
+		return -ENOMEM;
+
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_PSMMU_ST_L2_CREATE, psmmu_phys, stream_id
+	};
+	*rmi_ret = rmi_sro_execute(sro, GFP_KERNEL, NULL);
+	rmi_sro_free(sro);
+	return 0;
+}
+
+int rmi_psmmu_st_l2_destroy(unsigned long psmmu_phys,
+		    unsigned long stream_id, unsigned long *rmi_ret)
+{
+	struct rmi_sro_state *sro __free(kfree) = kzalloc_obj(*sro);
+	if (!sro)
+		return -ENOMEM;
+
+	sro->regs = (struct arm_smccc_1_2_regs){
+		SMC_RMI_PSMMU_ST_L2_DESTROY, psmmu_phys, stream_id
+	};
+	*rmi_ret = rmi_sro_execute(sro, GFP_KERNEL, NULL);
+	rmi_sro_free(sro);
+	return 0;
+}
+
 static int rmi_read_features(void)
 {
 	for (int i = 0; i < RMI_FEAT_REG_COUNT; i++) {

@@ -115,6 +115,11 @@ static inline long rmi_undelegate_page(phys_addr_t phys)
 }
 
 bool is_rmi_available(void);
+static inline bool rmm_is_active(void)
+{
+	/* If RMM is active we should atlest find non zero S2SZ field */
+	return rmi_feat_reg(0) != 0;
+}
 
 long rmi_sro_execute(struct rmi_sro_state *sro, gfp_t gfp,
 		     struct arm_smccc_1_2_regs *out_regs);
@@ -341,5 +346,13 @@ static inline long rmi_granule_range_undelegate(unsigned long base,
 
 	return ret;
 }
+
+int rmi_psmmu_activate(unsigned long psmmu_phys,
+		unsigned long psmmu_params_phys, unsigned long *rmi_ret);
+int rmi_psmmu_deactivate(unsigned long psmmu_phys, unsigned long *rmi_ret);
+int rmi_psmmu_st_l2_create(unsigned long psmmu_phys,
+		unsigned long stream_id, unsigned long *rmi_ret);
+int rmi_psmmu_st_l2_destroy(unsigned long psmmu_phys,
+		unsigned long stream_id, unsigned long *rmi_ret);
 
 #endif
