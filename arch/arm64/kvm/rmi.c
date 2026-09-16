@@ -2341,17 +2341,30 @@ static int ripas_change(struct kvm *kvm,
 static int realm_set_ipa_state(struct kvm_vcpu *vcpu,
 			       unsigned long start,
 			       unsigned long end,
-			       unsigned long ripas,
+			       enum rmi_ripas src_ripas,
+			       enum rmi_ripas target_ripas,
 			       unsigned long *top_ipa)
 {
 	struct kvm *kvm = vcpu->kvm;
 	int ret = ripas_change(kvm, vcpu, start, end, RIPAS_SET, top_ipa);
 
-	if (ripas == RMI_EMPTY && *top_ipa != start) {
+	if (target_ripas == RMI_EMPTY && *top_ipa != start) {
 		int unmap_ret;
 
-		unmap_ret = realm_unmap_private_range(kvm, start, *top_ipa,
-						false, vcpu->arch.rec.sro);
+		/*
+		 * Private RAM is also unmapped when userspace converts the
+		 * guest_memfd range, but nothing does that for a device
+		 * mapping, so unmap it explicitly. The range already reads
+		 * RIPAS_EMPTY here, hence the source RIPAS sampled before the
+		 * change selects the unmap.
+		 */
+		if (src_ripas == RMI_DEV)
+			unmap_ret = __realm_dev_mem_unmap(kvm, start, *top_ipa,
+							  false);
+		else
+			unmap_ret = realm_unmap_private_range(kvm, start,
+							      *top_ipa, false,
+							      vcpu->arch.rec.sro);
 		if (!ret)
 			ret = unmap_ret;
 	}
@@ -2549,19 +2562,90 @@ out_unlock:
 	return ret;
 }
 
+/*
+ * Slots without guest_memfd backing are always shared with in-place
+ * conversion, and use the per-VM attributes otherwise. They can never back
+ * RIPAS_RAM.
+ */
+static bool realm_slot_range_has_attrs(struct kvm *kvm,
+				       struct kvm_memory_slot *slot,
+				       gfn_t start, gfn_t end, u64 attrs)
+{
+	if (!kvm_slot_has_gmem(slot) && attrs)
+		return false;
+
+	if (gmem_in_place_conversion)
+		return !kvm_slot_has_gmem(slot) ||
+		       kvm_gmem_range_has_memory_attributes(slot, start, end,
+							    attrs);
+
+	return kvm_range_has_vm_memory_attributes(kvm, start, end,
+						  KVM_MEMORY_ATTRIBUTE_PRIVATE,
+						  attrs);
+}
+
+static bool realm_ripas_attributes_match(struct kvm_vcpu *vcpu,
+					 unsigned long start,
+					 unsigned long end,
+					 enum rmi_ripas ripas,
+					 unsigned long *mmu_seq)
+{
+	struct kvm *kvm = vcpu->kvm;
+	gfn_t gfn = gpa_to_gfn(start);
+	gfn_t end_gfn = gpa_to_gfn(end);
+	u64 attributes = ripas == RMI_RAM ? KVM_MEMORY_ATTRIBUTE_PRIVATE : 0;
+	bool match = true;
+	int idx;
+
+	/* RIPAS_DEV is not backed by ordinary guest_memfd RAM. */
+	if (ripas == RMI_DEV)
+		return true;
+
+	*mmu_seq = kvm->mmu_invalidate_seq;
+	smp_rmb();
+	idx = srcu_read_lock(&kvm->srcu);
+	while (gfn < end_gfn) {
+		struct kvm_memory_slot *slot = gfn_to_memslot(kvm, gfn);
+		gfn_t slot_end;
+
+		if (!slot) {
+			match = false;
+			break;
+		}
+
+		slot_end = min(end_gfn, slot->base_gfn + slot->npages);
+		if (!realm_slot_range_has_attrs(kvm, slot, gfn, slot_end,
+						attributes)) {
+			match = false;
+			break;
+		}
+		gfn = slot_end;
+	}
+	srcu_read_unlock(&kvm->srcu, idx);
+
+	return match;
+}
+
 static int kvm_complete_ripas_change(struct kvm_vcpu *vcpu)
 {
 	struct kvm *kvm = vcpu->kvm;
 	struct realm_rec *rec = &vcpu->arch.rec;
 	unsigned long base = rec->run->exit.ripas_base;
 	unsigned long top = rec->run->exit.ripas_top;
-	unsigned long ripas = rec->run->exit.ripas_value;
+	enum rmi_ripas target_ripas = rec->run->exit.ripas_value;
+	enum rmi_ripas src_ripas = RMI_EMPTY;
 	unsigned long top_ipa = base;
+	unsigned long mmu_seq = 0;
+	bool attributes_match;
 	int ret;
 
 	do {
 		unsigned long min_pages =
 			kvm_mmu_cache_min_pages(vcpu->arch.hw_mmu);
+
+		attributes_match = realm_ripas_attributes_match(vcpu, base, top,
+								target_ripas,
+								&mmu_seq);
 
 		kvm_mmu_topup_memory_cache(&vcpu->arch.mmu_page_cache,
 					   min_pages);
@@ -2573,15 +2657,56 @@ static int kvm_complete_ripas_change(struct kvm_vcpu *vcpu)
 		rmi_sro_topup(vcpu->arch.rec.sro, SZ_2M >> PAGE_SHIFT,
 			      min_pages);
 		write_lock(&kvm->mmu_lock);
-		ret = realm_set_ipa_state(vcpu, base, top, ripas, &top_ipa);
+		/*
+		 * Device mappings are not backed by guest_memfd. Detect the
+		 * source RIPAS while holding mmu_lock so DEV -> EMPTY can unmap
+		 * the device mapping without requiring memory attributes.
+		 */
+		src_ripas = RMI_EMPTY;
+		if (target_ripas == RMI_EMPTY) {
+			ret = realm_get_ripas(kvm, base, &src_ripas);
+			if (ret) {
+				write_unlock(&kvm->mmu_lock);
+				goto out_handle_error;
+			}
+		}
+
+		/* Device RIPAS transitions have no guest_memfd backing. */
+		if (target_ripas != RMI_DEV && src_ripas != RMI_DEV) {
+			if (!attributes_match) {
+				write_unlock(&kvm->mmu_lock);
+				rec->run->exit.ripas_base = base;
+				kvm_prepare_memory_fault_exit(vcpu, base,
+							      top - base,
+							      false, false,
+							      target_ripas == RMI_RAM);
+				/*
+				 * KVM_REQ_RMI has been consumed. Re-arm it so
+				 * the next KVM_RUN completes the change once
+				 * userspace has converted the range.
+				 */
+				kvm_make_request(KVM_REQ_RMI, vcpu);
+				return -EFAULT;
+			}
+			if (mmu_invalidate_retry(kvm, mmu_seq)) {
+				write_unlock(&kvm->mmu_lock);
+				continue;
+			}
+		}
+		ret = realm_set_ipa_state(vcpu, base, top, src_ripas,
+					  target_ripas, &top_ipa);
 		write_unlock(&kvm->mmu_lock);
 
+out_handle_error:
 		if (ret) {
 			if (ret != -ENOMEM) {
 				WARN_RATELIMIT(1,
 					       "Unable to satisfy RIPAS_CHANGE for %#lx - "
-					       "%#lx, ripas: %#lx\n",
-					       base, top, ripas);
+					       "%#lx, ripas: %#x\n",
+					       base, top, target_ripas);
+				/* Reject a request that KVM cannot complete. */
+				rec->run->enter.flags |= REC_ENTER_FLAG_RIPAS_RESPONSE;
+				base = top_ipa;
 				break;
 			}
 			/*

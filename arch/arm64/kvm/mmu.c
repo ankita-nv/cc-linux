@@ -1842,6 +1842,18 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 	int max_order = 0;
 	int ret;
 
+	mmu_seq = kvm->mmu_invalidate_seq;
+	/*
+	 * The private/shared attribute selects guest_memfd versus userspace
+	 * backing.  Capture mmu_seq before reading it and check the same sequence
+	 * under mmu_lock before mapping, so an attribute conversion racing this
+	 * fault forces a retry.  user_mem_abort() follows the same protocol for
+	 * the userspace-backed path.
+	 *
+	 * The barrier pairs with the smp_wmb() in kvm_mmu_invalidate_end().
+	 */
+	smp_rmb();
+
 	if (!perm_fault) {
 		memcache = get_mmu_memcache(vcpu);
 		ret = topup_mmu_memcache(vcpu, memcache);
@@ -1860,6 +1872,10 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 		is_priv_fault = (gpa == s2fd->fault_ipa);
 
 		if (is_priv_gfn != is_priv_fault) {
+			/* Prefault ioctls cannot return a KVM_RUN exit. */
+			if (s2fd->prefault)
+				return -EFAULT;
+
 			kvm_prepare_memory_fault_exit(vcpu, gpa, PAGE_SIZE,
 						      kvm_is_write_fault(vcpu),
 						      false,
@@ -1882,14 +1898,10 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
 
 	VM_WARN_ON_ONCE(write_fault && exec_fault);
 
-	mmu_seq = kvm->mmu_invalidate_seq;
-	/* Pairs with the smp_wmb() in kvm_mmu_invalidate_end(). */
-	smp_rmb();
-
 	ret = kvm_gmem_get_pfn(kvm, s2fd->memslot, gfn, &pfn, &page,
 			       kvm_is_realm(kvm) ? &max_order : NULL);
 	if (ret) {
-		kvm_prepare_memory_fault_exit(vcpu, gpa, PAGE_SIZE,
+		kvm_prepare_memory_fault_exit(vcpu, gfn << PAGE_SHIFT, PAGE_SIZE,
 					      write_fault, exec_fault, false);
 		return ret;
 	}
@@ -2178,12 +2190,6 @@ static gfn_t get_canonical_gfn(const struct kvm_s2_fault_desc *s2fd,
 static int kvm_s2_fault_pin_pfn(const struct kvm_s2_fault_desc *s2fd,
 				struct kvm_s2_fault_vma_info *s2vi)
 {
-	int ret;
-
-	ret = kvm_s2_fault_get_vma_info(s2fd, s2vi);
-	if (ret)
-		return ret;
-
 	s2vi->pfn = __kvm_faultin_pfn(s2fd->memslot, get_canonical_gfn(s2fd, s2vi),
 				      kvm_is_write_fault(s2fd->vcpu) ? FOLL_WRITE : 0,
 				      &s2vi->map_writable, &s2vi->page);
@@ -2477,6 +2483,35 @@ static int user_mem_abort(const struct kvm_s2_fault_desc *s2fd)
 	if (kvm_is_realm(kvm)) {
 		realm_shared_fault = shared_ipa_fault(kvm, s2fd->fault_ipa);
 		gpa = kvm_gpa_from_fault(kvm, s2fd->fault_ipa);
+	}
+
+	ret = kvm_s2_fault_get_vma_info(s2fd, &s2vi);
+	if (ret) {
+		if (ret == -EFAULT && realm_shared_fault)
+			kvm_prepare_memory_fault_exit(s2fd->vcpu, gpa, PAGE_SIZE,
+						      kvm_is_write_fault(s2fd->vcpu),
+						      kvm_vcpu_trap_is_exec_fault(s2fd->vcpu),
+						      false);
+		return ret;
+	}
+
+	/*
+	 * The private/shared attribute selects whether a Realm fault may consume
+	 * userspace memory here or guest_memfd memory in gmem_abort().  Read it
+	 * after capturing mmu_seq, and use that same sequence when installing the
+	 * mapping, so an attribute conversion cannot complete between the check
+	 * and the map without forcing a retry.
+	 */
+	if (kvm_is_realm(kvm) &&
+	    !realm_shared_fault != kvm_mem_is_private(kvm, gpa_to_gfn(gpa))) {
+		if (s2fd->prefault)
+			return -EFAULT;
+
+		kvm_prepare_memory_fault_exit(s2fd->vcpu, gpa, PAGE_SIZE,
+					      kvm_is_write_fault(s2fd->vcpu),
+					      kvm_vcpu_trap_is_exec_fault(s2fd->vcpu),
+					      !realm_shared_fault);
+		return -EFAULT;
 	}
 
 	/*
