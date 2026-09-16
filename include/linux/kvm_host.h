@@ -2594,6 +2594,8 @@ bool kvm_gmem_is_private(struct kvm *kvm, gfn_t gfn);
 bool kvm_gmem_range_has_memory_attributes(struct kvm_memory_slot *slot,
 					  gfn_t start, gfn_t end,
 					  u64 attributes);
+int kvm_gmem_set_attributes(struct kvm_memory_slot *slot, gfn_t start,
+			    gfn_t end, u64 attributes);
 bool kvm_arch_supports_gmem_init_shared(struct kvm *kvm);
 
 static inline u64 kvm_gmem_get_supported_flags(struct kvm *kvm)
@@ -2625,6 +2627,13 @@ static inline bool kvm_gmem_range_has_memory_attributes(
 	struct kvm_memory_slot *slot, gfn_t start, gfn_t end, u64 attributes)
 {
 	return false;
+}
+
+static inline int kvm_gmem_set_attributes(struct kvm_memory_slot *slot,
+					  gfn_t start, gfn_t end,
+					  u64 attributes)
+{
+	return -EOPNOTSUPP;
 }
 #endif /* CONFIG_KVM_GUEST_MEMFD */
 
