@@ -20,10 +20,6 @@ struct devsec_tsm_fn {
 	struct pci_tsm pci;
 };
 
-struct devsec_tsm_tdi {
-	struct pci_tdi pci;
-};
-
 static struct devsec_tsm_pf0 *to_devsec_tsm_pf0(struct pci_tsm *tsm)
 {
 	return container_of(tsm, struct devsec_tsm_pf0, pci.base_tsm);
@@ -234,39 +230,11 @@ static void devsec_link_tsm_disconnect(struct pci_dev *pdev)
 	clear_bit(i, devsec_stream_ids);
 }
 
-static struct pci_tdi *devsec_link_tsm_bind(struct pci_dev *pdev,
-					    struct kvm *kvm, u32 tdi_id)
-{
-	struct devsec_tsm_tdi *devsec_tdi =
-		kzalloc(sizeof(struct devsec_tsm_tdi), GFP_KERNEL);
-
-	dev_dbg(pci_tsm_host(pdev), "%s\n", pci_name(pdev));
-
-	if (!devsec_tdi)
-		return ERR_PTR(-ENOMEM);
-
-	pci_tsm_tdi_constructor(pdev, &devsec_tdi->pci, kvm, tdi_id);
-
-	return &devsec_tdi->pci;
-}
-
-static void devsec_link_tsm_unbind(struct pci_tdi *tdi)
-{
-	struct devsec_tsm_tdi *devsec_tdi =
-		container_of(tdi, struct devsec_tsm_tdi, pci);
-
-	dev_dbg(pci_tsm_host(tdi->pdev), "%s\n", pci_name(tdi->pdev));
-
-	kfree(devsec_tdi);
-}
-
 static struct pci_tsm_ops devsec_link_pci_ops = {
 	.probe = devsec_link_tsm_pci_probe,
 	.remove = devsec_link_tsm_pci_remove,
 	.connect = devsec_link_tsm_connect,
 	.disconnect = devsec_link_tsm_disconnect,
-	.bind = devsec_link_tsm_bind,
-	.unbind = devsec_link_tsm_unbind,
 };
 
 static void devsec_link_tsm_remove(void *tsm_dev)
@@ -292,71 +260,7 @@ static const struct faux_device_ops devsec_link_device_ops = {
 	.probe = devsec_link_tsm_probe,
 };
 
-static struct pci_dev *pci_find_device(const char *name)
-{
-	struct device *dev = bus_find_device_by_name(&pci_bus_type, NULL, name);
-
-	if (dev)
-		return to_pci_dev(dev);
-	return NULL;
-}
-
-static ssize_t tsm_bind_store(struct device *dev, struct device_attribute *attr,
-			      const char *buf, size_t count)
-{
-	struct device *host;
-	int rc;
-
-	struct pci_dev *pdev __free(pci_dev_put) = pci_find_device(buf);
-	if (!pdev)
-		return -ENODEV;
-
-	host = pci_tsm_host(pdev);
-	if (!host || host != &devsec_link_tsm->dev)
-		return -ENXIO;
-
-	rc = pci_tsm_bind(pdev, (struct kvm *)1, pci_dev_id(pdev));
-	if (rc)
-		return rc;
-	return count;
-}
-static DEVICE_ATTR_WO(tsm_bind);
-
-static ssize_t tsm_unbind_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct device *host;
-
-	struct pci_dev *pdev __free(pci_dev_put) = pci_find_device(buf);
-	if (!pdev)
-		return -ENODEV;
-
-	host = pci_tsm_host(pdev);
-	if (!host || host != &devsec_link_tsm->dev)
-		return -ENXIO;
-
-	pci_tsm_unbind(pdev);
-	return count;
-}
-static DEVICE_ATTR_WO(tsm_unbind);
-
-/*
- * Facilitate testing of the bind flows in lieu of VFIO/IOMMUFD
- * support to exercise these paths.
- */
-static struct attribute *devsec_link_attrs[] = {
-	&dev_attr_tsm_bind.attr,
-	&dev_attr_tsm_unbind.attr,
-	NULL,
-};
-
-static const struct attribute_group devsec_link_group = {
-	.attrs = devsec_link_attrs,
-};
-
 static const struct attribute_group *devsec_link_groups[] = {
-	&devsec_link_group,
 	&devsec_evidence_group,
 	NULL,
 };
