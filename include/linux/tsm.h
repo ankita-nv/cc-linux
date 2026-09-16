@@ -2,6 +2,7 @@
 #ifndef __TSM_H
 #define __TSM_H
 
+#include <linux/refcount.h>
 #include <linux/sizes.h>
 #include <linux/types.h>
 #include <linux/uuid.h>
@@ -109,8 +110,18 @@ struct tsm_report_ops {
 };
 
 struct pci_tsm_ops;
+
+/**
+ * struct tsm_dev - TEE Security Manager device
+ * @dev: device-model representation of the TSM
+ * @users: registration reference plus active references that retain the
+ *	PCI/TSM resources; reaching zero tears down those resources
+ * @id: instance identifier
+ * @pci_ops: PCI/TSM operations, or %NULL when PCI/TSM is unsupported
+ */
 struct tsm_dev {
 	struct device dev;
+	refcount_t users;
 	int id;
 	const struct pci_tsm_ops *pci_ops;
 };
@@ -122,6 +133,8 @@ int tsm_report_register(const struct tsm_report_ops *ops, void *priv);
 int tsm_report_unregister(const struct tsm_report_ops *ops);
 struct tsm_dev *tsm_register(struct device *parent, struct pci_tsm_ops *ops);
 void tsm_unregister(struct tsm_dev *tsm_dev);
+void tsm_get(struct tsm_dev *tsm_dev);
+void tsm_put(struct tsm_dev *tsm_dev);
 struct tsm_dev *find_tsm_dev(int id);
 struct pci_ide;
 int tsm_ide_stream_register(struct pci_ide *ide);

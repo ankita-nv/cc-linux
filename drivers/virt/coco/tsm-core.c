@@ -57,6 +57,39 @@ static const struct class tsm_class = {
 	.dev_groups	= tsm_pci_groups,
 };
 static DEFINE_IDA(tsm_ida);
+static void tsm_put_active(struct tsm_dev *tsm_dev)
+{
+	if (!refcount_dec_and_test(&tsm_dev->users))
+		return;
+	if (tsm_dev->pci_ops)
+		pci_tsm_unregister(tsm_dev);
+}
+
+/**
+ * tsm_get() - Take an active reference to a TSM
+ * @tsm_dev: registered TSM or TSM already held by an active reference
+ *
+ * Keeps both the device and its PCI/TSM resources alive.
+ */
+void tsm_get(struct tsm_dev *tsm_dev)
+{
+	get_device(&tsm_dev->dev);
+	refcount_inc(&tsm_dev->users);
+}
+EXPORT_SYMBOL_GPL(tsm_get);
+
+/**
+ * tsm_put() - Release an active TSM reference
+ * @tsm_dev: TSM acquired with tsm_get()
+ *
+ * The last active reference tears down PCI/TSM resources after unregister.
+ */
+void tsm_put(struct tsm_dev *tsm_dev)
+{
+	tsm_put_active(tsm_dev);
+	put_device(&tsm_dev->dev);
+}
+EXPORT_SYMBOL_GPL(tsm_put);
 
 static int match_id(struct device *dev, const void *data)
 {
@@ -90,6 +123,7 @@ static struct tsm_dev *alloc_tsm_dev(struct device *parent)
 		return ERR_PTR(id);
 
 	tsm_dev->id = id;
+	refcount_set(&tsm_dev->users, 1);
 	dev = &tsm_dev->dev;
 	dev->parent = parent;
 	dev->class = &tsm_class;
@@ -98,27 +132,26 @@ static struct tsm_dev *alloc_tsm_dev(struct device *parent)
 	return no_free_ptr(tsm_dev);
 }
 
-static struct tsm_dev *tsm_register_pci_or_reset(struct tsm_dev *tsm_dev,
-						 struct pci_tsm_ops *pci_ops)
+static int tsm_register_pci(struct tsm_dev *tsm_dev, struct pci_tsm_ops *pci_ops)
 {
 	int rc;
 
 	if (!pci_ops)
-		return tsm_dev;
+		return 0;
 
 	tsm_dev->pci_ops = pci_ops;
 	rc = pci_tsm_register(tsm_dev);
 	if (rc) {
+		tsm_dev->pci_ops = NULL;
 		dev_err(tsm_dev->dev.parent,
 			"PCI/TSM registration failure: %d\n", rc);
-		device_unregister(&tsm_dev->dev);
-		return ERR_PTR(rc);
+		return rc;
 	}
 	sysfs_update_group(&tsm_dev->dev.kobj, &tsm_pci_group);
 
 	/* Notify TSM userspace that PCI/TSM operations are now possible */
 	kobject_uevent(&tsm_dev->dev.kobj, KOBJ_CHANGE);
-	return tsm_dev;
+	return 0;
 }
 
 struct tsm_dev *tsm_register(struct device *parent, struct pci_tsm_ops *pci_ops)
@@ -139,14 +172,18 @@ struct tsm_dev *tsm_register(struct device *parent, struct pci_tsm_ops *pci_ops)
 	if (rc)
 		return ERR_PTR(rc);
 
-	return tsm_register_pci_or_reset(no_free_ptr(tsm_dev), pci_ops);
+	rc = tsm_register_pci(tsm_dev, pci_ops);
+	if (rc) {
+		device_del(dev);
+		return ERR_PTR(rc);
+	}
+	return no_free_ptr(tsm_dev);
 }
 EXPORT_SYMBOL_GPL(tsm_register);
 
 void tsm_unregister(struct tsm_dev *tsm_dev)
 {
-	if (tsm_dev->pci_ops)
-		pci_tsm_unregister(tsm_dev);
+	tsm_put_active(tsm_dev);
 	device_unregister(&tsm_dev->dev);
 }
 EXPORT_SYMBOL_GPL(tsm_unregister);
