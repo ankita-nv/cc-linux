@@ -58,6 +58,7 @@ enum realm_state {
  * @state: The lifetime state machine for the realm
  * @ia_bits: Number of valid Input Address bits in the IPA
  * @dev_mappings: RMM VDEV mapping ranges, protected by kvm->mmu_lock
+ * @ripas_user_init: Userspace initialized RIPAS with KVM_ARM_RMI_INIT_RIPAS
  * @stage2_unmapped: The Realm stage-2 mappings have been removed
  * @stage2_unmap_failed: An unmap could not be completed (retry required)
  * @rtts_destroyed: The non-root RTTs have been torn down
@@ -78,6 +79,7 @@ struct realm {
 	enum realm_state state;
 	unsigned int ia_bits;
 	struct list_head dev_mappings;
+	bool ripas_user_init;
 	bool stage2_unmapped;
 	bool stage2_unmap_failed;
 	bool rtts_destroyed;
@@ -139,9 +141,12 @@ int kvm_rec_handle_request(struct kvm_vcpu *vcpu);
 bool kvm_rec_handle_hvc(struct kvm_vcpu *vcpu, int *ret);
 
 struct kvm_arm_rmi_populate;
+struct kvm_arm_rmi_init_ripas;
 
 int kvm_arm_rmi_populate(struct kvm *kvm,
 			 struct kvm_arm_rmi_populate *arg);
+int kvm_arm_rmi_init_ripas(struct kvm *kvm,
+			   struct kvm_arm_rmi_init_ripas *arg);
 void kvm_realm_unmap_range(struct kvm *kvm,
 			   unsigned long ipa,
 			   unsigned long size,

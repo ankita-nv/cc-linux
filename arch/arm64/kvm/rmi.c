@@ -2413,6 +2413,7 @@ static int set_ripas_of_protected_regions(struct kvm *kvm)
 
 	return ret;
 }
+
 int kvm_realm_ensure_created(struct kvm *kvm)
 {
 	int ret;
@@ -2426,6 +2427,82 @@ int kvm_realm_ensure_created(struct kvm *kvm)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(kvm_realm_ensure_created);
+
+int kvm_arm_rmi_init_ripas(struct kvm *kvm,
+			   struct kvm_arm_rmi_init_ripas *args)
+{
+	struct kvm_memory_slot *memslot;
+	unsigned long mmu_seq;
+	unsigned long start, end;
+	gfn_t start_gfn, end_gfn;
+	int ret;
+
+	if (args->flags || memchr_inv(args->reserved, 0,
+				      sizeof(args->reserved)) ||
+	    !args->size || args->base + args->size < args->base ||
+	    !PAGE_ALIGNED(args->base) || !PAGE_ALIGNED(args->size))
+		return -EINVAL;
+
+	start = args->base;
+	end = start + args->size;
+	start_gfn = gpa_to_gfn(start);
+	end_gfn = gpa_to_gfn(end);
+
+	mutex_lock(&kvm->slots_lock);
+	mutex_lock(&kvm->arch.config_lock);
+
+	ret = realm_ensure_created(kvm);
+	if (ret)
+		goto out_unlock;
+
+	memslot = gfn_to_memslot(kvm, start_gfn);
+	if (!kvm_slot_has_gmem(memslot) ||
+	    end_gfn > memslot->base_gfn + memslot->npages) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (gmem_in_place_conversion) {
+		ret = kvm_gmem_set_attributes(memslot, start_gfn, end_gfn,
+					      KVM_MEMORY_ATTRIBUTE_PRIVATE);
+		if (ret)
+			goto out_unlock;
+	}
+
+	mmu_seq = kvm->mmu_invalidate_seq;
+	smp_rmb();
+	if (gmem_in_place_conversion) {
+		if (!kvm_gmem_range_has_memory_attributes(memslot, start_gfn,
+							  end_gfn,
+							  KVM_MEMORY_ATTRIBUTE_PRIVATE)) {
+			ret = -EAGAIN;
+			goto out_unlock;
+		}
+	} else if (!kvm_range_has_vm_memory_attributes(kvm, start_gfn, end_gfn,
+						       KVM_MEMORY_ATTRIBUTE_PRIVATE,
+						       KVM_MEMORY_ATTRIBUTE_PRIVATE)) {
+		/* Per-VM attributes are converted by userspace beforehand. */
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	write_lock(&kvm->mmu_lock);
+	if (mmu_invalidate_retry(kvm, mmu_seq)) {
+		write_unlock(&kvm->mmu_lock);
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	ret = realm_init_ipa_state(kvm, start_gfn, end_gfn - start_gfn);
+	write_unlock(&kvm->mmu_lock);
+	if (!ret)
+		kvm->arch.realm.ripas_user_init = true;
+
+out_unlock:
+	mutex_unlock(&kvm->arch.config_lock);
+	mutex_unlock(&kvm->slots_lock);
+
+	return ret;
+}
 
 int kvm_arm_rmi_populate(struct kvm *kvm,
 			 struct kvm_arm_rmi_populate *args)
@@ -3283,9 +3360,16 @@ int kvm_activate_realm(struct kvm *kvm)
 			return ret;
 	}
 
-	ret = set_ripas_of_protected_regions(kvm);
-	if (ret)
-		return ret;
+	/*
+	 * Every RMI_RTT_INIT_RIPAS extends the RIM, so the RIPAS of a Realm is
+	 * initialized either by userspace through KVM_ARM_RMI_INIT_RIPAS or,
+	 * if userspace never used it, for every guest_memfd memslot here.
+	 */
+	if (!realm->ripas_user_init) {
+		ret = set_ripas_of_protected_regions(kvm);
+		if (ret)
+			return ret;
+	}
 
 	ret = rmi_realm_activate(virt_to_phys(realm->rd));
 	if (ret)
