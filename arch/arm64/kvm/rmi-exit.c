@@ -70,6 +70,44 @@ static void rec_exit_hvc(struct kvm_vcpu *vcpu)
 		rec->psci_complete_pending = true;
 }
 
+static inline void kvm_prepare_vdev_validate_mapping_exit(struct kvm_vcpu *vcpu,
+		gpa_t gpa_base, gpa_t gpa_top,
+		hpa_t pa_base, unsigned long vdev_id)
+{
+	vcpu->run->exit_reason = KVM_EXIT_ARM64_TIO;
+	vcpu->run->cca_exit.nr = RMI_EXIT_VDEV_VALIDATE_MAPPING;
+	vcpu->run->cca_exit.vdev_id  = vdev_id;
+	vcpu->run->cca_exit.flags = 0;
+	vcpu->run->cca_exit.gpa_base = gpa_base;
+	vcpu->run->cca_exit.gpa_top  = gpa_top;
+	vcpu->run->cca_exit.pa_base  = pa_base;
+	vcpu->run->cca_exit.response = 0;
+}
+
+static int rec_exit_vdev_validate_mapping(struct kvm_vcpu *vcpu)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct realm *realm = &kvm->arch.realm;
+	struct realm_rec *rec = &vcpu->arch.rec;
+	unsigned long base = rec->run->exit.dev_mem_base;
+	unsigned long top = rec->run->exit.dev_mem_top;
+
+	/* The validation is completed on the next REC entry. */
+	kvm_make_request(KVM_REQ_RMI, vcpu);
+
+	if (!kvm_realm_is_private_address(realm, base) ||
+	    !kvm_realm_is_private_address(realm, top - 1)) {
+
+		vcpu->run->cca_exit.response = -EINVAL;
+		/* return to guest */
+		return ARM_EXCEPTION_IRQ;
+	}
+
+	kvm_prepare_vdev_validate_mapping_exit(vcpu, base, top, rec->run->exit.dev_mem_pa,
+					       rec->run->exit.vdev_id_1);
+	return ARM_EXCEPTION_EXIT;
+}
+
 static void update_arch_timer_irq_lines(struct kvm_vcpu *vcpu)
 {
 	struct realm_rec *rec = &vcpu->arch.rec;
@@ -192,6 +230,8 @@ int kvm_rec_exit(struct kvm_vcpu *vcpu, int rec_run_ret)
 	case RMI_EXIT_RIPAS_CHANGE:
 		rec_exit_hvc(vcpu);
 		return ARM_EXCEPTION_TRAP;
+	case RMI_EXIT_VDEV_VALIDATE_MAPPING:
+		return rec_exit_vdev_validate_mapping(vcpu);
 	}
 
 	return rec_exit_fatal(vcpu, "Unsupported Realm exit reason",

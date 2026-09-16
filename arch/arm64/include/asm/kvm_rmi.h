@@ -178,6 +178,9 @@ static inline bool kvm_realm_is_private_address(struct realm *realm,
 	return !(addr & BIT(realm->ia_bits - 1));
 }
 
+int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
+		unsigned long vdev_phys, unsigned long start_ipa,
+		unsigned long end_ipa, unsigned long start_pa);
 int realm_dev_mem_unmap(struct kvm *kvm, unsigned long vdev_phys);
 
 #endif /* __ASM_KVM_RMI_H */
