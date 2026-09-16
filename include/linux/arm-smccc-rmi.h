@@ -649,6 +649,7 @@ struct rmi_dev_comm_enter {
 	u64 req_addr;
 	u64 resp_addr;
 	u64 resp_len;
+	u8 padding1[0xe0];
 };
 
 struct rmi_dev_comm_exit {
@@ -658,17 +659,18 @@ struct rmi_dev_comm_exit {
 	u64 rsp_cache_offset;
 	u64 rsp_cache_len;
 	union {
-		u8 cache_obj_id;
-		u64 padding0;
+		u8 cache_object_id;
+		u8 padding0[0x8];
 	};
 
 	union {
 		u8 protocol;
-		u64 padding1;
+		u8 padding1[0x8];
 	};
 	u64 req_delay;
 	u64 req_len;
 	u64 rsp_timeout;
+	u8 padding2[0xb0];
 };
 
 struct rmi_dev_comm_data {
