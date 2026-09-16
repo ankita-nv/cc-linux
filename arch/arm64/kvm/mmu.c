@@ -3381,7 +3381,7 @@ long kvm_arch_vcpu_pre_fault_memory(struct kvm_vcpu *vcpu,
 	 * pKVM stage-2 mappings aren't directly walkable from the host; let
 	 * the fault path handle both new and existing mappings.
 	 */
-	if (!is_protected_kvm_enabled()) {
+	if (!(is_protected_kvm_enabled() || kvm_is_realm(vcpu->kvm))) {
 		pgt = vcpu->arch.hw_mmu->pgt;
 		scoped_guard(read_lock, &vcpu->kvm->mmu_lock) {
 			ret = kvm_pgtable_get_leaf(pgt, gpa, &pte, &walk_level,
