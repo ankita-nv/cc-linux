@@ -21,6 +21,28 @@ struct iommu_option;
 struct iommufd_device;
 struct dma_buf_attachment;
 
+/**
+ * struct iommufd_viommu_provider - vIOMMU implementation provider
+ * @node: entry in the provider registry
+ * @users: references retaining @ops, @owner, and @data; registered providers
+ *	have one registry reference plus one per live vIOMMU, while a fallback
+ *	provider is private to one vIOMMU
+ * @ops: provider operations
+ * @owner: module implementing @ops
+ * @data: provider-private data retained until the final reference is released
+ */
+struct iommufd_viommu_provider {
+	struct list_head node;
+	const struct iommufd_viommu_provider_ops *ops;
+	refcount_t users;
+	struct module *owner;
+	void *data;
+};
+
+void iommufd_put_viommu_provider(struct iommufd_viommu_provider *provider);
+struct iommufd_viommu_provider *
+iommufd_get_viommu_provider(struct device *dev, enum iommu_viommu_type type);
+
 struct iommufd_sw_msi_map {
 	struct list_head sw_msi_item;
 	phys_addr_t sw_msi_start;

@@ -8,7 +8,8 @@ iommufd-y := \
 	main.o \
 	pages.o \
 	vfio_compat.o \
-	viommu.o
+	viommu.o \
+	viommu_provider.o
 
 iommufd-$(CONFIG_IOMMUFD_NOIOMMU) += hwpt_noiommu.o
 iommufd-$(CONFIG_IOMMUFD_TEST) += selftest.o

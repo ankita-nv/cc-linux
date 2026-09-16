@@ -11,6 +11,7 @@ void iommufd_viommu_destroy(struct iommufd_object *obj)
 
 	if (viommu->ops && viommu->ops->destroy)
 		viommu->ops->destroy(viommu);
+	iommufd_put_viommu_provider(viommu->provider);
 	refcount_dec(&viommu->hwpt->common.obj.users);
 	if (viommu->kvm_file)
 		fput(viommu->kvm_file);
@@ -29,7 +30,7 @@ int iommufd_viommu_alloc_ioctl(struct iommufd_ucmd *ucmd)
 	struct iommufd_viommu *viommu;
 	struct iommufd_device *idev;
 	struct iommu_device *iommu_dev;
-	const struct iommu_ops *ops;
+	struct iommufd_viommu_provider *provider = NULL;
 	size_t viommu_size;
 	int rc;
 
@@ -45,16 +46,17 @@ int iommufd_viommu_alloc_ioctl(struct iommufd_ucmd *ucmd)
 		rc = -EOPNOTSUPP;
 		goto out_put_idev;
 	}
-	ops = iommu_dev->ops;
-	if (!ops->get_viommu_size || !ops->viommu_init) {
-		rc = -EOPNOTSUPP;
+
+	provider = iommufd_get_viommu_provider(idev->dev, cmd->type);
+	if (IS_ERR(provider)) {
+		rc = PTR_ERR(provider);
+		provider = NULL;
 		goto out_put_idev;
 	}
-
-	viommu_size = ops->get_viommu_size(idev->dev, cmd->type);
+	viommu_size = provider->ops->get_size(idev->dev, cmd->type);
 	if (!viommu_size) {
 		rc = -EOPNOTSUPP;
-		goto out_put_idev;
+		goto out_put_provider;
 	}
 
 	/*
@@ -63,13 +65,13 @@ int iommufd_viommu_alloc_ioctl(struct iommufd_ucmd *ucmd)
 	 */
 	if (WARN_ON_ONCE(viommu_size < sizeof(*viommu))) {
 		rc = -EOPNOTSUPP;
-		goto out_put_idev;
+		goto out_put_provider;
 	}
 
 	hwpt_paging = iommufd_get_hwpt_paging(ucmd, cmd->hwpt_id);
 	if (IS_ERR(hwpt_paging)) {
 		rc = PTR_ERR(hwpt_paging);
-		goto out_put_idev;
+		goto out_put_provider;
 	}
 
 	if (!hwpt_paging->nest_parent) {
@@ -90,6 +92,9 @@ int iommufd_viommu_alloc_ioctl(struct iommufd_ucmd *ucmd)
 	viommu->type = cmd->type;
 	viommu->ictx = ucmd->ictx;
 	viommu->hwpt = hwpt_paging;
+	viommu->provider = provider;
+	viommu->provider_data = provider->data;
+	provider = NULL;
 	refcount_inc(&viommu->hwpt->common.obj.users);
 	INIT_LIST_HEAD(&viommu->veventqs);
 	init_rwsem(&viommu->veventqs_rwsem);
@@ -100,8 +105,9 @@ int iommufd_viommu_alloc_ioctl(struct iommufd_ucmd *ucmd)
 	 */
 	viommu->iommu_dev = iommu_dev;
 
-	rc = ops->viommu_init(viommu, hwpt_paging->common.domain,
-			      user_data.len ? &user_data : NULL);
+	rc = viommu->provider->ops->init(viommu, idev->dev,
+					 hwpt_paging->common.domain,
+					 user_data.len ? &user_data : NULL);
 	if (rc)
 		goto out_put_hwpt;
 
@@ -116,6 +122,8 @@ int iommufd_viommu_alloc_ioctl(struct iommufd_ucmd *ucmd)
 
 out_put_hwpt:
 	iommufd_put_object(ucmd->ictx, &hwpt_paging->common.obj);
+out_put_provider:
+	iommufd_put_viommu_provider(provider);
 out_put_idev:
 	iommufd_put_object(ucmd->ictx, &idev->obj);
 	return rc;

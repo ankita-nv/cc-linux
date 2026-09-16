@@ -22,8 +22,38 @@ struct iommu_user_data_array;
 struct iommufd_access;
 struct iommufd_ctx;
 struct iommufd_device;
+struct iommufd_viommu;
 struct iommufd_viommu_ops;
+struct iommufd_viommu_provider;
+struct module;
 struct page;
+
+/**
+ * struct iommufd_viommu_provider_ops - External vIOMMU implementation
+ * @owner: Module implementing the callbacks
+ * @type: Exact vIOMMU type implemented by this provider
+ * @get_size: Allocation size for a device, or zero if unsupported
+ * @init: Initialize the vIOMMU; private data is in viommu->provider_data
+ * @release: Optional final release of the registration's private data
+ *
+ * Callbacks run without the registry lock held. The operations must remain
+ * valid until @release completes. An allocation failure is authoritative:
+ * it must not cause allocation through the physical IOMMU driver instead.
+ */
+struct iommufd_viommu_provider_ops {
+	struct module *owner;
+	enum iommu_viommu_type type;
+	size_t (*get_size)(struct device *dev, enum iommu_viommu_type type);
+	int (*init)(struct iommufd_viommu *viommu, struct device *dev,
+		    struct iommu_domain *parent,
+		    const struct iommu_user_data *user_data);
+	void (*release)(void *data);
+};
+
+struct iommufd_viommu_provider *
+iommufd_register_viommu_provider(const struct iommufd_viommu_provider_ops *ops,
+	     void *data);
+void iommufd_unregister_viommu_provider(struct iommufd_viommu_provider *provider);
 
 enum iommufd_object_type {
 	IOMMUFD_OBJ_NONE,
@@ -104,6 +134,8 @@ struct iommufd_viommu {
 	struct iommu_device *iommu_dev;
 	struct iommufd_hwpt_paging *hwpt;
 	struct file *kvm_file;
+	struct iommufd_viommu_provider *provider;
+	void *provider_data;
 
 	const struct iommufd_viommu_ops *ops;
 
