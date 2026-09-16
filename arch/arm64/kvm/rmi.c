@@ -2592,7 +2592,7 @@ static bool realm_ripas_attributes_match(struct kvm_vcpu *vcpu,
 {
 	struct kvm *kvm = vcpu->kvm;
 	gfn_t gfn = gpa_to_gfn(start);
-	gfn_t end_gfn = gpa_to_gfn(end);
+	gfn_t end_gfn = gpa_to_gfn(ALIGN(end, PAGE_SIZE));
 	u64 attributes = ripas == RMI_RAM ? KVM_MEMORY_ATTRIBUTE_PRIVATE : 0;
 	bool match = true;
 	int idx;
@@ -2676,8 +2676,10 @@ static int kvm_complete_ripas_change(struct kvm_vcpu *vcpu)
 			if (!attributes_match) {
 				write_unlock(&kvm->mmu_lock);
 				rec->run->exit.ripas_base = base;
-				kvm_prepare_memory_fault_exit(vcpu, base,
-							      top - base,
+				kvm_prepare_memory_fault_exit(vcpu,
+							      ALIGN_DOWN(base, PAGE_SIZE),
+							      ALIGN(top, PAGE_SIZE) -
+							      ALIGN_DOWN(base, PAGE_SIZE),
 							      false, false,
 							      target_ripas == RMI_RAM);
 				/*
