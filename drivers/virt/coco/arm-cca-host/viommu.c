@@ -343,6 +343,17 @@ static ssize_t cca_vdevice_tsm_req(struct iommufd_vdevice *vdev,
 			return len;
 		return info->resp_len - len;
 	}
+	case TSM_REQ_REGEN_OBJECT: {
+		struct arm64_vdev_object_regen_guest_req req;
+
+		if (info->req_len != sizeof(req))
+			return -EINVAL;
+		if (copy_from_sockptr(&req, info->req, sizeof(req)))
+			return -EFAULT;
+		if (req.object_type == RHI_DA_OBJECT_INTERFACE_REPORT)
+			return cca_vdev_update_interface_report(host_tdi, pdev);
+		return -EINVAL;
+	}
 	default:
 		return -EINVAL;
 	}
