@@ -595,7 +595,6 @@ enum rmi_pdev_state {
 #define RMI_PDEV_FLAGS_CATEGORY_ROOT_PORT	0x0
 #define RMI_PDEV_FLAGS_CATEGORY_OFF_CHIP_EP	0x1
 #define RMI_PDEV_FLAGS_CATEGORY_ON_CHIP_EP	0x2
-#define RMI_PDEV_FLAGS_CATEGORY_CMEM		0x3
 
 struct rmi_pdev_params {
 	union {
@@ -606,19 +605,19 @@ struct rmi_pdev_params {
 			u64 routing_id;
 			u64 id_index;
 			union {
-				u16 rid_base;
+				u32 rid_base;
+				u8 padding0[8];
+			};
+			union {
+				u32 rid_top;
 				u8 padding1[8];
 			};
 			union {
-				u16 rid_top;
+				u8 hash_algo;
 				u8 padding2[8];
 			};
-			union {
-				u8 hash_algo;
-				u8 padding3[8];
-			};
 		};
-		u8 padding5[0x1000];
+		u8 padding3[0x1000];
 	};
 };
 

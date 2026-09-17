@@ -12,6 +12,7 @@
 #include <linux/numa.h>
 #include <linux/processor.h>
 #include <linux/types.h>
+#include <linux/gfp_types.h>
 
 #include <asm/page.h>
 
