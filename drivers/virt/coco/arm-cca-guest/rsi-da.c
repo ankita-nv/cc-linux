@@ -4,8 +4,12 @@
  */
 
 #include <linux/arm-rsi-cmds.h>
+#include <linux/kstrtox.h>
 #include <linux/mem_encrypt.h>
+#include <linux/moduleparam.h>
 #include <linux/pci.h>
+#include <linux/sched.h>
+#include <linux/sizes.h>
 #include <crypto/hash.h>
 
 #include "rsi-da.h"
@@ -86,6 +90,52 @@ int cca_update_device_object_cache(struct pci_dev *pdev, const u8 *nonce)
 	return rhi_update_vdev_measurements_cache(pdev, nonce);
 }
 
+/*
+ * IPA span requested per device-mapping call. The host services one validate
+ * request by mapping the whole span and one invalidate request by unmapping
+ * and undelegating it, so the span decides how long a single call keeps the
+ * host busy on this vCPU's behalf -- a BAR asked for in one piece can be
+ * hundreds of GiB.
+ *
+ * The host also picks its device block size within the span it is handed, so
+ * a value >= SZ_1G keeps 1GiB device blocks reachable while a smaller one
+ * caps them at that size. Must be a power of two and at least SZ_2M.
+ */
+static unsigned long dev_mem_chunk_size = SZ_1G;
+
+static int dev_mem_chunk_size_set(const char *val,
+				  const struct kernel_param *kp)
+{
+	unsigned long size;
+	int ret;
+
+	ret = kstrtoul(val, 0, &size);
+	if (ret)
+		return ret;
+
+	if (size < SZ_2M || (size & (size - 1)))
+		return -EINVAL;
+
+	*(unsigned long *)kp->arg = size;
+	return 0;
+}
+
+static const struct kernel_param_ops dev_mem_chunk_size_ops = {
+	.set = dev_mem_chunk_size_set,
+	.get = param_get_ulong,
+};
+module_param_cb(dev_mem_chunk_size, &dev_mem_chunk_size_ops,
+		&dev_mem_chunk_size, 0644);
+MODULE_PARM_DESC(dev_mem_chunk_size,
+		 "IPA bytes per device mapping validate/invalidate call (power of two, >= 2MiB); >= 1GiB keeps 1GiB device blocks");
+
+static phys_addr_t dev_mem_chunk_end(phys_addr_t ipa, phys_addr_t end_ipa)
+{
+	unsigned long chunk = READ_ONCE(dev_mem_chunk_size);
+
+	return min_t(phys_addr_t, end_ipa, ALIGN_DOWN(ipa, chunk) + chunk);
+}
+
 static inline int
 rsi_validate_dev_mapping(unsigned long vdev_id, phys_addr_t start_ipa,
 		phys_addr_t end_ipa, phys_addr_t io_pa,
@@ -96,21 +146,36 @@ rsi_validate_dev_mapping(unsigned long vdev_id, phys_addr_t start_ipa,
 	phys_addr_t next_ipa;
 
 	while (start_ipa < end_ipa) {
-		ret = rsi_vdev_validate_mapping(vdev_id, start_ipa, end_ipa,
+		phys_addr_t chunk_end = dev_mem_chunk_end(start_ipa, end_ipa);
+
+		ret = rsi_vdev_validate_mapping(vdev_id, start_ipa, chunk_end,
 						io_pa, &next_ipa, flags,
 						lock_seq, meas_seq, report_seq);
-		if (ret || next_ipa <= start_ipa || next_ipa > end_ipa)
+		if (ret || next_ipa <= start_ipa || next_ipa > chunk_end)
 			return -EINVAL;
 		io_pa += next_ipa - start_ipa;
 		start_ipa = next_ipa;
+
+		cond_resched();
 	}
 	return 0;
 }
 
 static inline int rsi_invalidate_dev_mapping(phys_addr_t start_ipa, phys_addr_t end_ipa)
 {
-	return rsi_set_memory_range(start_ipa, end_ipa, RSI_RIPAS_EMPTY,
-				    RSI_CHANGE_DESTROYED);
+	while (start_ipa < end_ipa) {
+		phys_addr_t chunk_end = dev_mem_chunk_end(start_ipa, end_ipa);
+		int ret = rsi_set_memory_range(start_ipa, chunk_end,
+					       RSI_RIPAS_EMPTY,
+					       RSI_CHANGE_DESTROYED);
+
+		if (ret)
+			return ret;
+		start_ipa = chunk_end;
+
+		cond_resched();
+	}
+	return 0;
 }
 
 static int cca_apply_evidence_report_range(struct pci_dev *pdev,
