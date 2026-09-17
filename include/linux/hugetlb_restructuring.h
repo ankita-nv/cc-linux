@@ -12,7 +12,9 @@ struct hugetlb_cgroup;
 int hugetlb_restructuring_metadata_store(struct folio *folio);
 void hugetlb_restructuring_metadata_abort(struct folio *folio);
 
-int hugetlb_restructuring_restructure_folio(struct folio *folio, u8 to_order);
+int hugetlb_restructuring_restructure_folio(struct folio *folio,
+					    pgoff_t start, u8 range_order,
+					    u8 target_order);
 void hugetlb_split_handle_folio_put(struct folio *folio);
 void hugetlb_restructuring_free_folio(struct folio *folio);
 
@@ -33,8 +35,9 @@ static inline void hugetlb_restructuring_metadata_abort(struct folio *folio)
 {
 }
 
-static inline int hugetlb_restructuring_restructure_folio(struct folio *folio,
-						   u8 to_order)
+static inline int
+hugetlb_restructuring_restructure_folio(struct folio *folio, pgoff_t start,
+					u8 range_order, u8 target_order)
 {
 	return -EOPNOTSUPP;
 }

@@ -123,6 +123,13 @@ static bool kvm_gmem_range_has_attributes(struct inode *inode,
 	return matches;
 }
 
+static bool kvm_gmem_range_is_private(struct inode *inode, pgoff_t index,
+				      size_t nr_pages)
+{
+	return kvm_gmem_range_has_attributes(inode, index, nr_pages,
+					     KVM_MEMORY_ATTRIBUTE_PRIVATE);
+}
+
 static struct folio *__kvm_gmem_get_folio(struct inode *inode,
 					  pgoff_t index,
 					  struct mempolicy *policy)
@@ -177,48 +184,89 @@ err_put:
 	return ERR_PTR(err);
 }
 
-static struct folio *__maybe_split_hugetlb_folio(struct folio *folio,
-						 pgoff_t requested_index,
-						 bool may_restructure)
+static u8 kvm_gmem_hugetlb_mapping_order(struct gmem_inode *gi)
+{
+	if (PTRS_PER_PMD == 1)
+		return gi->page_order;
+
+	return min_t(u8, gi->page_order, PMD_ORDER);
+}
+
+/*
+ * Preserve large folios for uniform ranges.  Userspace mappings split an
+ * original HugeTLB folio, but can use restructured PMD folios.
+ */
+static struct folio *
+gmem_restructure_folio(struct folio *folio, pgoff_t requested_index,
+		       bool may_restructure, bool userspace_mapping)
 {
 	struct inode *inode = folio->mapping->host;
 	struct gmem_inode *gi = GMEM_I(inode);
-	size_t nr_pages = 1UL << gi->page_order;
-	pgoff_t huge_start;
+	u8 mapping_order, order, range_order, target_order;
+	pgoff_t range_start;
+	bool is_private, mapping_compatible;
+	u64 attributes;
 	int ret;
 
 	if (!IS_ENABLED(CONFIG_KVM_GUEST_MEMFD_HUGETLB) || gi->page_order == 0)
 		return folio;
-	if (!folio_order(folio))
-		return folio;
 
-	huge_start = round_down(requested_index, nr_pages);
-	if (kvm_gmem_range_has_attributes(inode, huge_start,
-					  nr_pages,
-					  KVM_MEMORY_ATTRIBUTE_PRIVATE))
-		return folio;
+	is_private = kvm_gmem_is_private_mem(inode, requested_index);
+	attributes = is_private ? KVM_MEMORY_ATTRIBUTE_PRIVATE : 0;
+	mapping_order = kvm_gmem_hugetlb_mapping_order(gi);
+	for (;;) {
+		order = folio_order(folio);
+		/* Only the original-order folio retains the HugeTLB type. */
+		if (order > gi->page_order ||
+		    (order == gi->page_order && !folio_test_hugetlb(folio)) ||
+		    (order < gi->page_order && folio_has_type(folio))) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return ERR_PTR(-EINVAL);
+		}
 
-	/* Leave only filemap's references before restructuring the folio. */
-	folio_unlock(folio);
-	folio_put(folio);
+		/* Use the current folio or its containing mapping-order range. */
+		range_order = max(order, mapping_order);
+		range_start = order >= mapping_order ? folio->index :
+			round_down(requested_index, BIT(mapping_order));
 
-	if (!may_restructure)
-		return ERR_PTR(-EAGAIN);
+		/* mmap requires a non-HugeTLB folio at or below mapping_order. */
+		mapping_compatible = !userspace_mapping ||
+			(!folio_test_hugetlb(folio) && order <= mapping_order);
 
-	ret = gmem_hugetlb_restructure_folio(inode->i_mapping, huge_start, 0);
-	if (ret)
-		return ERR_PTR(ret);
+		/* Preserve uniform ranges; otherwise descend or use base pages. */
+		if (mapping_compatible &&
+		    kvm_gmem_range_has_attributes(inode, range_start,
+						  BIT(range_order), attributes))
+			target_order = is_private ? range_order : order;
+		else
+			target_order = order > mapping_order ? mapping_order : 0;
+		if (order == target_order)
+			return folio;
 
-	folio = filemap_lock_folio(inode->i_mapping, requested_index);
-	if (IS_ERR(folio))
-		return folio;
-	if (WARN_ON_ONCE(folio_order(folio))) {
+		/* Leave only filemap's references before restructuring. */
 		folio_unlock(folio);
 		folio_put(folio);
-		return ERR_PTR(-EINVAL);
-	}
 
-	return folio;
+		if (!may_restructure)
+			return ERR_PTR(-EAGAIN);
+
+		ret = gmem_hugetlb_restructure_folio(inode->i_mapping,
+						     range_start, range_order,
+						     target_order);
+		if (ret) {
+			if (target_order != range_order ||
+			    (ret != -EAGAIN && ret != -ENOMEM && ret != -EBUSY &&
+			     ret != -EHWPOISON))
+				return ERR_PTR(ret);
+			return filemap_lock_folio(inode->i_mapping,
+						  requested_index);
+		}
+
+		folio = filemap_lock_folio(inode->i_mapping, requested_index);
+		if (IS_ERR(folio))
+			return folio;
+	}
 }
 
 
@@ -232,7 +280,8 @@ static struct folio *__maybe_split_hugetlb_folio(struct folio *folio,
  * unevictable and there is no storage to write back to.
  */
 static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index,
-					bool may_restructure)
+					bool may_restructure,
+					bool userspace_mapping)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct mempolicy *policy;
@@ -244,8 +293,8 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index,
 	 */
 	folio = filemap_lock_folio(mapping, index);
 	if (!IS_ERR(folio))
-		return __maybe_split_hugetlb_folio(folio, index,
-						      may_restructure);
+		return gmem_restructure_folio(folio, index, may_restructure,
+					      userspace_mapping);
 
 	policy = mpol_shared_policy_lookup(&GMEM_I(inode)->policy, index);
 	do {
@@ -257,7 +306,8 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index,
 	if (IS_ERR(folio))
 		return folio;
 
-	return __maybe_split_hugetlb_folio(folio, index, may_restructure);
+	return gmem_restructure_folio(folio, index, may_restructure,
+				      userspace_mapping);
 }
 
 static void __kvm_gmem_zap(struct gmem_file *f, pgoff_t start, pgoff_t end,
@@ -506,18 +556,21 @@ static int merge_folios_in_range(struct inode *inode, pgoff_t start,
 				 size_t nr_pages)
 {
 	u8 merge_order = GMEM_I(inode)->page_order;
-	size_t merge_nr_pages = 1 << merge_order;
+	size_t merge_nr_pages = 1UL << merge_order;
 	pgoff_t index;
-	int ret = 0;
+	int ret;
 
-	for (index = start; index < start + nr_pages; index += merge_nr_pages) {
-		ret = gmem_hugetlb_restructure_folio(inode->i_mapping, index,
+	for (index = start; index < start + nr_pages;
+	     index += merge_nr_pages) {
+		ret = gmem_hugetlb_restructure_folio(inode->i_mapping,
+						     index,
+						     merge_order,
 						     merge_order);
 		if (ret)
 			return ret;
 	}
 
-	return ret;
+	return 0;
 }
 
 /* Assumes that start and nr_pages are aligned to gi->page_order. */
@@ -605,7 +658,8 @@ retry:
 			break;
 		}
 
-		folio = kvm_gmem_get_folio(inode, index, may_restructure);
+		folio = kvm_gmem_get_folio(inode, index, may_restructure,
+					   false);
 		if (IS_ERR(folio)) {
 			r = PTR_ERR(folio);
 			break;
@@ -748,7 +802,7 @@ retry:
 		filemap_invalidate_lock_shared(inode->i_mapping);
 	if (kvm_gmem_is_shared_mem(inode, vmf->pgoff))
 		folio = kvm_gmem_get_folio(inode, vmf->pgoff,
-					   may_restructure);
+					   may_restructure, true);
 	else
 		folio = ERR_PTR(-EACCES);
 	if (may_restructure)
@@ -769,13 +823,17 @@ retry:
 		return vmf_error(PTR_ERR(folio));
 	}
 
-	if (WARN_ON_ONCE(folio_test_large(folio))) {
+	if (WARN_ON_ONCE(folio_test_hugetlb(folio))) {
 		ret = VM_FAULT_SIGBUS;
+		goto out_folio;
+	}
+	if (folio_contain_hwpoisoned_page(folio)) {
+		ret = VM_FAULT_HWPOISON;
 		goto out_folio;
 	}
 
 	if (!folio_test_uptodate(folio)) {
-		clear_highpage(folio_page(folio, 0));
+		folio_zero_user(folio, vmf->address);
 		folio_mark_uptodate(folio);
 	}
 
@@ -966,55 +1024,120 @@ static void kvm_gmem_make_shared(struct inode *inode, pgoff_t start, pgoff_t end
 static void kvm_gmem_make_shared(struct inode *inode, pgoff_t start, pgoff_t end) {}
 #endif
 
-static bool kvm_gmem_range_will_be_private(struct inode *inode,
-					   pgoff_t huge_start,
-					   size_t huge_nr_pages,
-					   pgoff_t start,
-					   size_t nr_pages)
+/* The changed range must be contained in the candidate range. */
+static bool kvm_gmem_range_will_have_attributes(struct inode *inode,
+						pgoff_t range_start,
+						size_t range_nr_pages,
+						pgoff_t start,
+						size_t nr_pages,
+						u64 attributes)
 {
 	pgoff_t end = start + nr_pages;
-	pgoff_t huge_end = huge_start + huge_nr_pages;
+	pgoff_t range_end = range_start + range_nr_pages;
 
-	if (start > huge_start &&
-	    !kvm_gmem_range_has_attributes(inode, huge_start,
-					   start - huge_start,
-					   KVM_MEMORY_ATTRIBUTE_PRIVATE))
+	if (start > range_start &&
+	    !kvm_gmem_range_has_attributes(inode, range_start,
+					   start - range_start, attributes))
 		return false;
 
-	if (end < huge_end &&
-	    !kvm_gmem_range_has_attributes(inode, end, huge_end - end,
-					   KVM_MEMORY_ATTRIBUTE_PRIVATE))
+	if (end < range_end &&
+	    !kvm_gmem_range_has_attributes(inode, end, range_end - end,
+					   attributes))
 		return false;
 
 	return true;
 }
 
+static bool kvm_gmem_range_will_be_private(struct inode *inode,
+					   pgoff_t range_start,
+					   size_t range_nr_pages,
+					   pgoff_t start,
+					   size_t nr_pages)
+{
+	return kvm_gmem_range_will_have_attributes(inode, range_start,
+						   range_nr_pages, start,
+						   nr_pages,
+						   KVM_MEMORY_ATTRIBUTE_PRIVATE);
+}
+
+static bool kvm_gmem_range_will_be_shared(struct inode *inode,
+					  pgoff_t range_start,
+					  size_t range_nr_pages,
+					  pgoff_t start,
+					  size_t nr_pages)
+{
+	return kvm_gmem_range_will_have_attributes(inode, range_start,
+						   range_nr_pages, start,
+						   nr_pages, 0);
+}
+
 static int kvm_gmem_restructure(struct inode *inode, pgoff_t start,
-				size_t nr_pages, bool to_private,
-				pgoff_t *err_index)
+				size_t nr_pages, bool to_private)
 {
 	struct gmem_inode *gi = GMEM_I(inode);
-	size_t huge_nr_pages;
-	pgoff_t index;
-	u8 to_order;
+	u8 mapping_order, target_order;
+	size_t huge_nr_pages, mapping_nr_pages;
+	pgoff_t end, huge_start, index;
 	int ret;
 
 	if (!IS_ENABLED(CONFIG_KVM_GUEST_MEMFD_HUGETLB) || gi->page_order == 0)
 		return 0;
 
 	huge_nr_pages = 1UL << gi->page_order;
-	index = round_down(start, huge_nr_pages);
-	to_order = 0;
+	huge_start = round_down(start, huge_nr_pages);
+	end = start + nr_pages;
+	mapping_order = kvm_gmem_hugetlb_mapping_order(gi);
+	mapping_nr_pages = 1UL << mapping_order;
+
 	if (to_private &&
-	    kvm_gmem_range_will_be_private(inode, index, huge_nr_pages,
+	    kvm_gmem_range_will_be_private(inode, huge_start, huge_nr_pages,
 					   start, nr_pages))
-		to_order = gi->page_order;
+		return gmem_hugetlb_restructure_folio(inode->i_mapping,
+						      huge_start,
+						      gi->page_order,
+						      gi->page_order);
+	if (!to_private &&
+	    kvm_gmem_range_will_be_shared(inode, huge_start, huge_nr_pages,
+					  start, nr_pages))
+		return 0;
 
-	ret = gmem_hugetlb_restructure_folio(inode->i_mapping, index, to_order);
-	if (ret)
-		*err_index = start;
+	if (gi->page_order > mapping_order) {
+		ret = gmem_hugetlb_restructure_folio(inode->i_mapping,
+						     huge_start,
+						     gi->page_order,
+						     mapping_order);
+		if (ret)
+			return ret;
+	}
 
-	return ret;
+	index = round_down(start, mapping_nr_pages);
+	for (; index < end; index += mapping_nr_pages) {
+		if (!to_private) {
+			pgoff_t change_start = max(start, index);
+			pgoff_t change_end = min(end,
+						  index + mapping_nr_pages);
+
+			if (kvm_gmem_range_will_be_shared(inode, index,
+							  mapping_nr_pages,
+							  change_start,
+							  change_end - change_start))
+				continue;
+			target_order = 0;
+		} else if (kvm_gmem_range_is_private(inode, index,
+						     mapping_nr_pages)) {
+			target_order = mapping_order;
+		} else {
+			target_order = 0;
+		}
+
+		ret = gmem_hugetlb_restructure_folio(inode->i_mapping, index,
+						     mapping_order,
+						     target_order);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static pgoff_t kvm_gmem_compute_invalidate_start(struct inode *inode,
@@ -1063,8 +1186,13 @@ static int kvm_gmem_convert(struct inode *inode, pgoff_t start,
 		return r;
 	}
 
+	invalidate_start = kvm_gmem_compute_invalidate_start(inode, start);
+	invalidate_end = kvm_gmem_compute_invalidate_end(inode, end);
+
 	if (to_private) {
-		unmap_mapping_pages(mapping, start, nr_pages, false);
+		/* Drop every PTE that can reference a folio being restructured. */
+		unmap_mapping_pages(mapping, invalidate_start,
+				    invalidate_end - invalidate_start, false);
 
 		if (!kvm_gmem_has_safe_refcount(inode, start, nr_pages, err_index)) {
 			mas_destroy(&mas);
@@ -1072,10 +1200,13 @@ static int kvm_gmem_convert(struct inode *inode, pgoff_t start,
 		}
 	}
 
-	r = kvm_gmem_restructure(inode, start, nr_pages, to_private, err_index);
-	if (r) {
-		mas_destroy(&mas);
-		return r;
+	if (!to_private) {
+		r = kvm_gmem_restructure(inode, start, nr_pages, false);
+		if (r) {
+			*err_index = start;
+			mas_destroy(&mas);
+			return r;
+		}
 	}
 
 	/*
@@ -1084,8 +1215,6 @@ static int kvm_gmem_convert(struct inode *inode, pgoff_t start,
 	 */
 
 	filter = to_private ? KVM_FILTER_SHARED : KVM_FILTER_PRIVATE;
-	invalidate_start = kvm_gmem_compute_invalidate_start(inode, start);
-	invalidate_end = kvm_gmem_compute_invalidate_end(inode, end);
 	kvm_gmem_invalidate_start(inode, invalidate_start, invalidate_end);
 	r = kvm_gmem_prepare_conversion(inode, start, end, filter);
 	if (r)
@@ -1097,6 +1226,10 @@ static int kvm_gmem_convert(struct inode *inode, pgoff_t start,
 		kvm_gmem_make_shared(inode, start, end);
 
 	mas_store_prealloc(&mas, xa_mk_value(attrs));
+
+	/* Restructuring is best effort; faults finish incomplete work. */
+	if (to_private)
+		kvm_gmem_restructure(inode, start, nr_pages, true);
 
 out_invalidate:
 	kvm_gmem_invalidate_end(inode, invalidate_start, invalidate_end);
@@ -1581,7 +1714,8 @@ static struct folio *__kvm_gmem_get_pfn(struct file *file,
 		return ERR_PTR(-EIO);
 	}
 
-	folio = kvm_gmem_get_folio(file_inode(file), index, may_restructure);
+	folio = kvm_gmem_get_folio(file_inode(file), index, may_restructure,
+				   false);
 	if (IS_ERR(folio))
 		return folio;
 

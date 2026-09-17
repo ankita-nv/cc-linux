@@ -176,9 +176,10 @@ err_put_pages:
 }
 
 int gmem_hugetlb_restructure_folio(struct address_space *mapping,
-				   pgoff_t index, u8 to_order)
+				   pgoff_t start, u8 range_order,
+				   u8 target_order)
 {
-	struct folio *folio = filemap_get_folio(mapping, index);
+	struct folio *folio = filemap_get_folio(mapping, start);
 
 	if (IS_ERR(folio))
 		return 0;
@@ -186,5 +187,7 @@ int gmem_hugetlb_restructure_folio(struct address_space *mapping,
 	/* Leave only filemap refcounts on folio. */
 	folio_put(folio);
 
-	return hugetlb_restructuring_restructure_folio(folio, to_order);
+	return hugetlb_restructuring_restructure_folio(folio, start,
+						       range_order,
+						       target_order);
 }

@@ -27,7 +27,8 @@ static inline void gmem_hugetlb_abort_folio(struct folio *folio)
 }
 
 int gmem_hugetlb_restructure_folio(struct address_space *mapping,
-				   pgoff_t index, u8 to_order);
+				   pgoff_t start, u8 range_order,
+				   u8 target_order);
 
 #else
 
@@ -58,7 +59,9 @@ static inline void gmem_hugetlb_free_folio(struct folio *folio) {}
 static inline void gmem_hugetlb_abort_folio(struct folio *folio) {}
 
 static inline int gmem_hugetlb_restructure_folio(struct address_space *mapping,
-						 pgoff_t index, u8 to_order)
+						 pgoff_t start,
+						 u8 range_order,
+						 u8 target_order)
 {
 	WARN_ONCE(true, "Unexpected call to gmem_hugetlb_restructure_folio().");
 	return -EOPNOTSUPP;

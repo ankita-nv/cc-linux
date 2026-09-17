@@ -377,11 +377,18 @@ static bool hugetlb_restructuring_xas_matches(struct xa_state *xas,
 static u8 hugetlb_restructuring_next_split_order(u8 current_order,
 						 u8 to_order)
 {
-	u8 boundary_order;
+	u8 boundary_order, next_order;
 
 	boundary_order = ((current_order - 1) / XA_CHUNK_SHIFT) *
 			 XA_CHUNK_SHIFT;
-	return max(to_order, boundary_order);
+	next_order = max(to_order, boundary_order);
+
+	/* Keep PMD as a stage so partial restructuring remains resumable. */
+	if (PTRS_PER_PMD > 1 && current_order > PMD_ORDER &&
+	    next_order < PMD_ORDER)
+		next_order = PMD_ORDER;
+
+	return next_order;
 }
 
 static void __merge_folio_to_order(struct folio *folio, unsigned int to_order)
@@ -587,10 +594,10 @@ out_destroy:
 
 static int hugetlb_restructuring_split_range(struct address_space *mapping,
 					     pgoff_t start, u8 original_order,
-					     u8 to_order)
+					     u8 from_order, u8 to_order)
 {
-	pgoff_t end = start + (1UL << original_order);
-	u8 current_order = original_order;
+	pgoff_t end = start + (1UL << from_order);
+	u8 current_order = from_order;
 
 	while (current_order > to_order) {
 		u8 next_order = hugetlb_restructuring_next_split_order(
@@ -643,11 +650,18 @@ static int hugetlb_restructuring_split_range(struct address_space *mapping,
 static u8 hugetlb_restructuring_next_merge_order(u8 current_order,
 						 u8 to_order)
 {
-	u8 boundary_order;
+	u8 boundary_order, next_order;
 
 	boundary_order = (current_order / XA_CHUNK_SHIFT + 1) *
 			 XA_CHUNK_SHIFT;
-	return min(to_order, boundary_order);
+	next_order = min(to_order, boundary_order);
+
+	/* Keep PMD as a stage so partial restructuring remains resumable. */
+	if (PTRS_PER_PMD > 1 && current_order < PMD_ORDER &&
+	    next_order > PMD_ORDER)
+		next_order = PMD_ORDER;
+
+	return next_order;
 }
 
 static int hugetlb_restructuring_merge_one(struct address_space *mapping,
@@ -684,9 +698,10 @@ static int hugetlb_restructuring_merge_one(struct address_space *mapping,
 		    folio_order(child) != current_order ||
 		    folio_pfn(child) != first_pfn + (i << current_order) ||
 		    folio_test_large(child) != !!current_order ||
-		    folio_has_type(child) || folio_mapped(child) ||
-		    folio_test_lru(child))
+		    folio_has_type(child))
 			return -EINVAL;
+		if (folio_mapped(child) || folio_test_lru(child))
+			return -EBUSY;
 		if (current_order > 1 &&
 		    !list_empty(&child->_deferred_list))
 			return -EINVAL;
@@ -766,18 +781,17 @@ out_unfreeze:
 
 static int hugetlb_restructuring_merge_range(struct address_space *mapping,
 					     pgoff_t start, u8 original_order,
-					     u8 from_order)
+					     u8 to_order)
 {
-	pgoff_t end = start + (1UL << original_order);
-	u8 current_order = from_order;
+	pgoff_t end = start + (1UL << to_order);
+	u8 current_order = 0;
 
-	while (current_order < original_order) {
+	while (current_order < to_order) {
 		u8 next_order = hugetlb_restructuring_next_merge_order(
-			current_order, original_order);
+			current_order, to_order);
 		pgoff_t index;
 
-		for (index = start; index < end;
-		     index += 1UL << next_order) {
+		for (index = start; index < end;) {
 			struct folio *folio;
 			pgoff_t folio_end;
 			u8 actual_order;
@@ -803,6 +817,7 @@ static int hugetlb_restructuring_merge_range(struct address_space *mapping,
 				if (folio->index > index ||
 				    folio_end < index + (1UL << next_order))
 					return -EINVAL;
+				index = min(folio_end, end);
 				cond_resched();
 				continue;
 			}
@@ -817,6 +832,7 @@ static int hugetlb_restructuring_merge_range(struct address_space *mapping,
 			if (ret)
 				return ret;
 
+			index += 1UL << next_order;
 			cond_resched();
 		}
 
@@ -826,12 +842,20 @@ static int hugetlb_restructuring_merge_range(struct address_space *mapping,
 	return 0;
 }
 
-int hugetlb_restructuring_restructure_folio(struct folio *folio, u8 to_order)
+/*
+ * Restructure an aligned range within the original HugeTLB allocation.
+ * Splits cap every folio in the range at @target_order, while merges ensure
+ * the complete range is covered by a single folio of at least @target_order.
+ */
+int hugetlb_restructuring_restructure_folio(struct folio *folio,
+					    pgoff_t start, u8 range_order,
+					    u8 target_order)
 {
 	struct address_space *mapping = folio->mapping;
-	unsigned long base_pfn;
-	unsigned long nr_pages;
-	pgoff_t start;
+	unsigned long base_pfn, pfn_offset;
+	unsigned long nr_pages, range_pages;
+	pgoff_t original_start, original_end, folio_end, range_end;
+	unsigned int current_order;
 	u8 original_order;
 
 	if (!mapping)
@@ -843,30 +867,60 @@ int hugetlb_restructuring_restructure_folio(struct folio *folio, u8 to_order)
 						  &original_order))
 		return -EINVAL;
 
-	/* The conversion interface only needs fully split or original order. */
-	if (to_order != 0 && to_order != original_order)
+	if (target_order > range_order || range_order > original_order)
 		return -EINVAL;
 
 	if (folio_contain_hwpoisoned_page(folio))
 		return -EHWPOISON;
 
 	nr_pages = 1UL << original_order;
-	start = round_down(folio->index, nr_pages);
-	if (folio_pfn(folio) < base_pfn ||
-	    folio_pfn(folio) - base_pfn >= nr_pages ||
-	    folio->index - start != folio_pfn(folio) - base_pfn)
-		return -EINVAL;
-	if (start + nr_pages < start)
+	original_start = round_down(folio->index, nr_pages);
+	original_end = original_start + nr_pages;
+	if (original_end < original_start)
 		return -EINVAL;
 
-	if (to_order == 0)
+	folio_end = folio->index + folio_nr_pages(folio);
+	if (folio_end < folio->index || folio_end > original_end ||
+	    !in_range(start, folio->index, folio_nr_pages(folio)))
+		return -EINVAL;
+
+	if (!in_range(folio_pfn(folio), base_pfn, nr_pages))
+		return -EINVAL;
+
+	pfn_offset = folio_pfn(folio) - base_pfn;
+	if (folio->index - original_start != pfn_offset)
+		return -EINVAL;
+
+	/* Only the original-order folio retains the HugeTLB type. */
+	current_order = folio_order(folio);
+	if (current_order > original_order)
+		return -EINVAL;
+
+	if (current_order == original_order) {
+		if (!folio_test_hugetlb(folio))
+			return -EINVAL;
+	} else if (folio_has_type(folio)) {
+		return -EINVAL;
+	}
+
+	range_pages = 1UL << range_order;
+	range_end = start + range_pages;
+	if (!IS_ALIGNED(start, range_pages) || range_end < start ||
+	    range_end > original_end)
+		return -EINVAL;
+
+	if (target_order == range_order && range_end <= folio_end)
+		return 0;
+
+	if (target_order < range_order)
 		return hugetlb_restructuring_split_range(mapping, start,
-							 original_order, 0);
+							 original_order,
+							 range_order,
+							 target_order);
 
-	return hugetlb_restructuring_merge_range(mapping, start,
-						 original_order, 0);
+	return hugetlb_restructuring_merge_range(mapping, start, original_order,
+						 target_order);
 }
-
 EXPORT_SYMBOL_FOR_MODULES(hugetlb_restructuring_restructure_folio, "kvm");
 
 static int hugetlb_restructuring_cleanup_account(
