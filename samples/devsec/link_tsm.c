@@ -260,22 +260,6 @@ static void devsec_link_tsm_unbind(struct pci_tdi *tdi)
 	kfree(devsec_tdi);
 }
 
-static ssize_t devsec_link_tsm_guest_req(struct pci_tdi *tdi,
-					 enum pci_tsm_req_scope scope,
-					 sockptr_t req_in, size_t in_len,
-					 sockptr_t req_out, size_t out_len,
-					 u64 *tsm_code)
-{
-	if (!sockptr_is_kernel(req_in))
-		return -ENXIO;
-
-	dev_dbg(pci_tsm_host(tdi->pdev), "%s\n", pci_name(tdi->pdev));
-	print_hex_dump_debug("devsec req_in  ", DUMP_PREFIX_OFFSET, 16, 4,
-			     req_in.kernel, min(in_len, 256u), true);
-
-	return 0;
-}
-
 static struct pci_tsm_ops devsec_link_pci_ops = {
 	.probe = devsec_link_tsm_pci_probe,
 	.remove = devsec_link_tsm_pci_remove,
@@ -283,7 +267,6 @@ static struct pci_tsm_ops devsec_link_pci_ops = {
 	.disconnect = devsec_link_tsm_disconnect,
 	.bind = devsec_link_tsm_bind,
 	.unbind = devsec_link_tsm_unbind,
-	.guest_req = devsec_link_tsm_guest_req,
 };
 
 static void devsec_link_tsm_remove(void *tsm_dev)
@@ -358,46 +341,13 @@ static ssize_t tsm_unbind_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(tsm_unbind);
 
-static ssize_t tsm_request_store(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *__buf, size_t count)
-{
-	ssize_t rc;
-	u64 tsm_code = 0;
-	struct device *host;
-	char req_out[16] = {0};
-	size_t out_len = sizeof(req_out);
-
-	struct pci_dev *pdev __free(pci_dev_put) = pci_find_device(__buf);
-	if (!pdev)
-		return -ENODEV;
-
-	char *buf __free(kvfree) = kvmemdup(__buf, count, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	host = pci_tsm_host(pdev);
-	if (!host || host != &devsec_link_tsm->dev)
-		return -ENXIO;
-
-	rc = pci_tsm_guest_req(pdev, PCI_TSM_REQ_INFO, KERNEL_SOCKPTR(buf),
-			       count, KERNEL_SOCKPTR(req_out), out_len,
-			       &tsm_code);
-	if (rc)
-		return rc;
-
-	return count;
-}
-static DEVICE_ATTR_WO(tsm_request);
-
 /*
- * Facilitate testing of the bind and request flows in lieu of VFIO/IOMMUFD
+ * Facilitate testing of the bind flows in lieu of VFIO/IOMMUFD
  * support to exercise these paths.
  */
 static struct attribute *devsec_link_attrs[] = {
 	&dev_attr_tsm_bind.attr,
 	&dev_attr_tsm_unbind.attr,
-	&dev_attr_tsm_request.attr,
 	NULL,
 };
 
