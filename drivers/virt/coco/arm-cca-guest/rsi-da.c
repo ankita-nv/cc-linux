@@ -205,9 +205,26 @@ static int cca_apply_evidence_report_range(struct pci_dev *pdev,
 		else
 			ret = rsi_invalidate_dev_mapping(res->start, res->end + 1);
 		if (ret)
-			return ret;
+			goto err_rollback;
 	}
 	return 0;
+
+err_rollback:
+	if (!map)
+		return ret;
+
+	/*
+	 * Best-effort rollback. The failed entry is included, as the host
+	 * may have validated part of it before rejecting the rest.
+	 */
+	for (; i >= 0; i--) {
+		entry = pci_tsm_mmio_entry(mmio, i);
+		res = &entry->res;
+		if (res->desc != IORES_DESC_ENCRYPTED)
+			continue;
+		rsi_invalidate_dev_mapping(res->start, res->end + 1);
+	}
+	return ret;
 }
 
 int cca_map_evidence_report_range(struct pci_dev *pdev, struct pci_tsm_mmio *mmio)
