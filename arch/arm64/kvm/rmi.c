@@ -3369,7 +3369,9 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 	 * potential NS mappings to avoid duplicate mappings
 	 * to the same ranges.
 	 */
-	kvm_realm_unmap_range(kvm, start_ipa, end_ipa - start_ipa, false, false);
+	write_lock(&kvm->mmu_lock);
+	kvm_realm_unmap_range(kvm, start_ipa, end_ipa - start_ipa, false, true);
+	write_unlock(&kvm->mmu_lock);
 
 	ret = rmi_init_device_gpt_range(start_pa, end_ipa - start_ipa);
 	if (ret)
