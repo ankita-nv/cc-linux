@@ -3531,6 +3531,23 @@ static int kvm_complete_vdev_map_validate(struct kvm_vcpu *vcpu)
 						       start_ipa,
 						       run->cca_exit.gpa_top,
 						       &next_ipa);
+			if (rmi_ret >= 0 &&
+			    RMI_RETURN_STATUS(rmi_ret) == RMI_BLOCKED) {
+				/*
+				 * Entering the REC now would hand the Realm a
+				 * partial result. KVM_REQ_RMI has been
+				 * consumed, so re-arm it and resume from
+				 * @start_ipa on the next KVM_RUN instead.
+				 */
+				if (signal_pending(current)) {
+					run->cca_exit.gpa_base = start_ipa;
+					run->exit_reason = KVM_EXIT_INTR;
+					kvm_make_request(KVM_REQ_RMI, vcpu);
+					return -EINTR;
+				}
+				cond_resched();
+				continue;
+			}
 			if (rmi_ret || next_ipa <= start_ipa) {
 				rec->run->enter.flags = REC_ENTER_FLAG_DEV_MEM_RESPONSE;
 				break;
