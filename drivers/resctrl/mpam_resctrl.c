@@ -716,6 +716,14 @@ int resctrl_arch_cntr_read(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
 	l3_dom = container_of(d, struct mpam_resctrl_dom, resctrl_mon_dom);
 	mon_comp = l3_dom->mon_comp[eventid];
 
+	/*
+	 * A monitor domain can be registered for events whose class has no
+	 * component overlapping this domain, leaving the entry unset. Reading
+	 * it would dereference NULL in the msmon code.
+	 */
+	if (!mon_comp)
+		return -EINVAL;
+
 	return read_mon_cdp_safe(mon, mon_comp, mpam_feat_msmon_mbwu,
 				 USE_PRE_ALLOCATED, closid, rmid, val);
 }

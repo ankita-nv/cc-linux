@@ -432,7 +432,7 @@ static int __l3_mon_event_count(struct rdtgroup *rdtgrp, struct rmid_read *rr)
 	struct mbm_state *m;
 	u64 tval = 0;
 
-	if (!domain_header_is_valid(rr->hdr, RESCTRL_MON_DOMAIN, RDT_RESOURCE_L3)) {
+	if (!domain_header_is_valid(rr->hdr, RESCTRL_MON_DOMAIN, rr->r->rid)) {
 		rr->err = -EIO;
 		return -EINVAL;
 	}
@@ -543,6 +543,15 @@ static int __mon_event_count(struct rdtgroup *rdtgrp, struct rmid_read *rr)
 			return __l3_mon_event_count(rdtgrp, rr);
 		else
 			return __l3_mon_event_count_sum(rdtgrp, rr);
+	case RDT_RESOURCE_MBA:
+		/*
+		 * MBM counters may be provided by memory-side controllers
+		 * rather than the cache, in which case the events hang off
+		 * this resource. Such a resource has per-domain files only:
+		 * summing is for domains sharing an L3, which these do not.
+		 */
+		WARN_ON_ONCE(rr->evt->any_cpu);
+		return __l3_mon_event_count(rdtgrp, rr);
 	case RDT_RESOURCE_PERF_PKG: {
 		u64 tval = 0;
 
