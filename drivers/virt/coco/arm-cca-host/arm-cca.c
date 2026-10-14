@@ -187,6 +187,38 @@ err_comm_buff:
 	return ret;
 }
 
+static int cca_root_port_pdev_get(struct pci_dev *pdev)
+{
+	int ret;
+	struct cca_host_rp_dsc *rp_dsc;
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	struct cca_host_pf0_ep_dsc *pf0_ep_dsc = to_cca_pf0_ep_dsc(pdev);
+
+	if (!rp)
+		return -EINVAL;
+
+	if (!rp->tsm) {
+		ret = cca_root_port_pdev_create(rp, pf0_ep_dsc->pci.base_tsm.tsm_dev);
+		if (ret)
+			return ret;
+		rp_dsc = to_cca_rp_dsc(rp);
+		if (!rp_dsc)
+			return -EINVAL;
+	} else {
+		/* Make sure they use the same TSM */
+		if (rp->tsm->tsm_dev != pf0_ep_dsc->pci.base_tsm.tsm_dev)
+			return -EINVAL;
+
+		rp_dsc = to_cca_rp_dsc(rp);
+		if (!rp_dsc)
+			return -EINVAL;
+		kref_get(&rp_dsc->tsm_ref);
+	}
+
+	pf0_ep_dsc->rp_dsc = rp_dsc;
+	return 0;
+}
+
 static int pci_dev_addr_range(struct pci_dev *pdev, struct rmi_addr_range *pdev_addr)
 {
 	int naddr = 0;
@@ -221,29 +253,13 @@ static int cca_pdev_create_ncoh_stream(struct pci_dev *pdev, unsigned long strea
 	if (!rp)
 		return -EINVAL;
 
-	if (!rp->tsm) {
-		ret = cca_root_port_pdev_create(rp, pf0_ep_dsc->pci.base_tsm.tsm_dev);
-		if (ret)
-			return ret;
-		rp_dsc = to_cca_rp_dsc(rp);
-		if (!rp_dsc)
-			return -EINVAL;
-	} else {
-		/* Make sure they use the same TSM */
-		if (rp->tsm->tsm_dev != pf0_ep_dsc->pci.base_tsm.tsm_dev)
-			return -EINVAL;
-
-		rp_dsc = to_cca_rp_dsc(rp);
-		if (!rp_dsc)
-			return -EINVAL;
-		kref_get(&rp_dsc->tsm_ref);
-	}
+	rp_dsc = to_cca_rp_dsc(rp);
+	if (!rp_dsc)
+		return -EINVAL;
 
 	params = (struct rmi_pdev_stream_params *)get_zeroed_page(GFP_KERNEL);
-	if (!params) {
-		cca_root_port_pdev_put(rp_dsc);
+	if (!params)
 		return -ENOMEM;
-	}
 
 	params->flags = 0;
 	params->stream_type = RMI_PDEV_STREAM_NCOH;
@@ -253,10 +269,8 @@ static int cca_pdev_create_ncoh_stream(struct pci_dev *pdev, unsigned long strea
 	params->num_addr_range = pci_dev_addr_range(pdev, params->addr_range);
 
 	ret = cca_pdev_stream_connect(pdev, rp, params, &stream_handle);
-	if (ret)
-		cca_root_port_pdev_put(rp_dsc);
-	else
-		pf0_ep_dsc->stream_handle = stream_handle;
+	if (!ret)
+		pf0_ep_dsc->rmi_stream_handle_ncoh = stream_handle;
 
 	free_page((unsigned long)params);
 	return ret;
@@ -282,7 +296,7 @@ static int cca_pdev_create_ncoh_sys_stream(struct pci_dev *pdev)
 
 	ret = cca_pdev_stream_connect(pdev, NULL, params, &stream_handle);
 	if (!ret)
-		pf0_ep_dsc->stream_handle = stream_handle;
+		pf0_ep_dsc->rmi_stream_handle_ncoh = stream_handle;
 
 	free_page((unsigned long)params);
 	return ret;
@@ -313,6 +327,31 @@ static int cca_pdev_init_device_tracking(struct pci_dev *pdev)
 	return 0;
 }
 
+static void cca_pdev_disconnect_streams(struct pci_dev *pdev)
+{
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	struct cca_host_pf0_ep_dsc *pf0_ep_dsc = to_cca_pf0_ep_dsc(pdev);
+	struct cca_host_rp_dsc *rp_dsc;
+
+	if (!pf0_ep_dsc)
+		return;
+
+	if (pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT)
+		return;
+
+	rp_dsc = pf0_ep_dsc->rp_dsc;
+
+	if (pf0_ep_dsc->rmi_stream_handle_ncoh) {
+		cca_pdev_disconnect_stream(pdev, rp, pf0_ep_dsc->rmi_stream_handle_ncoh);
+		pf0_ep_dsc->rmi_stream_handle_ncoh = 0;
+	}
+
+	if (rp_dsc) {
+		pf0_ep_dsc->rp_dsc = NULL;
+		cca_root_port_pdev_put(rp_dsc);
+	}
+}
+
 static int cca_pdev_create_streams(struct pci_dev *pdev, unsigned long stream_id)
 {
 	int ret;
@@ -323,7 +362,14 @@ static int cca_pdev_create_streams(struct pci_dev *pdev, unsigned long stream_id
 
 	switch (pci_pcie_type(pdev)) {
 	case PCI_EXP_TYPE_ENDPOINT:
-		return cca_pdev_create_ncoh_stream(pdev, stream_id);
+		ret = cca_root_port_pdev_get(pdev);
+		if (ret)
+			return ret;
+
+		ret = cca_pdev_create_ncoh_stream(pdev, stream_id);
+		if (ret)
+			cca_pdev_disconnect_streams(pdev);
+		return ret;
 	case PCI_EXP_TYPE_RC_END:
 		return cca_pdev_create_ncoh_sys_stream(pdev);
 	case PCI_EXP_TYPE_ROOT_PORT:
@@ -439,7 +485,6 @@ static void cca_tsm_disconnect(struct pci_dev *pdev)
 {
 	struct pci_ide *ide;
 	struct cca_host_pf0_ep_dsc *pf0_ep_dsc;
-	struct pci_dev *rp = pcie_find_root_port(pdev);
 
 	pf0_ep_dsc = to_cca_pf0_ep_dsc(pdev);
 	if (!pf0_ep_dsc)
@@ -448,12 +493,7 @@ static void cca_tsm_disconnect(struct pci_dev *pdev)
 	if (cca_pdev_need_sel_ide_streams(pdev))
 		ide = pf0_ep_dsc->sel_stream;
 
-	if (pf0_ep_dsc->stream_handle) {
-		cca_pdev_disconnect_stream(pdev, rp, pf0_ep_dsc->stream_handle);
-		pf0_ep_dsc->stream_handle = 0;
-		if (rp && pci_pcie_type(pdev) == PCI_EXP_TYPE_ENDPOINT)
-			cca_root_port_pdev_put(to_cca_rp_dsc(rp));
-	}
+	cca_pdev_disconnect_streams(pdev);
 
 	cca_pdev_stop_and_destroy(pdev);
 	free_dev_communication_buffers(&pf0_ep_dsc->pdev.comm_data);

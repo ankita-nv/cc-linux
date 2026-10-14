@@ -1379,7 +1379,7 @@ retry_unlock:
 	    !rmi_vdev_get_state(rmm_vdev_phys, &state) &&
 	    state == RMI_VDEV_KEY_REFRESH) {
 		struct pci_dev *rp = pcie_find_root_port(pf0_dev);
-		unsigned long stream_handle = pf0_ep_dsc->stream_handle;
+		unsigned long stream_handle = pf0_ep_dsc->rmi_stream_handle_ncoh;
 		struct rmi_pdev_stream_info info;
 		phys_addr_t peer_phys = 0;
 		bool has_ide;

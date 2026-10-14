@@ -87,7 +87,8 @@ struct cca_host_pdev_dsc {
  * @pci: Physical Function 0 TDISP link context
  * @pdev: pdev communication context
  * @sel_stream: Selective IDE Stream descriptor
- * @stream_handle: Stream handle returned by stream connect
+ * @rmi_stream_handle_ncoh: stream handle for non-coherent stream registration
+ * @rp_dsc: root port PDEV referenced by the endpoint streams
  * @rmi_signature_algorithm: Signature algorithm used for public key
  * @cert_chain: cetrificate chain
  * @vca: SPDM's Version-Capabilities-Algorithms cache object
@@ -96,7 +97,8 @@ struct cca_host_pf0_ep_dsc {
 	struct pci_tsm_pf0 pci;
 	struct cca_host_pdev_dsc pdev;
 	struct pci_ide *sel_stream;
-	unsigned long stream_handle;
+	unsigned long rmi_stream_handle_ncoh;
+	struct cca_host_rp_dsc *rp_dsc;
 
 	char *rmi_signature_algorithm;
 	struct {
