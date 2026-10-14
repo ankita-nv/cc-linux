@@ -276,6 +276,52 @@ static int cca_pdev_create_ncoh_stream(struct pci_dev *pdev, unsigned long strea
 	return ret;
 }
 
+static int cca_pdev_create_link_stream(struct pci_dev *pdev)
+{
+	int ret, stream_id;
+	long stream_handle;
+	struct rmi_pdev_stream_params *params;
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	struct pci_host_bridge *hb = pci_find_host_bridge(pdev->bus);
+	struct cca_host_pf0_ep_dsc *pf0_ep_dsc = to_cca_pf0_ep_dsc(pdev);
+	struct cca_host_rp_dsc *rp_dsc;
+
+	if (!rp)
+		return -EINVAL;
+	rp_dsc = to_cca_rp_dsc(rp);
+	if (!rp_dsc)
+		return -EINVAL;
+
+	params = (struct rmi_pdev_stream_params *)get_zeroed_page(GFP_KERNEL);
+	if (!params)
+		return -ENOMEM;
+
+	/* Stream ids are 8 bits wide; registered selective streams hold theirs. */
+	stream_id = ida_alloc_max(&hb->ide_stream_ids_ida, U8_MAX, GFP_KERNEL);
+	if (stream_id < 0) {
+		ret = stream_id;
+		goto out;
+	}
+
+	params->flags = 0;
+	params->stream_type = RMI_PDEV_STREAM_NON_TEE;
+	params->pdev_1 = virt_to_phys(pf0_ep_dsc->pdev.rmm_pdev);
+	params->pdev_2 = virt_to_phys(rp_dsc->pdev.rmm_pdev);
+	params->ide_sid = stream_id;
+
+	ret = cca_pdev_stream_connect(pdev, rp, params, &stream_handle);
+	if (ret) {
+		ida_free(&hb->ide_stream_ids_ida, stream_id);
+		goto out;
+	}
+
+	pf0_ep_dsc->rmi_stream_handle_link = stream_handle;
+	pf0_ep_dsc->link_stream_id = stream_id;
+out:
+	free_page((unsigned long)params);
+	return ret;
+}
+
 static int cca_pdev_create_ncoh_sys_stream(struct pci_dev *pdev)
 {
 	int ret;
@@ -341,6 +387,13 @@ static void cca_pdev_disconnect_streams(struct pci_dev *pdev)
 
 	rp_dsc = pf0_ep_dsc->rp_dsc;
 
+	if (pf0_ep_dsc->rmi_stream_handle_link) {
+		cca_pdev_disconnect_stream(pdev, rp, pf0_ep_dsc->rmi_stream_handle_link);
+		pf0_ep_dsc->rmi_stream_handle_link = 0;
+		ida_free(&pci_find_host_bridge(pdev->bus)->ide_stream_ids_ida,
+			 pf0_ep_dsc->link_stream_id);
+	}
+
 	if (pf0_ep_dsc->rmi_stream_handle_ncoh) {
 		cca_pdev_disconnect_stream(pdev, rp, pf0_ep_dsc->rmi_stream_handle_ncoh);
 		pf0_ep_dsc->rmi_stream_handle_ncoh = 0;
@@ -368,7 +421,28 @@ static int cca_pdev_create_streams(struct pci_dev *pdev, unsigned long stream_id
 
 		ret = cca_pdev_create_ncoh_stream(pdev, stream_id);
 		if (ret)
-			cca_pdev_disconnect_streams(pdev);
+			goto err_disconnect;
+
+		if (pci_ide_link_stream_capable(pdev)) {
+			/*
+			 * RMI_PDEV_STREAM_CONNECT rejects a NON_TEE stream
+			 * unless the RMM advertises it. Skip rather than fail
+			 * so that the device still attaches over its other
+			 * streams.
+			 */
+			if (!rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_NON_TEE_STREAM)) {
+				pci_warn(pdev,
+					 "RMM lacks NON_TEE stream support; skipping link IDE\n");
+			} else {
+				ret = cca_pdev_create_link_stream(pdev);
+				if (ret)
+					goto err_disconnect;
+			}
+		}
+
+		return 0;
+err_disconnect:
+		cca_pdev_disconnect_streams(pdev);
 		return ret;
 	case PCI_EXP_TYPE_RC_END:
 		return cca_pdev_create_ncoh_sys_stream(pdev);

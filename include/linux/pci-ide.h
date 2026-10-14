@@ -103,6 +103,7 @@ struct pci_ide {
  */
 #define PCI_IDE_RESERVED_STREAM_ID 255
 
+bool pci_ide_link_stream_capable(struct pci_dev *pdev);
 void pci_ide_set_nr_streams(struct pci_host_bridge *hb, u16 nr);
 struct pci_ide_partner *pci_ide_to_settings(struct pci_dev *pdev,
 					    struct pci_ide *ide);

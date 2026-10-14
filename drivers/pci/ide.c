@@ -813,6 +813,25 @@ void pci_ide_set_nr_streams(struct pci_host_bridge *hb, u16 nr)
 }
 EXPORT_SYMBOL_NS_GPL(pci_ide_set_nr_streams, "PCI_IDE");
 
+/**
+ * pci_ide_link_stream_capable() - can @pdev be protected by a Link IDE Stream?
+ * @pdev: Endpoint to query
+ *
+ * A Link IDE Stream only protects a single link, so it is usable when the
+ * endpoint is attached directly to its Root Port and both ports implement
+ * the Link IDE Stream capability.
+ */
+bool pci_ide_link_stream_capable(struct pci_dev *pdev)
+{
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+
+	if (!rp || pci_upstream_bridge(pdev) != rp)
+		return false;
+
+	return pdev->nr_link_ide && rp->nr_link_ide;
+}
+EXPORT_SYMBOL_GPL(pci_ide_link_stream_capable);
+
 void pci_ide_destroy(struct pci_dev *pdev)
 {
 	ida_destroy(&pdev->ide_stream_ida);
