@@ -97,7 +97,7 @@ void pci_ide_init(struct pci_dev *pdev)
 		return;
 
 	pci_read_config_dword(pdev, ide_cap + PCI_IDE_CAP, &val);
-	if ((val & PCI_IDE_CAP_SELECTIVE) == 0)
+	if (!(val & (PCI_IDE_CAP_LINK | PCI_IDE_CAP_SELECTIVE)))
 		return;
 
 	/*
@@ -123,7 +123,9 @@ void pci_ide_init(struct pci_dev *pdev)
 		nr_link_ide = 0;
 
 	nr_ide_mem = 0;
-	nr_streams = 1 + FIELD_GET(PCI_IDE_CAP_SEL_NUM, val);
+	nr_streams = 0;
+	if (val & PCI_IDE_CAP_SELECTIVE)
+		nr_streams = 1 + FIELD_GET(PCI_IDE_CAP_SEL_NUM, val);
 	for (u16 i = 0; i < nr_streams; i++) {
 		int pos = __sel_ide_offset(ide_cap, nr_link_ide, i, nr_ide_mem);
 		int nr_assoc;
@@ -831,6 +833,24 @@ bool pci_ide_link_stream_capable(struct pci_dev *pdev)
 	return pdev->nr_link_ide && rp->nr_link_ide;
 }
 EXPORT_SYMBOL_GPL(pci_ide_link_stream_capable);
+
+/**
+ * pci_ide_selective_stream_capable() - can @pdev use a Selective IDE Stream?
+ * @pdev: Endpoint to query
+ *
+ * Selective IDE requires stream register blocks in both the Endpoint and its
+ * Root Port.
+ */
+bool pci_ide_selective_stream_capable(struct pci_dev *pdev)
+{
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+
+	if (pci_pcie_type(pdev) != PCI_EXP_TYPE_ENDPOINT || !rp)
+		return false;
+
+	return pdev->nr_sel_ide && rp->nr_sel_ide;
+}
+EXPORT_SYMBOL_GPL(pci_ide_selective_stream_capable);
 
 void pci_ide_destroy(struct pci_dev *pdev)
 {
