@@ -627,19 +627,11 @@ static void cca_link_tsm_remove(void *tsm_dev)
 	tsm_unregister(tsm_dev);
 }
 
-static bool rmi_has_reg2_feature(unsigned long feature)
-{
-	return !!u64_get_bits(rmi_feat_reg(2), feature);
-}
-
 static int cca_link_tsm_probe(struct arm_smccc_device *sdev)
 {
 	struct iommufd_viommu_provider *provider;
 	struct tsm_dev *tsm_dev;
 	int ret;
-
-	if (!rmi_has_reg2_feature(RMI_FEATURE_REGISTER_2_DA))
-		return -ENODEV;
 
 	tsm_dev = tsm_register(&sdev->dev, &cca_link_pci_ops);
 	if (IS_ERR(tsm_dev))
