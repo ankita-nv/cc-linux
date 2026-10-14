@@ -1322,11 +1322,72 @@ int cca_pdev_purge_stream_key(struct pci_dev *pdev1,
 	return 0;
 }
 
+/*
+ * Only NCOH and COH streams carry an IDE stream (DEN0137 PdevStreamUsesIDE),
+ * and the RMM rejects RMI_PDEV_STREAM_KEY_REFRESH/PURGE on others. The
+ * handle of an RC integrated endpoint names its NCOH_SYS stream, so ask the
+ * RMM for the type. Returns 1 for an IDE stream, 0 otherwise, or -errno.
+ */
+static int cca_pdev_stream_uses_ide(struct pci_dev *pdev, struct pci_dev *rp,
+				    unsigned long stream_handle)
+{
+	phys_addr_t pdev_phys = virt_to_phys(to_cca_pdev_dsc(pdev)->rmm_pdev);
+	phys_addr_t peer_phys = 0;
+	struct rmi_pdev_stream_info info;
+
+	if (rp)
+		peer_phys = virt_to_phys(to_cca_pdev_dsc(rp)->rmm_pdev);
+
+	if (rmi_pdev_stream_info(pdev_phys, peer_phys, stream_handle, &info))
+		return -EIO;
+
+	return info.type == RMI_PDEV_STREAM_NCOH ||
+	       info.type == RMI_PDEV_STREAM_COH;
+}
+
+/*
+ * Iterate the IDE-bearing stream handles activated for the endpoint @pdev
+ * and invoke @stream_op for each. A stream is activated when its handle is
+ * non-zero.
+ */
+static int cca_pdev_for_each_ide_stream(struct pci_dev *pdev,
+		int (*stream_op)(struct pci_dev *pdev1, struct pci_dev *pdev2,
+				 unsigned long stream_handle))
+{
+	struct cca_host_pf0_ep_dsc *pf0_ep_dsc = to_cca_pf0_ep_dsc(pdev);
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	int ret;
+
+	if (!pf0_ep_dsc)
+		return -EINVAL;
+
+	if (pf0_ep_dsc->rmi_stream_handle_ncoh) {
+		ret = cca_pdev_stream_uses_ide(pdev, rp,
+					       pf0_ep_dsc->rmi_stream_handle_ncoh);
+		if (ret > 0)
+			ret = stream_op(pdev, rp,
+					pf0_ep_dsc->rmi_stream_handle_ncoh);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+int cca_pdev_refresh_all_stream_keys(struct pci_dev *pdev)
+{
+	return cca_pdev_for_each_ide_stream(pdev, cca_pdev_refresh_stream_key);
+}
+
+int cca_pdev_purge_all_stream_keys(struct pci_dev *pdev)
+{
+	return cca_pdev_for_each_ide_stream(pdev, cca_pdev_purge_stream_key);
+}
+
 int cca_vdev_device_unlock(struct cca_host_tdi *host_tdi,
 			   struct pci_dev *pdev)
 {
 	struct pci_dev *pf0_dev = pdev->tsm->dsm_dev;
-	struct cca_host_pf0_ep_dsc *pf0_ep_dsc = to_cca_pf0_ep_dsc(pf0_dev);
 	phys_addr_t rmm_pdev_phys;
 	phys_addr_t rmm_vdev_phys;
 	struct cca_host_pdev_dsc *pdev_dsc;
@@ -1368,44 +1429,27 @@ retry_unlock:
 	}
 
 	/*
-	 * KROU: a live IDE stream at unlock parks the VDEV in KEY_REFRESH.
-	 * Refresh the stream keys, step the VDEV to KEY_PURGE (the RMM
-	 * snapshots the purge counter on that transition, so it must precede
-	 * the purge), then purge. Streams without IDE keys skip the stream
-	 * operations. If the rotation fails, disconnecting the stream lets
-	 * the unlock complete.
+	 * KROU: a live IDE stream at unlock parks the VDEV in KEY_REFRESH
+	 * (DEN0137 IWVLKG). Drive the rotation the RMM waits for -- refresh
+	 * keys, step to KEY_PURGE (the RMM snapshots purge_count on that
+	 * transition, so it must precede the purge), then purge. On failure
+	 * force the unlock by disconnecting the IDE streams (IFVQVC).
 	 */
 	if (rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_VDEV_KROU) &&
 	    !rmi_vdev_get_state(rmm_vdev_phys, &state) &&
 	    state == RMI_VDEV_KEY_REFRESH) {
-		struct pci_dev *rp = pcie_find_root_port(pf0_dev);
-		unsigned long stream_handle = pf0_ep_dsc->rmi_stream_handle_ncoh;
-		struct rmi_pdev_stream_info info;
-		phys_addr_t peer_phys = 0;
-		bool has_ide;
-
-		if (rp)
-			peer_phys = virt_to_phys(to_cca_pdev_dsc(rp)->rmm_pdev);
-
-		ret = rmi_pdev_stream_info(rmm_pdev_phys, peer_phys,
-					   stream_handle, &info) ? -EIO : 0;
-		has_ide = !ret && (info.type == RMI_PDEV_STREAM_NCOH ||
-				   info.type == RMI_PDEV_STREAM_COH);
-		if (has_ide)
-			ret = cca_pdev_refresh_stream_key(pf0_dev, rp,
-							  stream_handle);
+		ret = cca_pdev_refresh_all_stream_keys(pf0_dev);
 		if (!ret)
 			ret = submit_vdev_state_transition_work(host_tdi, pdev,
 							RMI_VDEV_KEY_PURGE);
-		if (!ret && has_ide)
-			ret = cca_pdev_purge_stream_key(pf0_dev, rp,
-							stream_handle);
+		if (!ret)
+			ret = cca_pdev_purge_all_stream_keys(pf0_dev);
 		if (ret) {
 			pci_err(pf0_dev,
-				"vdev key rotation on unlock failed (%d); disconnecting stream\n",
+				"vdev key rotation on unlock failed (%d); disconnecting IDE streams\n",
 				ret);
-			ret = cca_pdev_disconnect_stream(pf0_dev, rp,
-							 stream_handle);
+			ret = cca_pdev_for_each_ide_stream(pf0_dev,
+							   cca_pdev_disconnect_stream);
 			if (ret)
 				goto out_sync_state;
 		}
