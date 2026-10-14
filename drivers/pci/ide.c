@@ -158,6 +158,7 @@ void pci_ide_init(struct pci_dev *pdev)
 			return;
 	}
 
+#if 0
 	/* Reserve link stream-ids that are already active on the device */
 	for (u16 i = 0; i < nr_link_ide; ++i) {
 		int pos = ide_cap + PCI_IDE_LINK_STREAM_0 + i * PCI_IDE_LINK_BLOCK_SIZE;
@@ -169,6 +170,7 @@ void pci_ide_init(struct pci_dev *pdev)
 		    !claim_stream(hb, id, NULL, -1))
 			return;
 	}
+#endif
 
 	for (u16 i = 0; i < nr_streams; i++) {
 		int pos = __sel_ide_offset(ide_cap, nr_link_ide, i, nr_ide_mem);
