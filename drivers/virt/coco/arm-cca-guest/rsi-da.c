@@ -87,7 +87,12 @@ int cca_update_device_object_cache(struct pci_dev *pdev, const u8 *nonce)
 		return ret;
 	}
 
-	return rhi_update_vdev_measurements_cache(pdev, nonce);
+	ret = rhi_update_vdev_measurements_cache(pdev, nonce);
+
+	if (ret)
+		pci_err(pdev, "failed to get device measurement (%d). Ignoring.\n", ret);
+
+	return 0;
 }
 
 /*
@@ -316,10 +321,13 @@ int cca_verify_digests(u64 hash_algo,
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(reports); i++) {
+		if (reports[i].size == 0)
+			continue;
+
 		ret = cca_verify_digest(hash_algo, reports[i].report,
 					reports[i].size, reports[i].digest);
 		if (ret)
-			return ret;
+			pr_err("Invalid digest. Ignoring.\n");
 	}
 	return 0;
 }

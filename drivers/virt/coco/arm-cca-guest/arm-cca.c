@@ -264,8 +264,8 @@ static int cca_collect_dev_evidence(struct pci_dev *pdev, struct cca_guest_dsc *
 	struct pci_tsm_evidence *evidence;
 	struct rsi_vdevice_info *dev_info;
 	struct pci_tsm_evidence_object *obj;
-	void *certificate, *vca, *interface_report, *measurements;
-	size_t certificate_size, vca_size, interface_report_size, measurements_size;
+	void *certificate = NULL, *vca = NULL, *interface_report, *measurements = NULL;
+	size_t certificate_size = 0, vca_size = 0, interface_report_size, measurements_size = 0;
 
 	/* Regenerate interface report and measurement from the device */
 	ret = cca_update_device_object_cache(pdev, NULL);
@@ -277,14 +277,14 @@ static int cca_collect_dev_evidence(struct pci_dev *pdev, struct cca_guest_dsc *
 	ret = rhi_read_cached_object(vdev_id, RHI_DA_OBJECT_CERTIFICATE,
 				     &certificate, &certificate_size);
 	if (ret) {
-		pci_err(pdev, "failed to get device certificate from the host (%d)\n", ret);
-		return ret;
+		pci_err(pdev, "failed to get device certificate from the host (%d). Ignoring.\n", ret);
+		certificate_size = 0;
 	}
 
 	ret = rhi_read_cached_object(vdev_id, RHI_DA_OBJECT_VCA, &vca, &vca_size);
 	if (ret) {
-		pci_err(pdev, "failed to get device VCA from the host (%d)\n", ret);
-		goto free_certificate;
+		pci_err(pdev, "failed to get VCA from the host (%d). Ignoring.\n", ret);
+		vca_size = 0;
 	}
 
 	ret = rhi_read_cached_object(vdev_id, RHI_DA_OBJECT_INTERFACE_REPORT,
@@ -297,8 +297,8 @@ static int cca_collect_dev_evidence(struct pci_dev *pdev, struct cca_guest_dsc *
 	ret = rhi_read_cached_object(vdev_id, RHI_DA_OBJECT_MEASUREMENT,
 				     &measurements, &measurements_size);
 	if (ret) {
-		pci_err(pdev, "failed to get device certificate from the host (%d)\n", ret);
-		goto free_interface_report;
+		pci_err(pdev, "failed to get device measurement from the host (%d). Ignoring.\n", ret);
+		measurements_size = 0;
 	}
 
 	dev_info = kmalloc(sizeof(*dev_info), GFP_KERNEL);
@@ -376,11 +376,9 @@ free_dev_info:
 	kfree(dev_info);
 free_measurements:
 	kvfree(measurements);
-free_interface_report:
 	kvfree(interface_report);
 free_vca:
 	kvfree(vca);
-free_certificate:
 	kvfree(certificate);
 	return ret;
 }
