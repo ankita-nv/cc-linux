@@ -40,7 +40,7 @@ static struct pci_tsm *cca_tsm_pci_probe(struct tsm_dev *tsm_dev, struct pci_dev
 		return NULL;
 
 	/* if device have ide cap, setup doe mailbox */
-	if (pdev->ide_cap) {
+	if (pdev->ide_cap && pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT) {
 		struct pci_doe_mb *doe_mb;
 
 		doe_mb = pci_find_doe_mailbox(pdev, PCI_VENDOR_ID_PCI_SIG,
@@ -218,17 +218,24 @@ static int cca_pdev_create_ncoh_stream(struct pci_dev *pdev, unsigned long strea
 	struct pci_dev *rp = pcie_find_root_port(pdev);
 	struct cca_host_pf0_ep_dsc *pf0_ep_dsc = to_cca_pf0_ep_dsc(pdev);
 
+	if (!rp)
+		return -EINVAL;
+
 	if (!rp->tsm) {
 		ret = cca_root_port_pdev_create(rp, pf0_ep_dsc->pci.base_tsm.tsm_dev);
 		if (ret)
 			return ret;
 		rp_dsc = to_cca_rp_dsc(rp);
+		if (!rp_dsc)
+			return -EINVAL;
 	} else {
-		rp_dsc = to_cca_rp_dsc(rp);
 		/* Make sure they use the same TSM */
 		if (rp->tsm->tsm_dev != pf0_ep_dsc->pci.base_tsm.tsm_dev)
 			return -EINVAL;
 
+		rp_dsc = to_cca_rp_dsc(rp);
+		if (!rp_dsc)
+			return -EINVAL;
 		kref_get(&rp_dsc->tsm_ref);
 	}
 
@@ -319,6 +326,8 @@ static int cca_pdev_create_streams(struct pci_dev *pdev, unsigned long stream_id
 		return cca_pdev_create_ncoh_stream(pdev, stream_id);
 	case PCI_EXP_TYPE_RC_END:
 		return cca_pdev_create_ncoh_sys_stream(pdev);
+	case PCI_EXP_TYPE_ROOT_PORT:
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -439,9 +448,12 @@ static void cca_tsm_disconnect(struct pci_dev *pdev)
 	if (cca_pdev_need_sel_ide_streams(pdev))
 		ide = pf0_ep_dsc->sel_stream;
 
-	cca_pdev_disconnect_stream(pdev, rp, pf0_ep_dsc->stream_handle);
-	if (rp)
-		cca_root_port_pdev_put(to_cca_rp_dsc(rp));
+	if (pf0_ep_dsc->stream_handle) {
+		cca_pdev_disconnect_stream(pdev, rp, pf0_ep_dsc->stream_handle);
+		pf0_ep_dsc->stream_handle = 0;
+		if (rp && pci_pcie_type(pdev) == PCI_EXP_TYPE_ENDPOINT)
+			cca_root_port_pdev_put(to_cca_rp_dsc(rp));
+	}
 
 	cca_pdev_stop_and_destroy(pdev);
 	free_dev_communication_buffers(&pf0_ep_dsc->pdev.comm_data);

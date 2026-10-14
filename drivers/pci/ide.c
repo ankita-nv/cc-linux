@@ -107,6 +107,9 @@ void pci_ide_init(struct pci_dev *pdev)
 	if (pci_pcie_type(pdev) == PCI_EXP_TYPE_ENDPOINT) {
 		struct pci_dev *rp = pcie_find_root_port(pdev);
 
+		if (!rp)
+			return;
+
 		if (!rp->ide_cap)
 			return;
 	}
@@ -268,6 +271,9 @@ struct pci_ide *pci_ide_stream_alloc(struct pci_dev *pdev)
 		return NULL;
 
 	rp = pcie_find_root_port(pdev);
+	if (!rp)
+		return NULL;
+
 	struct stream_index *rp_stream __free(free_stream) = alloc_stream_index(
 		&rp->ide_stream_ida, rp->nr_sel_ide, &__stream[PCI_IDE_RP]);
 	if (!rp_stream)
