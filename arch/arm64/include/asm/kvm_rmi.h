@@ -176,6 +176,8 @@ int realm_map_non_secure(struct kvm *kvm,
 			 enum kvm_pgtable_prot prot,
 			 struct rmi_sro_state *sro);
 unsigned long realm_psci_complete(struct kvm_vcpu *vcpu, unsigned long status);
+void kvm_complete_dev_empty_change(struct kvm_vcpu *vcpu,
+				   unsigned long base, unsigned long top);
 
 static inline bool kvm_realm_is_private_address(struct realm *realm,
 						unsigned long addr)

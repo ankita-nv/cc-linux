@@ -2736,6 +2736,9 @@ static int kvm_complete_ripas_change(struct kvm_vcpu *vcpu)
 	bool attributes_match;
 	int ret;
 
+	if (base >= top)
+		return 1;
+
 	do {
 		unsigned long min_pages =
 			kvm_mmu_cache_min_pages(vcpu->arch.hw_mmu);
@@ -3544,6 +3547,51 @@ int realm_dev_mem_unmap(struct kvm *kvm, unsigned long vdev_phys)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(realm_dev_mem_unmap);
+
+/*
+ * Complete device-backed RIPAS EMPTY requests before returning to userspace.
+ * Device mappings otherwise get removed by the VMM before the deferred RIPAS
+ * completion, reopening an unmap-before-EMPTY window across that round trip.
+ */
+void kvm_complete_dev_empty_change(struct kvm_vcpu *vcpu,
+				   unsigned long base, unsigned long top)
+{
+	struct kvm *kvm = vcpu->kvm;
+	unsigned long rd = virt_to_phys(kvm->arch.realm.rd);
+	unsigned long min_pages = kvm_mmu_cache_min_pages(vcpu->arch.hw_mmu);
+	struct rtt_entry rtte;
+
+	write_lock(&kvm->mmu_lock);
+	if (rmi_rtt_read_entry(rd, base, RMM_RTT_MAX_LEVEL, &rtte) ||
+	    rtte.state != RMI_ASSIGNED_DEV) {
+		write_unlock(&kvm->mmu_lock);
+		return;
+	}
+	write_unlock(&kvm->mmu_lock);
+
+	while (base < top) {
+		unsigned long chunk = READ_ONCE(realm_dev_map_chunk_size);
+		unsigned long chunk_end = min(top, ALIGN_DOWN(base, chunk) +
+					      chunk);
+		unsigned long top_ipa = base;
+		int ret;
+
+		rmi_sro_topup(vcpu->arch.rec.sro, SZ_2M >> PAGE_SHIFT,
+			      min_pages);
+
+		write_lock(&kvm->mmu_lock);
+		ret = realm_set_ipa_state(vcpu, base, chunk_end, RMI_DEV,
+					  RMI_EMPTY, &top_ipa);
+		write_unlock(&kvm->mmu_lock);
+
+		vcpu->arch.rec.run->exit.ripas_base = top_ipa;
+		if (top_ipa == base || ret)
+			break;
+
+		base = top_ipa;
+		cond_resched();
+	}
+}
 
 static int kvm_complete_vdev_map_validate(struct kvm_vcpu *vcpu)
 {

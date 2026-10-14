@@ -151,6 +151,14 @@ bool kvm_rec_handle_hvc(struct kvm_vcpu *vcpu, int *ret)
 		return true;
 	}
 
+	/*
+	 * A device-backed transition must commit RIPAS EMPTY before the VMM
+	 * removes the mapping. Complete that ordered teardown now; RAM remains
+	 * on the deferred path so userspace can still reject the request.
+	 */
+	if (ripas == RMI_EMPTY)
+		kvm_complete_dev_empty_change(vcpu, base, top);
+
 	/* Exit to VMM, the actual RIPAS change is done on next entry */
 	kvm_prepare_memory_fault_exit(vcpu, ALIGN_DOWN(base, PAGE_SIZE),
 				      ALIGN(top, PAGE_SIZE) -
