@@ -1638,9 +1638,11 @@ static void rmi_teardown_memory_tracking(phys_addr_t start, phys_addr_t end,
 
 		ret = rmi_granule_tracking_set(start, category,
 					       RMI_TRACKING_NONE, sro);
-		if (ret)
+		if (ret) {
 			pr_warn("RMI: tracking clear failed for %pa: state=%lu ret=0x%lx\n",
 				&start, state, ret);
+			return;
+		}
 		start += RMM_GRANULE_TRACKING_SIZE;
 	}
 }
@@ -2269,9 +2271,11 @@ static void rmi_destroy_dpt(struct rmi_sro_state *sro)
 
 		while (start < end) {
 			if (RMI_RETURN_STATUS(rmi_dpt_l1_destroy(start, sro)) !=
-			    RMI_SUCCESS)
+			    RMI_SUCCESS) {
 				pr_warn("RMI: DPT Level 1 destroy failed for %pa\n",
 					&start);
+				return;
+			}
 			start += RMI_DPT_L0_REGION_SIZE;
 		}
 	}
@@ -2384,11 +2388,11 @@ static int __init arm64_init_rmi(void)
 		goto out_free_sro;
 	ret = rmi_init_metadata(rmi_sro);
 	if (ret)
-		goto out_deactivate;
+		goto out_undo_meta;
 
 	ret = rmi_init_dpt(rmi_sro);
 	if (ret)
-		goto out_deactivate;
+		goto out_undo_dpt;
 
 	arm64_rmi_is_available = true;
 	pr_info("RMI configured\n");
@@ -2401,15 +2405,16 @@ static int __init arm64_init_rmi(void)
 	rmi_sro_free(rmi_sro);
 	return 0;
 
-out_deactivate:
+out_undo_dpt:
+	rmi_destroy_dpt(rmi_sro);
+	rmi_sro_free(rmi_sro);
+out_undo_meta:
 	/*
 	 * Beta3 permits L1 GPT destruction before tracking is configured. Undo
 	 * any partial GPT setup, then return the RMM to INIT and reclaim every
 	 * activation donation. Keep the notifier and tracking state only if the
 	 * firmware fails to return all memory, so a later kexec can retry.
 	 */
-	rmi_destroy_dpt(rmi_sro);
-	rmi_sro_free(rmi_sro);
 	rmi_destroy_metadata(rmi_sro);
 	rmi_sro_free(rmi_sro);
 	rmi_destroy_tracking(rmi_sro);
