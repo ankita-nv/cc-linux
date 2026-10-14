@@ -1092,6 +1092,39 @@ out_undelegate_tables:
 static int __realm_dev_mem_unmap(struct kvm *kvm, unsigned long start,
 				 unsigned long end, bool may_block);
 
+/*
+ * RMI_RTT_DATA_UNMAP does not consume device RTTEs and reports them like
+ * holes, so a teardown that walks a range with the DATA unmap would leave
+ * the device mappings live and RTT destruction would fail. Drain the device
+ * mappings tracked within [start, end) through RMI_RTT_DEV_UNMAP first.
+ */
+static int realm_unmap_dev_ranges(struct kvm *kvm, unsigned long start,
+				  unsigned long end, bool may_block)
+{
+	struct realm *realm = &kvm->arch.realm;
+	struct realm_dev_mapping *mapping, *iter;
+	int ret;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	for (;;) {
+		mapping = NULL;
+		list_for_each_entry(iter, &realm->dev_mappings, node) {
+			if (iter->start < end && start < iter->end) {
+				mapping = iter;
+				break;
+			}
+		}
+		if (!mapping)
+			return 0;
+
+		ret = __realm_dev_mem_unmap(kvm, max(start, mapping->start),
+					    min(end, mapping->end), may_block);
+		if (ret)
+			return ret;
+	}
+}
+
 static int realm_unmap_private_range_single(struct kvm *kvm,
 					    unsigned long start,
 					    unsigned long end,
@@ -1287,6 +1320,10 @@ static int __kvm_realm_unmap_range(struct kvm *kvm, unsigned long start,
 
 	ret = realm_unmap_shared_range(kvm, start, end, may_block, sro);
 	if (ret || !unmap_private)
+		return ret;
+
+	ret = realm_unmap_dev_ranges(kvm, start, end, may_block);
+	if (ret)
 		return ret;
 
 	/* An unmap request won't mix different RIPAS ranges. */
