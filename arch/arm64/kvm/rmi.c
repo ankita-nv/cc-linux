@@ -3672,6 +3672,8 @@ int kvm_realm_register_vsmmu(struct kvm *kvm, u32 vsmmu_id,
 
 	if (WARN_ON(!vsmmu_id))
 		return -ENXIO;
+	if (!rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_VSMMU))
+		return -EOPNOTSUPP;
 	if (!PAGE_ALIGNED(params->reg_base) || !PAGE_ALIGNED(params->reg_top) ||
 	    params->reg_top <= params->reg_base)
 		return -EINVAL;
