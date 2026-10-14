@@ -407,6 +407,8 @@ static void cca_pdev_disconnect_streams(struct pci_dev *pdev)
 
 static int cca_pdev_create_streams(struct pci_dev *pdev, unsigned long stream_id)
 {
+	struct cca_host_pf0_ep_dsc *pf0_ep_dsc = to_cca_pf0_ep_dsc(pdev);
+	bool create_ncoh;
 	int ret;
 
 	ret = cca_pdev_init_device_tracking(pdev);
@@ -415,13 +417,20 @@ static int cca_pdev_create_streams(struct pci_dev *pdev, unsigned long stream_id
 
 	switch (pci_pcie_type(pdev)) {
 	case PCI_EXP_TYPE_ENDPOINT:
+		/* NCOH carries the Selective IDE Stream, NON_TEE the Link IDE Stream */
+		create_ncoh = pf0_ep_dsc->sel_stream;
+		if (!create_ncoh && !pci_ide_link_stream_capable(pdev))
+			return 0;
+
 		ret = cca_root_port_pdev_get(pdev);
 		if (ret)
 			return ret;
 
-		ret = cca_pdev_create_ncoh_stream(pdev, stream_id);
-		if (ret)
-			goto err_disconnect;
+		if (create_ncoh) {
+			ret = cca_pdev_create_ncoh_stream(pdev, stream_id);
+			if (ret)
+				goto err_disconnect;
+		}
 
 		if (pci_ide_link_stream_capable(pdev)) {
 			/*
@@ -455,7 +464,8 @@ err_disconnect:
 
 static inline bool cca_pdev_need_sel_ide_streams(struct pci_dev *pdev)
 {
-	return pci_pcie_type(pdev) == PCI_EXP_TYPE_ENDPOINT;
+	return pci_pcie_type(pdev) == PCI_EXP_TYPE_ENDPOINT &&
+	       pci_ide_selective_stream_capable(pdev);
 }
 
 static int cca_tsm_connect(struct pci_dev *pdev)
