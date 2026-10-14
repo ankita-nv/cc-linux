@@ -222,21 +222,19 @@ static int cca_root_port_pdev_get(struct pci_dev *pdev)
 static int pci_dev_addr_range(struct pci_dev *pdev, struct rmi_addr_range *pdev_addr)
 {
 	int naddr = 0;
-	struct pci_dev *br;
-	struct resource *mem, *pref;
 
-	br = pci_upstream_bridge(pdev);
-	if (!br)
-		return 0;
+	for (int i = 0; i <= PCI_STD_RESOURCE_END && naddr < MAX_STREAM_ADDR_RANGE; i++) {
+		struct resource *res = &pdev->resource[i];
 
-	mem = pci_resource_n(br, PCI_BRIDGE_MEM_WINDOW);
-	pref = pci_resource_n(br, PCI_BRIDGE_PREF_MEM_WINDOW);
-	if (resource_assigned(mem))
+		if (!(res->flags & IORESOURCE_MEM))
+			continue;
+
+		if (resource_size(res) == 0)
+			continue;
+
 		naddr = insert_addr_range_sorted(pdev_addr, naddr,
-						 mem->start, mem->end + 1);
-	if (resource_assigned(pref))
-		naddr = insert_addr_range_sorted(pdev_addr, naddr,
-						 pref->start, pref->end + 1);
+						 res->start, res->end + 1);
+	}
 
 	return naddr;
 }
