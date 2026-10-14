@@ -479,6 +479,16 @@ static int cca_tsm_connect(struct pci_dev *pdev)
 	if (WARN_ON(!is_pci_tsm_pf0(pdev)))
 		return -EIO;
 
+	/*
+	 * The RMM rejects the ON_CHIP_EP PDEV category, so RC integrated
+	 * endpoints cannot be connected and their NCOH_SYS stream cannot be
+	 * registered.
+	 */
+	if (pci_pcie_type(pdev) == PCI_EXP_TYPE_RC_END) {
+		pci_info(pdev, "RC integrated endpoints are not supported\n");
+		return -EOPNOTSUPP;
+	}
+
 	pf0_ep_dsc = to_cca_pf0_ep_dsc(pdev);
 	if (cca_pdev_need_sel_ide_streams(pdev)) {
 
