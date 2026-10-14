@@ -1326,6 +1326,7 @@ int cca_vdev_device_unlock(struct cca_host_tdi *host_tdi,
 	struct cca_host_pdev_dsc *pdev_dsc;
 	enum rmi_vdev_state state;
 	bool retry_error = true;
+	unsigned long rmi_ret;
 	phys_addr_t rd_phys;
 	int ret;
 
@@ -1341,7 +1342,21 @@ int cca_vdev_device_unlock(struct cca_host_tdi *host_tdi,
 	rmm_pdev_phys = virt_to_phys(pdev_dsc->rmm_pdev);
 
 retry_unlock:
-	if (rmi_vdev_unlock(rd_phys, rmm_pdev_phys, rmm_vdev_phys)) {
+	rmi_ret = rmi_vdev_unlock(rd_phys, rmm_pdev_phys, rmm_vdev_phys);
+	if (RMI_RETURN_STATUS(rmi_ret) == RMI_ERROR_GRANULE) {
+		/*
+		 * Device memory of the VDEV is still mapped, e.g. after an
+		 * abrupt guest or VMM teardown. Force-unmap it and retry once.
+		 */
+		ret = realm_dev_mem_unmap(host_tdi->kvm, rmm_vdev_phys);
+		if (ret)
+			pci_err(pdev, "failed to force-unmap vdev memory (%d)\n",
+				ret);
+		else
+			rmi_ret = rmi_vdev_unlock(rd_phys, rmm_pdev_phys,
+						  rmm_vdev_phys);
+	}
+	if (rmi_ret) {
 		pci_err(pdev, "failed to unlock vdev\n");
 		return -ENXIO;
 	}
