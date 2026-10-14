@@ -316,11 +316,12 @@ static int rmi_addr_range_desc_decode(unsigned long desc,
 	return 0;
 }
 
-static int undelegate_range_desc(struct realm *realm, unsigned long desc)
+static int undelegate_range_desc(struct kvm *kvm, unsigned long desc,
+				 bool may_block)
 {
+	struct realm *realm = &kvm->arch.realm;
 	unsigned long size;
 	phys_addr_t addr;
-	long rmi_ret;
 	int ret;
 
 	ret = rmi_addr_range_desc_decode(desc, RMI_OP_MEM_DELEGATED,
@@ -330,8 +331,22 @@ static int undelegate_range_desc(struct realm *realm, unsigned long desc)
 	if (!size)
 		return 0;
 
-	rmi_ret = realm_undelegate_range(realm, addr, size, NULL);
-	return realm_rmi_to_errno(rmi_ret);
+	while (size) {
+		unsigned long step = min(size, rmi_granule_range_step());
+		long rmi_ret;
+
+		rmi_ret = realm_undelegate_range(realm, addr, step, NULL);
+		ret = realm_rmi_to_errno(rmi_ret);
+		if (ret)
+			return ret;
+
+		addr += step;
+		size -= step;
+		if (may_block)
+			cond_resched_rwlock_write(&kvm->mmu_lock);
+	}
+
+	return 0;
 }
 
 static int rmi_addr_range_desc_cmp(const void *a, const void *b)
@@ -1136,7 +1151,7 @@ retry:
 			return ret < 0 ? ret : -ENXIO;
 		}
 
-		ret = undelegate_range_desc(realm, out_range);
+		ret = undelegate_range_desc(kvm, out_range, may_block);
 		if (WARN_ONCE(ret, "RMI: descriptor undelegate failed: %d\n",
 			      ret))
 			return ret < 0 ? ret : -ENXIO;
@@ -3034,7 +3049,7 @@ retry:
 					     next_ipa);
 		ipa = next_ipa;
 
-		ret = undelegate_range_desc(realm, range_desc);
+		ret = undelegate_range_desc(kvm, range_desc, may_block);
 		if (WARN_ONCE(ret, "RMI: device descriptor undelegate failed: %d\n",
 			      ret))
 			return ret < 0 ? ret : -ENXIO;

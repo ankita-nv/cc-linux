@@ -78,6 +78,7 @@ static __always_inline void kvm_rmi_smc_busy_count(unsigned long fid)
 } while (0)
 
 unsigned long rmi_feat_reg(unsigned long id);
+unsigned long rmi_granule_range_step(void);
 
 long rmi_delegate_range(phys_addr_t phys, unsigned long size,
 			unsigned long *delegated_size);

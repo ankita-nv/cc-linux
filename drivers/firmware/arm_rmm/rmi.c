@@ -15,6 +15,7 @@
 #include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/numa.h>
 #include <linux/overflow.h>
@@ -22,6 +23,7 @@
 #include <linux/reboot.h>
 #include <linux/sched/mm.h>
 #include <linux/seq_file.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/string.h>
@@ -36,6 +38,39 @@ static bool arm64_rmi_is_available;
 /* DEN0137 v2.0-bet3 defines feature registers 0 through 4. */
 #define RMI_FEAT_REG_COUNT	5
 static __ro_after_init unsigned long rmi_feat_reg_cache[RMI_FEAT_REG_COUNT];
+
+static unsigned long granule_range_step = SZ_1G;
+
+static int granule_range_step_set(const char *val,
+				  const struct kernel_param *kp)
+{
+	unsigned long size;
+	int ret;
+
+	ret = kstrtoul(val, 0, &size);
+	if (ret)
+		return ret;
+	if (size < SZ_2M || size > SZ_64G || !is_power_of_2(size))
+		return -EINVAL;
+
+	*(unsigned long *)kp->arg = size;
+	return 0;
+}
+
+static const struct kernel_param_ops granule_range_step_ops = {
+	.set = granule_range_step_set,
+	.get = param_get_ulong,
+};
+module_param_cb(granule_range_step, &granule_range_step_ops,
+		&granule_range_step, 0644);
+MODULE_PARM_DESC(granule_range_step,
+		 "Bytes per granule range operation (power of two, 2MiB to 64GiB)");
+
+unsigned long rmi_granule_range_step(void)
+{
+	return READ_ONCE(granule_range_step);
+}
+EXPORT_SYMBOL_GPL(rmi_granule_range_step);
 
 unsigned long rmi_feat_reg(unsigned long id)
 {
@@ -68,13 +103,15 @@ long rmi_delegate_range(phys_addr_t phys, unsigned long size,
 	 * avoid a per-call struct rmi_sro_state allocation.
 	 */
 	while (phys < top) {
+		unsigned long req_top = min_t(unsigned long, top,
+					      phys + rmi_granule_range_step());
 		unsigned long out_top;
 
-		ret = rmi_granule_range_delegate(phys, top, &out_top);
+		ret = rmi_granule_range_delegate(phys, req_top, &out_top);
 		if (ret != RMI_SUCCESS)
 			return ret;
 
-		if (WARN_ONCE(out_top <= phys || out_top > top,
+		if (WARN_ONCE(out_top <= phys || out_top > req_top,
 			      "RMI: invalid delegate progress %#lx: %d\n",
 			      out_top, -ENXIO)) {
 			return -ENXIO;
@@ -103,13 +140,15 @@ long rmi_undelegate_range(phys_addr_t phys, unsigned long size,
 	 * executor and avoid a per-call struct rmi_sro_state allocation.
 	 */
 	while (phys < top) {
+		unsigned long req_top = min_t(unsigned long, top,
+					      phys + rmi_granule_range_step());
 		unsigned long out_top;
 
-		ret = rmi_granule_range_undelegate(phys, top, &out_top);
+		ret = rmi_granule_range_undelegate(phys, req_top, &out_top);
 		if (ret != RMI_SUCCESS)
 			return ret;
 
-		if (WARN_ONCE(out_top <= phys || out_top > top,
+		if (WARN_ONCE(out_top <= phys || out_top > req_top,
 			      "RMI: invalid undelegate progress %#lx: %d\n",
 			      out_top, -ENXIO)) {
 			return -ENXIO;
