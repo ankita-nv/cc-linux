@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/pci-acpi.h>
 #include <linux/pci-ecam.h>
+#include <linux/pci-tsm.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_qos.h>
 #include <linux/rwsem.h>
@@ -966,9 +967,14 @@ int pci_dev_acpi_reset(struct pci_dev *dev, bool probe)
 	if (probe)
 		return 0;
 
+	ret = pci_tsm_reset_prepare(dev);
+	if (ret)
+		return ret;
+
 	ret = pci_dev_reset_iommu_prepare(dev);
 	if (ret) {
 		pci_err(dev, "failed to stop IOMMU for a PCI reset: %d\n", ret);
+		pci_tsm_reset_done(dev);
 		return ret;
 	}
 
@@ -978,6 +984,7 @@ int pci_dev_acpi_reset(struct pci_dev *dev, bool probe)
 	}
 
 	pci_dev_reset_iommu_done(dev);
+	pci_tsm_reset_done(dev);
 	return ret;
 }
 

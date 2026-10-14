@@ -475,11 +475,11 @@ static int pci_tsm_disconnect(struct pci_dev *pdev)
 	return 0;
 }
 
-/* Time budget to keep retrying the reconnect after an FLR. */
+/* Time budget to keep retrying the reconnect after a reset. */
 static unsigned int reset_timeout_ms = 5000;
 module_param(reset_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(reset_timeout_ms,
-	"msecs to keep retrying the TSM reconnect after an FLR");
+	"msecs to keep retrying the TSM reconnect after a reset");
 
 /*
  * A vdevice holds a TSM context for its lifetime. Resetting PF0 drops the
@@ -502,33 +502,37 @@ static bool pci_tsm_reset_is_bound(struct pci_dev *pdev)
 }
 
 /**
- * pci_tsm_reset_prepare() - drop the TSM session before an FLR
+ * pci_tsm_reset_prepare() - drop the TSM session before a device reset
  * @pdev: device about to be reset
- * @tsm_dev_out: TSM to reconnect in reset_done() (ref taken), or NULL
  *
- * FLR wipes IDE/SPDM state, so disconnect here. Return -EBUSY if the device is
- * bound to a TVM.
+ * A reset wipes IDE/SPDM state, so disconnect the session hosted by @pdev and
+ * reconnect it in pci_tsm_reset_done(). Calls nest; only the outermost
+ * prepare/done pair acts. Every successful call must be paired with
+ * pci_tsm_reset_done().
  *
- * Return: 0 to proceed, -EBUSY if bound, else -errno.
+ * Context: Called from the reset methods with the device locked.
+ * Return: 0 to proceed, -EBUSY if a TVM is using the device, else -errno.
  */
-int pci_tsm_reset_prepare(struct pci_dev *pdev, struct tsm_dev **tsm_dev_out)
+int pci_tsm_reset_prepare(struct pci_dev *pdev)
 {
 	struct tsm_dev *tsm_dev;
 	int rc;
-
-	*tsm_dev_out = NULL;
 
 	/* disconnect() runs under pci_tsm_rwsem held for write */
 	ACQUIRE(rwsem_write_kill, lock)(&pci_tsm_rwsem);
 	if ((rc = ACQUIRE_ERR(rwsem_write_kill, &lock)))
 		return rc;
 
+	if (pdev->tsm_reset_depth++)
+		return 0;
+
 	if (!pdev->tsm)
 		return 0;		/* not TSM-managed */
 
 	if (is_devsec_tsm(pdev->tsm->tsm_dev)) {
 		pci_info(pdev, "tsm-reset: devsec context active, blocking reset\n");
-		return -EBUSY;
+		rc = -EBUSY;
+		goto err;
 	}
 
 	if (!is_link_tsm(pdev->tsm->tsm_dev))
@@ -536,7 +540,8 @@ int pci_tsm_reset_prepare(struct pci_dev *pdev, struct tsm_dev **tsm_dev_out)
 
 	if (pci_tsm_reset_is_bound(pdev)) {
 		pci_info(pdev, "tsm-reset: bound to TVM (vdevice present), blocking reset\n");
-		return -EBUSY;
+		rc = -EBUSY;
+		goto err;
 	}
 
 	/* The TSM session lives on PF0; resetting another function keeps it */
@@ -551,25 +556,42 @@ int pci_tsm_reset_prepare(struct pci_dev *pdev, struct tsm_dev **tsm_dev_out)
 	rc = pci_tsm_disconnect(pdev);
 	if (rc) {
 		put_device(&tsm_dev->dev);
-		return rc;
+		goto err;
 	}
-	*tsm_dev_out = tsm_dev;
+	pdev->tsm_reset_dev = tsm_dev;
 
 	return 0;
+err:
+	pdev->tsm_reset_depth--;
+	return rc;
 }
 EXPORT_SYMBOL_GPL(pci_tsm_reset_prepare);
 
 #define PCI_TSM_RECONNECT_PACING_MS 500
 
-void pci_tsm_reset_done(struct pci_dev *pdev, struct tsm_dev *tsm_dev)
+/**
+ * pci_tsm_reset_done() - rebuild the TSM session after a device reset
+ * @pdev: device that was reset
+ */
+void pci_tsm_reset_done(struct pci_dev *pdev)
 {
+	struct tsm_dev *tsm_dev;
 	unsigned long deadline;
 	int rc;
+
+	scoped_guard(rwsem_write, &pci_tsm_rwsem) {
+		if (WARN_ON(!pdev->tsm_reset_depth))
+			return;
+		if (--pdev->tsm_reset_depth)
+			return;
+		tsm_dev = pdev->tsm_reset_dev;
+		pdev->tsm_reset_dev = NULL;
+	}
 
 	if (!tsm_dev)
 		return;			/* was not connected, nothing to rebuild */
 
-	/* device settles after the FLR at its own pace; retry connect until it takes */
+	/* device settles after the reset at its own pace; retry connect until it takes */
 	deadline = jiffies + msecs_to_jiffies(reset_timeout_ms);
 	for (;;) {
 		scoped_guard(rwsem_write, &pci_tsm_rwsem)
@@ -577,7 +599,7 @@ void pci_tsm_reset_done(struct pci_dev *pdev, struct tsm_dev *tsm_dev)
 		if (!rc)
 			break;			/* rebuilt */
 		if (time_after(jiffies, deadline)) {
-			pci_warn(pdev, "tsm-reset: reconnect after FLR failed (%d)\n", rc);
+			pci_warn(pdev, "tsm-reset: reconnect after reset failed (%d)\n", rc);
 			break;
 		}
 		msleep(PCI_TSM_RECONNECT_PACING_MS);

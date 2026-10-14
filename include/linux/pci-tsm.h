@@ -266,8 +266,8 @@ struct pci_tsm_pf0 *pci_tsm_context_pf0(struct pci_tsm_context *context);
 struct pci_dev *pci_tsm_context_dsm_dev(struct pci_tsm_context *context);
 bool pci_tsm_context_match_device(struct pci_tsm_context *context,
 				  struct pci_dev *pdev);
-int pci_tsm_reset_prepare(struct pci_dev *pdev, struct tsm_dev **tsm_dev_out);
-void pci_tsm_reset_done(struct pci_dev *pdev, struct tsm_dev *tsm_dev);
+int pci_tsm_reset_prepare(struct pci_dev *pdev);
+void pci_tsm_reset_done(struct pci_dev *pdev);
 struct pci_tsm_devsec *to_pci_tsm_devsec(struct pci_tsm *tsm);
 void pci_tsm_init_evidence(struct pci_tsm_evidence *evidence, int slot,
 			   enum hash_algo digest_algo);
@@ -298,15 +298,12 @@ static inline void pci_tsm_context_put(struct pci_tsm_context *context)
 {
 }
 
-static inline int pci_tsm_reset_prepare(struct pci_dev *pdev,
-					struct tsm_dev **tsm_dev_out)
+static inline int pci_tsm_reset_prepare(struct pci_dev *pdev)
 {
-	*tsm_dev_out = NULL;
 	return 0;
 }
 
-static inline void pci_tsm_reset_done(struct pci_dev *pdev,
-				      struct tsm_dev *tsm_dev)
+static inline void pci_tsm_reset_done(struct pci_dev *pdev)
 {
 }
 

@@ -580,6 +580,8 @@ struct pci_dev {
 #endif
 #ifdef CONFIG_PCI_TSM
 	struct pci_tsm *tsm;		/* TSM operation state */
+	unsigned int tsm_reset_depth;	/* Nesting of TSM reset hooks */
+	struct tsm_dev *tsm_reset_dev;	/* TSM to reconnect after a reset */
 #endif
 	u16		acs_cap;	/* ACS Capability offset */
 	u16		acs_capabilities; /* ACS Capabilities */

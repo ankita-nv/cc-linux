@@ -19,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/export.h>
 #include <linux/pci.h>
+#include <linux/pci-tsm.h>
 #include <linux/isa-dma.h> /* isa_dma_bridge_buggy */
 #include <linux/init.h>
 #include <linux/iommu.h>
@@ -4253,14 +4254,23 @@ static int __pci_dev_specific_reset(struct pci_dev *dev, bool probe,
 {
 	int ret;
 
+	if (!probe) {
+		ret = pci_tsm_reset_prepare(dev);
+		if (ret)
+			return ret;
+	}
+
 	ret = pci_dev_reset_iommu_prepare(dev);
 	if (ret) {
 		pci_err(dev, "failed to stop IOMMU for a PCI reset: %d\n", ret);
-		return ret;
+		goto done_tsm;
 	}
 
 	ret = i->reset(dev, probe);
 	pci_dev_reset_iommu_done(dev);
+done_tsm:
+	if (!probe)
+		pci_tsm_reset_done(dev);
 	return ret;
 }
 

@@ -4395,7 +4395,6 @@ EXPORT_SYMBOL(pci_wait_for_pending_transaction);
  */
 int pcie_flr(struct pci_dev *dev)
 {
-	struct tsm_dev *tsm_dev = NULL;
 	int ret;
 
 	if (!pci_dev_config_accessible(dev, "FLR"))
@@ -4404,8 +4403,7 @@ int pcie_flr(struct pci_dev *dev)
 	if (!pci_wait_for_pending_transaction(dev))
 		pci_err(dev, "timed out waiting for pending transaction; performing function level reset anyway\n");
 
-	/* FLR wipes IDE/SPDM state; drop the TSM session, or -EBUSY if bound */
-	ret = pci_tsm_reset_prepare(dev, &tsm_dev);
+	ret = pci_tsm_reset_prepare(dev);
 	if (ret)
 		return ret;
 
@@ -4432,8 +4430,7 @@ int pcie_flr(struct pci_dev *dev)
 done:
 	pci_dev_reset_iommu_done(dev);
 done_tsm:
-	/* device is back from the FLR: rebuild the TSM session transparently */
-	pci_tsm_reset_done(dev, tsm_dev);
+	pci_tsm_reset_done(dev);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(pcie_flr);
@@ -4489,11 +4486,15 @@ static int pci_af_flr(struct pci_dev *dev, bool probe)
 				 PCI_AF_STATUS_TP << 8))
 		pci_err(dev, "timed out waiting for pending transaction; performing AF function level reset anyway\n");
 
+	ret = pci_tsm_reset_prepare(dev);
+	if (ret)
+		return ret;
+
 	/* Have to call it after waiting for pending DMA transaction */
 	ret = pci_dev_reset_iommu_prepare(dev);
 	if (ret) {
 		pci_err(dev, "failed to stop IOMMU for a PCI reset: %d\n", ret);
-		return ret;
+		goto done_tsm;
 	}
 
 	pci_write_config_byte(dev, pos + PCI_AF_CTRL, PCI_AF_CTRL_FLR);
@@ -4512,6 +4513,8 @@ static int pci_af_flr(struct pci_dev *dev, bool probe)
 	ret = pci_dev_wait(dev, "AF_FLR", PCIE_RESET_READY_POLL_MS);
 done:
 	pci_dev_reset_iommu_done(dev);
+done_tsm:
+	pci_tsm_reset_done(dev);
 	return ret;
 }
 
@@ -4548,9 +4551,14 @@ static int pci_pm_reset(struct pci_dev *dev, bool probe)
 	if (dev->current_state != PCI_D0)
 		return -EINVAL;
 
+	ret = pci_tsm_reset_prepare(dev);
+	if (ret)
+		return ret;
+
 	ret = pci_dev_reset_iommu_prepare(dev);
 	if (ret) {
 		pci_err(dev, "failed to stop IOMMU for a PCI reset: %d\n", ret);
+		pci_tsm_reset_done(dev);
 		return ret;
 	}
 
@@ -4566,6 +4574,7 @@ static int pci_pm_reset(struct pci_dev *dev, bool probe)
 
 	ret = pci_dev_wait(dev, "PM D3hot->D0", PCIE_RESET_READY_POLL_MS);
 	pci_dev_reset_iommu_done(dev);
+	pci_tsm_reset_done(dev);
 	return ret;
 }
 
@@ -5006,10 +5015,16 @@ static int pci_reset_bus_function(struct pci_dev *dev, bool probe)
 	if (bridge && pcie_is_cxl(bridge) && cxl_sbr_masked(bridge))
 		return -ENOTTY;
 
+	if (!probe) {
+		rc = pci_tsm_reset_prepare(dev);
+		if (rc)
+			return rc;
+	}
+
 	rc = pci_dev_reset_iommu_prepare(dev);
 	if (rc) {
 		pci_err(dev, "failed to stop IOMMU for a PCI reset: %d\n", rc);
-		return rc;
+		goto done_tsm;
 	}
 
 	rc = pci_dev_reset_slot_function(dev, probe);
@@ -5019,6 +5034,9 @@ static int pci_reset_bus_function(struct pci_dev *dev, bool probe)
 	rc = pci_parent_bus_reset(dev, probe);
 done:
 	pci_dev_reset_iommu_done(dev);
+done_tsm:
+	if (!probe)
+		pci_tsm_reset_done(dev);
 	return rc;
 }
 
@@ -5579,6 +5597,89 @@ static void pci_slot_restore_locked(struct pci_slot *slot)
 	}
 }
 
+/* Undo pci_tsm_reset_prepare() for the devices on @bus walked before @stop */
+static bool pci_bus_tsm_reset_done(struct pci_bus *bus, struct pci_dev *stop)
+{
+	struct pci_dev *dev;
+
+	list_for_each_entry(dev, &bus->devices, bus_list) {
+		if (dev == stop)
+			return true;
+		pci_tsm_reset_done(dev);
+		if (dev->subordinate &&
+		    pci_bus_tsm_reset_done(dev->subordinate, stop))
+			return true;
+	}
+
+	return false;
+}
+
+static int __pci_bus_tsm_reset_prepare(struct pci_bus *bus,
+				       struct pci_bus *top)
+{
+	struct pci_dev *dev;
+	int rc;
+
+	list_for_each_entry(dev, &bus->devices, bus_list) {
+		rc = pci_tsm_reset_prepare(dev);
+		if (rc) {
+			pci_bus_tsm_reset_done(top, dev);
+			return rc;
+		}
+		if (dev->subordinate) {
+			rc = __pci_bus_tsm_reset_prepare(dev->subordinate, top);
+			if (rc)
+				return rc;
+		}
+	}
+
+	return 0;
+}
+
+static int pci_bus_tsm_reset_prepare(struct pci_bus *bus)
+{
+	return __pci_bus_tsm_reset_prepare(bus, bus);
+}
+
+static void pci_slot_tsm_reset_done(struct pci_slot *slot,
+				    struct pci_dev *stop)
+{
+	struct pci_dev *dev;
+
+	list_for_each_entry(dev, &slot->bus->devices, bus_list) {
+		if (dev == stop)
+			return;
+		if (!dev->slot || dev->slot != slot)
+			continue;
+		pci_tsm_reset_done(dev);
+		if (dev->subordinate)
+			pci_bus_tsm_reset_done(dev->subordinate, NULL);
+	}
+}
+
+static int pci_slot_tsm_reset_prepare(struct pci_slot *slot)
+{
+	struct pci_dev *dev;
+	int rc;
+
+	list_for_each_entry(dev, &slot->bus->devices, bus_list) {
+		if (!dev->slot || dev->slot != slot)
+			continue;
+		rc = pci_tsm_reset_prepare(dev);
+		if (!rc && dev->subordinate) {
+			rc = pci_bus_tsm_reset_prepare(dev->subordinate);
+			if (rc)
+				pci_tsm_reset_done(dev);
+		}
+		if (rc) {
+			pci_slot_tsm_reset_done(slot, dev);
+			return rc;
+		}
+	}
+
+	return 0;
+}
+
 static int pci_slot_reset(struct pci_slot *slot, bool probe)
 {
 	int rc;
@@ -5635,10 +5736,15 @@ static int pci_try_reset_slot(struct pci_slot *slot)
 		return rc;
 
 	if (pci_slot_trylock(slot)) {
-		pci_slot_save_and_disable_locked(slot);
-		might_sleep();
-		rc = pci_reset_hotplug_slot(slot->hotplug, PCI_RESET_DO_RESET);
-		pci_slot_restore_locked(slot);
+		rc = pci_slot_tsm_reset_prepare(slot);
+		if (!rc) {
+			pci_slot_save_and_disable_locked(slot);
+			might_sleep();
+			rc = pci_reset_hotplug_slot(slot->hotplug,
+						    PCI_RESET_DO_RESET);
+			pci_slot_restore_locked(slot);
+			pci_slot_tsm_reset_done(slot, NULL);
+		}
 		pci_slot_unlock(slot);
 	} else
 		rc = -EAGAIN;
@@ -5682,10 +5788,14 @@ static int pci_try_reset_bus(struct pci_bus *bus)
 		return rc;
 
 	if (pci_bus_trylock(bus)) {
-		pci_bus_save_and_disable_locked(bus);
-		might_sleep();
-		rc = pci_bridge_secondary_bus_reset(bus->self);
-		pci_bus_restore_locked(bus);
+		rc = pci_bus_tsm_reset_prepare(bus);
+		if (!rc) {
+			pci_bus_save_and_disable_locked(bus);
+			might_sleep();
+			rc = pci_bridge_secondary_bus_reset(bus->self);
+			pci_bus_restore_locked(bus);
+			pci_bus_tsm_reset_done(bus, NULL);
+		}
 		pci_bus_unlock(bus);
 	} else
 		rc = -EAGAIN;
