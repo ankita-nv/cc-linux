@@ -905,6 +905,14 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev)
 		bool coherent =
 			bar == PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_COHERENT;
 
+		/*
+		 * On FVP BAR2 contains the MSI-X range, and it is
+		 * erroneously included as a TEE range. Keep
+		 * just the BAR0 (control page) protected.
+		 */
+		if (pdev->vendor == 0x13b5 && bar > 0)
+			continue;
+
 		if (coherent) {
 			if (i != mmio_range_count - 1) {
 				pci_dbg(pdev, "Coherent reporting range is not last\n");
