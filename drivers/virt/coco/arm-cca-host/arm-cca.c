@@ -39,16 +39,11 @@ static struct pci_tsm *cca_tsm_pci_probe(struct tsm_dev *tsm_dev, struct pci_dev
 	if (!pf0_ep_dsc)
 		return NULL;
 
-	/* if device have ide cap, setup doe mailbox */
-	if (pdev->ide_cap && pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT) {
-		struct pci_doe_mb *doe_mb;
-
-		doe_mb = pci_find_doe_mailbox(pdev, PCI_VENDOR_ID_PCI_SIG,
-					      PCI_DOE_FEATURE_CMA);
-		if (!doe_mb)
-			return NULL;
-		pf0_ep_dsc->pci.doe_mb = doe_mb;
-	}
+	/* The mailbox is optional as SPDM-less PDEVs do not use it */
+	if (pdev->ide_cap && pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT)
+		pf0_ep_dsc->pci.doe_mb =
+			pci_find_doe_mailbox(pdev, PCI_VENDOR_ID_PCI_SIG,
+					     PCI_DOE_FEATURE_CMA);
 
 	ret = pci_tsm_pf0_constructor(pdev, &pf0_ep_dsc->pci, tsm_dev);
 	if (ret)
