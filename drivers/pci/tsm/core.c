@@ -11,6 +11,7 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/ioport.h>
+#include <linux/overflow.h>
 #include <linux/pci.h>
 #include <linux/pci-doe.h>
 #include <linux/pci-tsm.h>
@@ -913,6 +914,12 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev)
 		if (pdev->vendor == 0x13b5 && bar > 0)
 			continue;
 
+		if (pdev->report_offset_in_pages &&
+		    check_mul_overflow(tsm_offset, (u64)SZ_4K, &tsm_offset)) {
+			pci_dbg(pdev, "Reporting offset overflow\n");
+			return NULL;
+		}
+
 		if (coherent) {
 			if (i != mmio_range_count - 1) {
 				pci_dbg(pdev, "Coherent reporting range is not last\n");
@@ -1194,6 +1201,32 @@ static ssize_t unlock_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_WO(unlock);
 
+static ssize_t report_offset_in_pages_show(struct device *dev,
+					   struct device_attribute *attr,
+					   char *buf)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+
+	return sysfs_emit(buf, "%d\n", pdev->report_offset_in_pages);
+}
+
+static ssize_t report_offset_in_pages_store(struct device *dev,
+					    struct device_attribute *attr,
+					    const char *buf, size_t count)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	bool val;
+	int err;
+
+	err = kstrtobool(buf, &val);
+	if (err)
+		return err;
+
+	pdev->report_offset_in_pages = val;
+	return count;
+}
+static DEVICE_ATTR_RW(report_offset_in_pages);
+
 /* The 'authenticated' attribute is exclusive to the presence of a 'link' TSM */
 static bool pci_tsm_link_group_visible(struct kobject *kobj)
 {
@@ -1261,7 +1294,8 @@ static umode_t pci_tsm_attr_visible(struct kobject *kobj,
 	if (pci_tsm_devsec_group_visible(kobj)) {
 		if (attr == &dev_attr_accept.attr ||
 		    attr == &dev_attr_lock.attr ||
-		    attr == &dev_attr_unlock.attr)
+		    attr == &dev_attr_unlock.attr ||
+		    attr == &dev_attr_report_offset_in_pages.attr)
 			return attr->mode;
 	}
 
@@ -1283,6 +1317,7 @@ static struct attribute *pci_tsm_attrs[] = {
 	&dev_attr_accept.attr,
 	&dev_attr_lock.attr,
 	&dev_attr_unlock.attr,
+	&dev_attr_report_offset_in_pages.attr,
 	NULL
 };
 

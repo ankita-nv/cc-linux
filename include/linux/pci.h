@@ -582,6 +582,7 @@ struct pci_dev {
 	struct pci_tsm *tsm;		/* TSM operation state */
 	unsigned int tsm_reset_depth;	/* Nesting of TSM reset hooks */
 	struct tsm_dev *tsm_reset_dev;	/* TSM to reconnect after a reset */
+	bool report_offset_in_pages;	/* DevIf Report MMIO offsets in 4K pages */
 #endif
 	u16		acs_cap;	/* ACS Capability offset */
 	u16		acs_capabilities; /* ACS Capabilities */
