@@ -165,18 +165,32 @@ int arm_smmu_get_realm_params(struct device *dev,
 	params->l2_sid = ALIGN_DOWN(master->streams[0].id,
 				    STRTAB_NUM_L2_STES);
 
-	/* No ATS and PRI support */
+	/*
+	 * Request ATS only if the SMMU, the RMM and the PSMMU all support it.
+	 * PRI remains disabled.
+	 */
+	if ((smmu->features & ARM_SMMU_FEAT_ATS) &&
+	    rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_ATS) &&
+	    (smmu->realm.flags & RMI_PSMMU_ATS))
+		params->irq_flags |= RMI_PSMMU_ATS;
+
 	if (!(smmu->features & ARM_SMMU_FEAT_RME_MSI)) {
-		params->irq_flags = RMI_PSMMU_IRQCFG_IRQ_WIRED;
+		params->irq_flags |= RMI_PSMMU_IRQCFG_IRQ_WIRED;
 		return 0;
 	}
 
-	params->irq_flags = RMI_PSMMU_IRQCFG_IRQ_MSI;
+	params->irq_flags |= RMI_PSMMU_IRQCFG_IRQ_MSI;
 	if (get_irq_data(smmu->realm.gerr_irq,
 			 &params->gerr_addr, &params->gerr_data))
 		return -EINVAL;
 	if (get_irq_data(smmu->realm.evtq_irq,
 			 &params->eventq_addr, &params->eventq_data))
 		return -EINVAL;
+	/*
+	 * RMI_PSMMU_ACTIVATE validates every MSI doorbell in MSI mode, even
+	 * with PRI disabled. Point the PRIQ at the event queue doorbell.
+	 */
+	params->priq_addr = params->eventq_addr;
+	params->priq_data = params->eventq_data;
 	return 0;
 }

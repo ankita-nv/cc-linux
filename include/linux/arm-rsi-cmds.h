@@ -263,6 +263,7 @@ static inline unsigned long rsi_features(unsigned long index, u64 *out)
 	return res.a0;
 }
 bool rsi_has_da_feature(void);
+bool rsi_has_ats_feature(void);
 
 static inline long
 rsi_vdev_validate_mapping(unsigned long vdev_id,

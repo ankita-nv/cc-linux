@@ -238,11 +238,14 @@ int cca_verify_digests(u64 hash_algo,
 
 static inline int rsi_vdev_enable_dma(int vdev_id, struct dsm_device_info *dev_info)
 {
+	unsigned long flags = 0;
 	unsigned long ret;
 
-	/* No ATS support */
+	if (rsi_has_ats_feature())
+		flags |= RSI_VDEV_DMA_FLAGS_ATS;
+
 	do {
-		ret = __rsi_vdev_dma_enable(vdev_id, 0, 0, dev_info->lock_seq,
+		ret = __rsi_vdev_dma_enable(vdev_id, flags, 0, dev_info->lock_seq,
 					    dev_info->meas_seq,
 					    dev_info->report_seq);
 		cond_resched();

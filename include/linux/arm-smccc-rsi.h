@@ -56,6 +56,7 @@
 #define SMC_RSI_ABI_VERSION	SMC_RSI_FID(0x190)
 
 #define RSI_FEATURE_REGISTER_0_DA		BIT(0)
+#define RSI_FEATURE_REGISTER_0_ATS		BIT(2)
 /*
  * Read feature register.
  *
@@ -190,6 +191,8 @@ struct realm_config {
 #define SMC_RSI_IPA_STATE_GET			SMC_RSI_FID(0x198)
 
 #define SMC_RSI_VDEV_DMA_ENABLE			SMC_RSI_FID(0x19C)
+
+#define RSI_VDEV_DMA_FLAGS_ATS			BIT(0)
 
 /*
  * Disable DMA for a Realm device.

@@ -904,6 +904,8 @@ struct arm_smmu_impl_ops {
 };
 
 struct arm_smmu_realm {
+	/* RMI_PSMMU_INFO flags this driver acts on. */
+	u64				flags;
 	int				gerr_irq;
 	int				evtq_irq;
 	int				pri_irq;

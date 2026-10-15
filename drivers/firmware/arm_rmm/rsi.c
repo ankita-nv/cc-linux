@@ -34,6 +34,12 @@ bool rsi_has_da_feature(void)
 }
 EXPORT_SYMBOL_GPL(rsi_has_da_feature);
 
+bool rsi_has_ats_feature(void)
+{
+	return u64_get_bits(rsi_feat_reg0, RSI_FEATURE_REGISTER_0_ATS);
+}
+EXPORT_SYMBOL_GPL(rsi_has_ats_feature);
+
 static bool rsi_version_matches(void)
 {
 	unsigned long ver_lower, ver_higher;

@@ -5774,6 +5774,9 @@ static int arm_smmu_rmm_device_probe(struct arm_smmu_device *smmu)
 
 	flags = psmmu_info->flags;
 	irq_cfg = flags & RMI_PSMMU_IRQCFG_MASK;
+	smmu->realm.flags = flags & (RMI_PSMMU_IRQCFG_MASK |
+				     RMI_PSMMU_CMDQSYNC_IRQ_WIRED |
+				     RMI_PSMMU_ATS);
 
 	/* Disable RME FEAT because RMM need cmdq sync interrupt*/
 	if (flags & RMI_PSMMU_CMDQSYNC_IRQ_WIRED)
