@@ -1589,8 +1589,8 @@ static void cca_vdev_drain_dpt_regions(struct cca_host_tdi *host_tdi,
 	}
 }
 
-void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
-		      struct pci_dev *pdev, struct pci_dev *pf0_dev)
+int cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
+		     struct pci_dev *pdev, struct pci_dev *pf0_dev)
 {
 	phys_addr_t rmm_pdev_phys;
 	phys_addr_t rmm_vdev_phys;
@@ -1600,6 +1600,9 @@ void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
 	int ret;
 
 	cca_vdev_assert_locked(pdev);
+	/* Already released, e.g. across a device reset. */
+	if (!host_tdi->rmm_vdev)
+		return 0;
 	rmm_vdev_phys = virt_to_phys(host_tdi->rmm_vdev);
 
 	if (host_tdi->state != RMI_VDEV_UNLOCKED) {
@@ -1609,7 +1612,7 @@ void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
 				"failed to unmap vdev memory before destroy (%d)\n",
 				ret);
 			cca_vdev_drain_dpt_regions(host_tdi, false);
-			return;
+			return ret;
 		}
 
 		ret = cca_vdev_device_unlock(host_tdi, pdev);
@@ -1629,7 +1632,7 @@ void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
 	    state != RMI_VDEV_UNLOCKED) {
 		pci_err(pdev, "vdev is not unlocked for destruction\n");
 		cca_vdev_drain_dpt_regions(host_tdi, false);
-		return;
+		return -EBUSY;
 	}
 
 	/* A successful unlock proves that no device mappings remain. */
@@ -1637,7 +1640,7 @@ void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
 
 	if (cca_rmi_vdev_destroy(rd_phys, rmm_pdev_phys, rmm_vdev_phys)) {
 		pci_err(pdev, "failed to destroy vdev\n");
-		return;
+		return -ENXIO;
 	}
 
 	if (!rmi_undelegate_page(rmm_vdev_phys))
@@ -1645,6 +1648,7 @@ void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
 
 	host_tdi->rmm_vdev = NULL;
 	host_tdi->realm = NULL;
+	return 0;
 }
 
 static void vdev_fetch_object_workfn(struct work_struct *work)

@@ -138,6 +138,8 @@ size_t cca_viommu_get_size(struct device *dev, enum iommu_viommu_type type);
 int cca_viommu_init(struct iommufd_viommu *viommu, struct device *dev,
 		    struct iommu_domain *parent,
 		    const struct iommu_user_data *user_data);
+int cca_vdevice_context_detach(struct pci_tsm_context *context);
+int cca_vdevice_context_attach(struct pci_tsm_context *context);
 
 enum dev_comm_type {
 	PDEV_COMMUNICATE = 0x1,
@@ -269,8 +271,8 @@ int cca_pdev_purge_stream_key(struct pci_dev *pdev1,
 		struct pci_dev *pdev2, unsigned long stream_handle);
 int cca_pdev_refresh_all_stream_keys(struct pci_dev *pdev);
 int cca_pdev_purge_all_stream_keys(struct pci_dev *pdev);
-void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
-		      struct pci_dev *pdev, struct pci_dev *pf0_dev);
+int cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
+		     struct pci_dev *pdev, struct pci_dev *pf0_dev);
 int cca_vdev_device_map(struct cca_host_tdi *host_tdi, struct pci_dev *pdev,
 			unsigned long gpa_base, unsigned long gpa_top,
 			unsigned long pa_base);

@@ -237,6 +237,69 @@ static void cca_vdevice_destroy(struct iommufd_vdevice *vdev)
 	pci_tsm_context_put(context);
 }
 
+/*
+ * A device reset forces the TDI to CONFIG_UNLOCKED and, for a DSM reset,
+ * drops the PDEV the VDEV belongs to. Destroy the RMM VDEV ahead of the reset,
+ * keeping the vdevice, its PSMMU L2 table and its VSMMU reference, so that
+ * cca_vdevice_context_attach() can recreate it in the UNLOCKED state.
+ */
+int cca_vdevice_context_detach(struct pci_tsm_context *context)
+{
+	struct cca_host_tdi *host_tdi = pci_tsm_context_data(context);
+	struct pci_dev *dsm_dev = pci_tsm_context_dsm_dev(context);
+	struct cca_vdevice *cca_vdev;
+	struct pci_dev *pdev;
+	int ret;
+
+	if (!host_tdi || !host_tdi->rmm_vdev)
+		return 0;
+
+	cca_vdev = container_of(host_tdi, struct cca_vdevice, host_tdi);
+	pdev = to_pci_dev(iommufd_vdevice_to_device(&cca_vdev->core));
+	ret = cca_vdev_destroy(host_tdi, &host_tdi->kvm->arch.realm, pdev,
+			       dsm_dev);
+	if (ret)
+		return ret;
+
+	/* The cached evidence describes the destroyed VDEV. */
+	kvfree(host_tdi->interface_report);
+	host_tdi->interface_report = NULL;
+	kvfree(host_tdi->measurements);
+	host_tdi->measurements = NULL;
+	return 0;
+}
+
+int cca_vdevice_context_attach(struct pci_tsm_context *context)
+{
+	struct cca_host_tdi *host_tdi = pci_tsm_context_data(context);
+	struct pci_dev *dsm_dev = pci_tsm_context_dsm_dev(context);
+	struct cca_vdevice *cca_vdev;
+	struct iommufd_vdevice *vdev;
+	struct realm_vsmmu *vsmmu;
+	struct pci_dev *pdev;
+	void *rmm_vdev;
+
+	if (!host_tdi || host_tdi->rmm_vdev)
+		return 0;
+
+	cca_vdev = container_of(host_tdi, struct cca_vdevice, host_tdi);
+	vdev = &cca_vdev->core;
+	pdev = to_pci_dev(iommufd_vdevice_to_device(vdev));
+
+	/* cca_vdev_create() takes its own VSMMU reference on success. */
+	vsmmu = host_tdi->vsmmu;
+	host_tdi->vsmmu = NULL;
+	rmm_vdev = cca_vdev_create(host_tdi, &host_tdi->kvm->arch.realm, pdev,
+				   dsm_dev, vdev->virt_id,
+				   vdev->viommu->obj.id);
+	if (IS_ERR_OR_NULL(rmm_vdev)) {
+		host_tdi->vsmmu = vsmmu;
+		return rmm_vdev ? PTR_ERR(rmm_vdev) : -ENOMEM;
+	}
+	kvm_realm_put_vsmmu(vsmmu);
+	return 0;
+}
+
 static int cca_vdevice_init(struct iommufd_vdevice *vdev)
 {
 	struct cca_vdevice *cca_vdev =
@@ -335,6 +398,9 @@ static ssize_t cca_vdevice_tsm_req(struct iommufd_vdevice *vdev,
 	pdev = to_pci_dev(iommufd_vdevice_to_device(vdev));
 	pf0 = pci_tsm_context_pf0(context);
 	guard(mutex)(&pf0->lock);
+	/* The VDEV is released while its device is being reset. */
+	if (!host_tdi->rmm_vdev)
+		return -ENXIO;
 	switch (info->op) {
 	case TSM_REQ_VALIDATE_MMIO: {
 		struct arm64_vdev_validate_mmio_guest_req req;
