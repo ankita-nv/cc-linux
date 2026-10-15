@@ -89,8 +89,8 @@ int cca_update_device_object_cache(struct pci_dev *pdev, const u8 *nonce)
 static inline int
 rsi_validate_dev_mapping(unsigned long vdev_id, phys_addr_t start_ipa,
 		phys_addr_t end_ipa, phys_addr_t io_pa,
-		unsigned long flags, unsigned long lock_nonce,
-		unsigned long meas_nonce, unsigned long report_nonce)
+		unsigned long flags, unsigned long lock_seq,
+		unsigned long meas_seq, unsigned long report_seq)
 {
 	unsigned long ret;
 	phys_addr_t next_ipa;
@@ -98,7 +98,7 @@ rsi_validate_dev_mapping(unsigned long vdev_id, phys_addr_t start_ipa,
 	while (start_ipa < end_ipa) {
 		ret = rsi_vdev_validate_mapping(vdev_id, start_ipa, end_ipa,
 						io_pa, &next_ipa, flags,
-						lock_nonce, meas_nonce, report_nonce);
+						lock_seq, meas_seq, report_seq);
 		if (ret || next_ipa <= start_ipa || next_ipa > end_ipa)
 			return -EINVAL;
 		io_pa += next_ipa - start_ipa;
@@ -176,6 +176,10 @@ int cca_verify_digest(u64 hash_algo, uint8_t *report,
 		digest_func = sha512;
 		digest_size = SHA512_DIGEST_SIZE;
 		break;
+	case RSI_HASH_SHA_384:
+		digest_func = sha384;
+		digest_size = SHA384_DIGEST_SIZE;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -234,9 +238,60 @@ int cca_verify_digests(u64 hash_algo,
 
 static inline int rsi_vdev_enable_dma(int vdev_id, struct dsm_device_info *dev_info)
 {
+	unsigned long ret;
+
 	/* No ATS support */
-	return __rsi_vdev_dma_enable(vdev_id, 0, 0, dev_info->lock_seq,
-				     dev_info->meas_seq, dev_info->report_seq);
+	do {
+		ret = __rsi_vdev_dma_enable(vdev_id, 0, 0, dev_info->lock_seq,
+					    dev_info->meas_seq,
+					    dev_info->report_seq);
+		cond_resched();
+	} while (ret == RSI_INCOMPLETE);
+
+	return ret;
+}
+
+int cca_device_disable_dma(struct pci_dev *pdev)
+{
+	unsigned long ret;
+
+	do {
+		ret = rsi_vdev_dma_disable(rsi_vdev_id(pdev));
+		cond_resched();
+	} while (ret == RSI_INCOMPLETE);
+
+	return ret;
+}
+
+/*
+ * The host may have relocked the device or refreshed its evidence since
+ * the guest collected it. Re-read RsiVdevInfo so that mappings and DMA are
+ * never accepted against stale lock, measurement or report sequences.
+ */
+static int cca_vdev_check_fresh_info(struct pci_dev *pdev,
+				     unsigned long lock_seq,
+				     struct dsm_device_info *cached)
+{
+	struct rsi_vdevice_info *info __free(kfree) =
+		kmalloc_obj(struct rsi_vdevice_info);
+
+	if (!info)
+		return -ENOMEM;
+
+	if (rsi_vdev_get_info(rsi_vdev_id(pdev), virt_to_phys(info))) {
+		pci_err(pdev, "failed to refresh device information\n");
+		return -EIO;
+	}
+
+	if (info->lock_seq != lock_seq ||
+	    info->lock_seq != cached->lock_seq ||
+	    info->meas_seq != cached->meas_seq ||
+	    info->report_seq != cached->report_seq) {
+		pci_err(pdev, "Device evidence generation mismatch\n");
+		return -EIO;
+	}
+
+	return 0;
 }
 
 int cca_device_accept(struct pci_dev *pdev, unsigned long lock_seq)
@@ -246,10 +301,9 @@ int cca_device_accept(struct pci_dev *pdev, unsigned long lock_seq)
 	int vdev_id = rsi_vdev_id(pdev);
 	struct cca_guest_dsc *dsc = to_cca_guest_dsc(pdev);
 
-	if (lock_seq != dsc->dev_info.lock_seq) {
-		pci_err(pdev, "Device evidence generation mismatch\n");
-		return -EIO;
-	}
+	ret = cca_vdev_check_fresh_info(pdev, lock_seq, &dsc->dev_info);
+	if (ret)
+		return ret;
 
 	/* Allocation private mmio range based on interface report. */
 	tsm_mmio = pci_tsm_mmio_alloc(pdev);

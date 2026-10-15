@@ -129,6 +129,7 @@
 
 #define RSI_HASH_SHA_256 0
 #define RSI_HASH_SHA_512 1
+#define RSI_HASH_SHA_384 2
 
 struct realm_config {
 	union {
@@ -190,7 +191,17 @@ struct realm_config {
 
 #define SMC_RSI_VDEV_DMA_ENABLE			SMC_RSI_FID(0x19C)
 
-#define RSI_VDEV_REPORT_FORMAT_TDISP 0x1
+/*
+ * Disable DMA for a Realm device.
+ *
+ * arg1 == Realm device identifier
+ * ret0 == Status / error
+ */
+#define SMC_RSI_VDEV_DMA_DISABLE		SMC_RSI_FID(0x1A4)
+
+#define RSI_VDEV_INFO_FLAGS_VSMMU		BIT(0)
+#define RSI_VDEV_INFO_FLAGS_PROTOCOL_DATA_SET	BIT(1)
+#define RSI_VDEV_INFO_FLAGS_PLATFORM_NONCE	BIT(2)
 struct rsi_vdevice_info {
 	union {
 		struct {
@@ -226,11 +237,24 @@ struct rsi_vdevice_info {
 	union { /* 0x1c0  */
 		struct {
 			u64 vsmmu_addr;
-			u64 vsmu_vsid;
+			u64 vsmmu_vsid;
 		};
 		u8 padding5[0x200 - 0x1c0];
 	};
 };
+static_assert(offsetof(struct rsi_vdevice_info, id_index) == 0x08);
+static_assert(offsetof(struct rsi_vdevice_info, hash_algo) == 0x10);
+static_assert(offsetof(struct rsi_vdevice_info, lock_seq) == 0x18);
+static_assert(offsetof(struct rsi_vdevice_info, meas_seq) == 0x20);
+static_assert(offsetof(struct rsi_vdevice_info, report_seq) == 0x28);
+static_assert(offsetof(struct rsi_vdevice_info, tdisp_version) == 0x38);
+static_assert(offsetof(struct rsi_vdevice_info, state) == 0x40);
+static_assert(offsetof(struct rsi_vdevice_info, protocol_data_digest) == 0x80);
+static_assert(offsetof(struct rsi_vdevice_info, identity_digest) == 0xc0);
+static_assert(offsetof(struct rsi_vdevice_info, report_digest) == 0x180);
+static_assert(offsetof(struct rsi_vdevice_info, vsmmu_addr) == 0x1c0);
+static_assert(offsetof(struct rsi_vdevice_info, vsmmu_vsid) == 0x1c8);
+static_assert(sizeof(struct rsi_vdevice_info) == 0x200);
 
 /*
  * Get information for a device.

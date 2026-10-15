@@ -426,6 +426,9 @@ static struct pci_tsm *cca_tsm_lock(struct tsm_dev *tsm_dev, struct pci_dev *pde
 	case RSI_HASH_SHA_512:
 		digest_algo = HASH_ALGO_SHA512;
 		break;
+	case RSI_HASH_SHA_384:
+		digest_algo = HASH_ALGO_SHA384;
+		break;
 	default:
 		ret = -EIO;
 		goto free_dev_info;
@@ -455,6 +458,12 @@ static void cca_tsm_unlock(struct pci_tsm *tsm)
 	long ret;
 	struct pci_dev *pdev = tsm->pdev;
 	struct cca_guest_dsc *cca_dsc = to_cca_guest_dsc(pdev);
+
+	/* Stop device DMA before its mappings are invalidated. */
+	if (cca_dsc->pci.mmio && cca_device_disable_dma(pdev)) {
+		pci_err(pdev, "failed to disable DMA from the device\n");
+		goto err_out;
+	}
 
 	/* invalidate dev mapping based on interface report */
 	ret = cca_unmap_evidence_report_range(tsm->pdev);

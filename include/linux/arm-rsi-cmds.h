@@ -268,8 +268,8 @@ static inline long
 rsi_vdev_validate_mapping(unsigned long vdev_id,
 			  phys_addr_t ipa_base, phys_addr_t ipa_top,
 			  phys_addr_t pa_base, phys_addr_t *next_ipa,
-			  unsigned long flags, unsigned long lock_nonce,
-			  unsigned long meas_nonce, unsigned long report_nonce)
+			  unsigned long flags, unsigned long lock_seq,
+			  unsigned long meas_seq, unsigned long report_seq)
 {
 	struct arm_smccc_1_2_regs res;
 	struct arm_smccc_1_2_regs regs = {
@@ -279,18 +279,20 @@ rsi_vdev_validate_mapping(unsigned long vdev_id,
 		.a3 = ipa_top,
 		.a4 = pa_base,
 		.a5 = flags,
-		.a6 = lock_nonce,
-		.a7 = meas_nonce,
-		.a8 = report_nonce,
+		.a6 = lock_seq,
+		.a7 = meas_seq,
+		.a8 = report_seq,
 	};
 
 	arm_smccc_1_2_invoke(&regs, &res);
-	*next_ipa = res.a1;
+	if (res.a0 != RSI_SUCCESS)
+		return res.a0;
 
 	if (res.a2 != RSI_ACCEPT)
 		return -EPERM;
 
-	return res.a0;
+	*next_ipa = res.a1;
+	return RSI_SUCCESS;
 }
 
 static inline unsigned long rsi_vdev_get_info(unsigned long vdev_id,
@@ -306,14 +308,23 @@ static inline unsigned long rsi_vdev_get_info(unsigned long vdev_id,
 
 static inline unsigned long __rsi_vdev_dma_enable(unsigned long vdev_id,
 		unsigned long flags, unsigned long non_ats_plane,
-		unsigned long lock_nonce, unsigned long meas_nonce,
-		unsigned long report_nonce)
+		unsigned long lock_seq, unsigned long meas_seq,
+		unsigned long report_seq)
 {
 	struct arm_smccc_res res;
 
 	arm_smccc_1_1_invoke(SMC_RSI_VDEV_DMA_ENABLE, vdev_id, flags,
-			     non_ats_plane, lock_nonce,
-			     meas_nonce, report_nonce, &res);
+			     non_ats_plane, lock_seq,
+			     meas_seq, report_seq, &res);
+
+	return res.a0;
+}
+
+static inline unsigned long rsi_vdev_dma_disable(unsigned long vdev_id)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(SMC_RSI_VDEV_DMA_DISABLE, vdev_id, &res);
 
 	return res.a0;
 }

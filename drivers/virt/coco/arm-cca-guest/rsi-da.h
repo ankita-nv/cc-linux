@@ -48,6 +48,7 @@ static inline int rsi_vdev_id(struct pci_dev *pdev)
 
 int cca_device_lock(struct pci_dev *pdev);
 int cca_device_unlock(struct pci_dev *pdev);
+int cca_device_disable_dma(struct pci_dev *pdev);
 int cca_update_device_object_cache(struct pci_dev *pdev, const u8 *nonce);
 struct page *alloc_shared_pages(int nid, gfp_t gfp_mask, unsigned long min_size);
 int free_shared_pages(struct page *page, unsigned long min_size);
@@ -61,6 +62,6 @@ int cca_verify_digests(u64 hash_algo,
 		uint8_t *interface_report, size_t interface_report_size,
 		uint8_t *measurements, size_t measurements_size,
 		struct rsi_vdevice_info *dev_info);
-int cca_device_accept(struct pci_dev *pdev, unsigned long lock_nonce);
+int cca_device_accept(struct pci_dev *pdev, unsigned long lock_seq);
 
 #endif
