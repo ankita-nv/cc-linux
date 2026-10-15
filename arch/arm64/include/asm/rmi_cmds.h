@@ -616,6 +616,29 @@ static inline unsigned long rmi_pdev_stream_disconnect(unsigned long pdev1_phys,
 	return res.a0;
 }
 
+static inline unsigned long rmi_pdev_stream_info(unsigned long pdev1_phys,
+		unsigned long pdev2_phys, unsigned long stream_handle,
+		struct rmi_pdev_stream_info *info)
+{
+	struct arm_smccc_1_2_regs regs = {
+		.a0 = SMC_RMI_PDEV_STREAM_INFO,
+		.a1 = pdev1_phys,
+		.a2 = pdev2_phys,
+		.a3 = stream_handle,
+	};
+
+	arm_smccc_1_2_invoke(&regs, &regs);
+
+	if (RMI_RETURN_STATUS(regs.a0) == RMI_SUCCESS) {
+		info->state = regs.a1;
+		info->type = regs.a2;
+		info->refresh_count = regs.a3;
+		info->purge_count = regs.a4;
+	}
+
+	return regs.a0;
+}
+
 static inline unsigned long rmi_psmmu_info(unsigned long psmmu_phys,
 		unsigned long psmmu_info_phys)
 {

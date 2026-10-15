@@ -911,16 +911,60 @@ static int submit_stream_work(struct pci_dev *pdev1, struct pci_dev *pdev2,
 	return 0;
 }
 
+static int stream_pair_not_errored(struct pci_dev *pdev1,
+		struct pci_dev *pdev2)
+{
+	struct cca_host_pdev_dsc *pdev_dsc1 = to_cca_pdev_dsc(pdev1);
+	enum rmi_pdev_state state;
+
+	if (rmi_pdev_get_state(virt_to_phys(pdev_dsc1->rmm_pdev), &state) ||
+	    state == RMI_PDEV_ERROR)
+		return -EIO;
+
+	if (pdev2) {
+		struct cca_host_pdev_dsc *pdev_dsc2 =
+			to_cca_pdev_dsc(pdev2);
+
+		if (rmi_pdev_get_state(virt_to_phys(pdev_dsc2->rmm_pdev),
+				       &state) || state == RMI_PDEV_ERROR)
+			return -EIO;
+	}
+
+	return 0;
+}
+
 int cca_pdev_stream_connect(struct pci_dev *pdev1, struct pci_dev *pdev2,
 		struct rmi_pdev_stream_params *stream_params,
 		unsigned long *stream_handle)
 {
 	phys_addr_t stream_params_phys = virt_to_phys(stream_params);
+	phys_addr_t rmm_pdev1_phys, rmm_pdev2_phys = 0;
+	struct rmi_pdev_stream_info info;
+	int ret;
 
 	if (rmi_pdev_stream_connect(stream_params_phys, stream_handle))
 		return -EIO;
 
-	return submit_stream_work(pdev1, pdev2, *stream_handle);
+	ret = submit_stream_work(pdev1, pdev2, *stream_handle);
+	if (ret)
+		return ret;
+
+	ret = stream_pair_not_errored(pdev1, pdev2);
+	if (ret)
+		return ret;
+
+	rmm_pdev1_phys = virt_to_phys(to_cca_pdev_dsc(pdev1)->rmm_pdev);
+	if (pdev2)
+		rmm_pdev2_phys = virt_to_phys(to_cca_pdev_dsc(pdev2)->rmm_pdev);
+
+	if (rmi_pdev_stream_info(rmm_pdev1_phys, rmm_pdev2_phys, *stream_handle,
+				 &info))
+		return -EIO;
+
+	if (info.state != RMI_PDEV_STREAM_CONNECTED)
+		return -EPROTO;
+
+	return 0;
 }
 
 int cca_pdev_disconnect_stream(struct pci_dev *pdev1,
@@ -929,15 +973,39 @@ int cca_pdev_disconnect_stream(struct pci_dev *pdev1,
 
 	phys_addr_t rmm_pdev2_phys = 0;
 	struct cca_host_pdev_dsc *pdev_dsc1 = to_cca_pdev_dsc(pdev1);
+	phys_addr_t rmm_pdev1_phys = virt_to_phys(pdev_dsc1->rmm_pdev);
+	struct rmi_pdev_stream_info info;
+	int ret;
 
 	if (pdev2)
 		rmm_pdev2_phys = virt_to_phys(to_cca_pdev_dsc(pdev2)->rmm_pdev);
 
-	if (rmi_pdev_stream_disconnect(virt_to_phys(pdev_dsc1->rmm_pdev),
-				       rmm_pdev2_phys, stream_handle))
+	if (rmi_pdev_stream_disconnect(rmm_pdev1_phys, rmm_pdev2_phys,
+				       stream_handle))
 		return -EIO;
 
-	return submit_stream_work(pdev1, pdev2, stream_handle);
+	ret = submit_stream_work(pdev1, pdev2, stream_handle);
+	if (ret)
+		return ret;
+
+	ret = stream_pair_not_errored(pdev1, pdev2);
+	if (ret)
+		return ret;
+
+	/*
+	 * A completed disconnect releases the stream handle, so INFO normally
+	 * stops resolving it. If it still resolves, require DISCONNECTED.
+	 */
+	ret = rmi_pdev_stream_info(rmm_pdev1_phys, rmm_pdev2_phys,
+				   stream_handle, &info);
+	if (RMI_RETURN_STATUS(ret) != RMI_SUCCESS &&
+	    RMI_RETURN_STATUS(ret) != RMI_ERROR_INPUT)
+		return -EIO;
+	if (RMI_RETURN_STATUS(ret) == RMI_SUCCESS &&
+	    info.state != RMI_PDEV_STREAM_DISCONNECTED)
+		return -EPROTO;
+
+	return 0;
 }
 
 static unsigned long pci_get_tdi_id(struct pci_dev *pdev)
@@ -1063,15 +1131,41 @@ int cca_pdev_refresh_stream_key(struct pci_dev *pdev1,
 
 	phys_addr_t rmm_pdev2_phys = 0;
 	struct cca_host_pdev_dsc *pdev_dsc1 = to_cca_pdev_dsc(pdev1);
+	struct rmi_pdev_stream_info info_before, info_after;
+	phys_addr_t rmm_pdev1_phys = virt_to_phys(pdev_dsc1->rmm_pdev);
+	int ret;
 
 	if (pdev2)
 		rmm_pdev2_phys = virt_to_phys(to_cca_pdev_dsc(pdev2)->rmm_pdev);
 
-	if (rmi_pdev_stream_key_refresh(virt_to_phys(pdev_dsc1->rmm_pdev),
-					rmm_pdev2_phys, stream_handle))
+	if (rmi_pdev_stream_info(rmm_pdev1_phys, rmm_pdev2_phys, stream_handle,
+				 &info_before))
 		return -EIO;
 
-	return submit_stream_work(pdev1, pdev2, stream_handle);
+	if (info_before.state != RMI_PDEV_STREAM_CONNECTED)
+		return -EPROTO;
+
+	if (rmi_pdev_stream_key_refresh(rmm_pdev1_phys, rmm_pdev2_phys,
+					stream_handle))
+		return -EIO;
+
+	ret = submit_stream_work(pdev1, pdev2, stream_handle);
+	if (ret)
+		return ret;
+
+	ret = stream_pair_not_errored(pdev1, pdev2);
+	if (ret)
+		return ret;
+
+	if (rmi_pdev_stream_info(rmm_pdev1_phys, rmm_pdev2_phys, stream_handle,
+				 &info_after))
+		return -EIO;
+
+	if (info_after.state != RMI_PDEV_STREAM_CONNECTED ||
+	    info_after.refresh_count != info_before.refresh_count + 1)
+		return -EPROTO;
+
+	return 0;
 }
 
 
@@ -1081,15 +1175,41 @@ int cca_pdev_purge_stream_key(struct pci_dev *pdev1,
 
 	phys_addr_t rmm_pdev2_phys = 0;
 	struct cca_host_pdev_dsc *pdev_dsc1 = to_cca_pdev_dsc(pdev1);
+	struct rmi_pdev_stream_info info_before, info_after;
+	phys_addr_t rmm_pdev1_phys = virt_to_phys(pdev_dsc1->rmm_pdev);
+	int ret;
 
 	if (pdev2)
 		rmm_pdev2_phys = virt_to_phys(to_cca_pdev_dsc(pdev2)->rmm_pdev);
 
-	if (rmi_pdev_stream_key_purge(virt_to_phys(pdev_dsc1->rmm_pdev),
-				      rmm_pdev2_phys, stream_handle))
+	if (rmi_pdev_stream_info(rmm_pdev1_phys, rmm_pdev2_phys, stream_handle,
+				 &info_before))
 		return -EIO;
 
-	return submit_stream_work(pdev1, pdev2, stream_handle);
+	if (info_before.state != RMI_PDEV_STREAM_CONNECTED)
+		return -EPROTO;
+
+	if (rmi_pdev_stream_key_purge(rmm_pdev1_phys, rmm_pdev2_phys,
+				      stream_handle))
+		return -EIO;
+
+	ret = submit_stream_work(pdev1, pdev2, stream_handle);
+	if (ret)
+		return ret;
+
+	ret = stream_pair_not_errored(pdev1, pdev2);
+	if (ret)
+		return ret;
+
+	if (rmi_pdev_stream_info(rmm_pdev1_phys, rmm_pdev2_phys, stream_handle,
+				 &info_after))
+		return -EIO;
+
+	if (info_after.state != RMI_PDEV_STREAM_CONNECTED ||
+	    info_after.purge_count != info_before.purge_count + 1)
+		return -EPROTO;
+
+	return 0;
 }
 
 int cca_vdev_device_unlock(struct cca_host_tdi *host_tdi,

@@ -730,6 +730,22 @@ enum rmi_pdev_stream_type {
 	RMI_PDEV_STREAM_COH_SYS,
 };
 
+enum rmi_pdev_stream_state {
+	RMI_PDEV_STREAM_DISCONNECTED	= 0,
+	RMI_PDEV_STREAM_CONNECTING	= 1,
+	RMI_PDEV_STREAM_CONNECTED	= 2,
+	RMI_PDEV_STREAM_DISCONNECTING	= 3,
+	RMI_PDEV_STREAM_KEY_REFRESHING	= 4,
+	RMI_PDEV_STREAM_KEY_PURGING	= 5,
+};
+
+struct rmi_pdev_stream_info {
+	enum rmi_pdev_stream_state state;
+	enum rmi_pdev_stream_type type;
+	unsigned long refresh_count;
+	unsigned long purge_count;
+};
+
 struct rmi_addr_range {
 	u64 base; /* inclusive */
 	u64 top;  /* exclusive */
