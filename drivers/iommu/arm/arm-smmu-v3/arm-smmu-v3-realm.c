@@ -222,6 +222,10 @@ int arm_smmu_get_realm_params(struct device *dev,
 	    (smmu->realm.flags & RMI_PSMMU_ATS))
 		params->irq_flags |= RMI_PSMMU_ATS;
 
+	if ((smmu->realm.flags & RMI_PSMMU_IRQCFG_MASK) ==
+	    RMI_PSMMU_IRQCFG_IRQ_DISABLED)
+		return 0;
+
 	if (!(smmu->features & ARM_SMMU_FEAT_RME_MSI)) {
 		params->irq_flags |= RMI_PSMMU_IRQCFG_IRQ_WIRED;
 		return 0;

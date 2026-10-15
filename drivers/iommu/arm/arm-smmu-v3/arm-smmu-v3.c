@@ -6006,6 +6006,8 @@ static int arm_smmu_rmm_device_probe(struct arm_smmu_device *smmu)
 		smmu->features |= ARM_SMMU_FEAT_RME_MSI;
 		break;
 	case RMI_PSMMU_IRQCFG_IRQ_DISABLED:
+		/* RMM polls the Realm queues; no Host-side Realm IRQs. */
+		return 0;
 	default:
 		return -ENODEV;
 	}
