@@ -1365,6 +1365,19 @@ out_sync_state:
 	return ret;
 }
 
+static void cca_vdev_drain_dpt_regions(struct cca_host_tdi *host_tdi,
+				       bool destroy)
+{
+	struct cca_vdev_dpt_region *region, *tmp;
+
+	list_for_each_entry_safe(region, tmp, &host_tdi->dpt_regions, node) {
+		if (destroy)
+			realm_destroy_dpt_l1(host_tdi->kvm, region->base);
+		list_del(&region->node);
+		kfree(region);
+	}
+}
+
 void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
 		      struct pci_dev *pdev, struct pci_dev *pf0_dev)
 {
@@ -1384,6 +1397,7 @@ void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
 			pci_err(pdev,
 				"failed to unmap vdev memory before destroy (%d)\n",
 				ret);
+			cca_vdev_drain_dpt_regions(host_tdi, false);
 			return;
 		}
 
@@ -1403,8 +1417,12 @@ void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
 	if (rmi_vdev_get_state(rmm_vdev_phys, &state) ||
 	    state != RMI_VDEV_UNLOCKED) {
 		pci_err(pdev, "vdev is not unlocked for destruction\n");
+		cca_vdev_drain_dpt_regions(host_tdi, false);
 		return;
 	}
+
+	/* A successful unlock proves that no device mappings remain. */
+	cca_vdev_drain_dpt_regions(host_tdi, true);
 
 	if (rmi_vdev_destroy(rd_phys, rmm_pdev_phys, rmm_vdev_phys)) {
 		pci_err(pdev, "failed to destroy vdev\n");
@@ -1445,6 +1463,39 @@ static void vdev_fetch_object_workfn(struct work_struct *work)
 		setup_work->cache_size = CACHE_CHUNK_SIZE;
 }
 
+static int cca_vdev_track_dpt_regions(struct cca_host_tdi *host_tdi,
+				      phys_addr_t pa_base, u64 size)
+{
+	phys_addr_t base = ALIGN_DOWN(pa_base, RMI_DPT_L0_REGION_SIZE);
+	phys_addr_t end = ALIGN(pa_base + size, RMI_DPT_L0_REGION_SIZE);
+	struct cca_vdev_dpt_region *region;
+
+	if (!rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_ATS))
+		return 0;
+
+	for (; base < end; base += RMI_DPT_L0_REGION_SIZE) {
+		bool seen = false;
+
+		list_for_each_entry(region, &host_tdi->dpt_regions, node) {
+			if (region->base == base) {
+				seen = true;
+				break;
+			}
+		}
+		if (seen)
+			continue;
+
+		region = kzalloc_obj(*region);
+		if (!region)
+			return -ENOMEM;
+
+		region->base = base;
+		list_add_tail(&region->node, &host_tdi->dpt_regions);
+	}
+
+	return 0;
+}
+
 int cca_vdev_device_map(struct cca_host_tdi *host_tdi, struct pci_dev *pdev,
 			unsigned long gpa_base, unsigned long gpa_top,
 			unsigned long pa_base)
@@ -1453,6 +1504,7 @@ int cca_vdev_device_map(struct cca_host_tdi *host_tdi, struct pci_dev *pdev,
 	phys_addr_t rmm_pdev_phys;
 	phys_addr_t rmm_vdev_phys;
 	struct cca_host_pdev_dsc *pdev_dsc;
+	int ret;
 
 	cca_vdev_assert_locked(pdev);
 
@@ -1460,6 +1512,11 @@ int cca_vdev_device_map(struct cca_host_tdi *host_tdi, struct pci_dev *pdev,
 	kvm = host_tdi->kvm;
 	rmm_vdev_phys = virt_to_phys(host_tdi->rmm_vdev);
 	rmm_pdev_phys = virt_to_phys(pdev_dsc->rmm_pdev);
+
+	ret = cca_vdev_track_dpt_regions(host_tdi, pa_base,
+					 gpa_top - gpa_base);
+	if (ret)
+		return ret;
 
 	return realm_dev_mem_map(kvm, rmm_pdev_phys, rmm_vdev_phys,
 				 gpa_base, gpa_top, pa_base);

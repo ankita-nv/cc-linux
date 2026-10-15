@@ -225,6 +225,7 @@ static int cca_vdevice_init(struct iommufd_vdevice *vdev)
 	}
 
 	host_tdi->kvm = kvm;
+	INIT_LIST_HEAD(&host_tdi->dpt_regions);
 	cca_vdev->l2_sid = params.l2_sid;
 	pf0 = pci_tsm_context_pf0(context);
 	dsm_dev = pci_tsm_context_dsm_dev(context);

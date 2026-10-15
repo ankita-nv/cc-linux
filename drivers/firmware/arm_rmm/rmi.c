@@ -1620,6 +1620,73 @@ static unsigned long rmi_l1gpt_size(void)
 	return (rmi_l0gpt_size() >> PAGE_SHIFT) / 2;
 }
 
+/* One 32-bit DPT entry describes one RMM granule. */
+static unsigned long rmi_l1dpt_size(void)
+{
+	return (RMI_DPT_L0_REGION_SIZE >> PAGE_SHIFT) * sizeof(u32);
+}
+
+static int rmi_init_dpt(struct rmi_sro_state *sro)
+{
+	unsigned long l1_pages = PFN_UP(rmi_l1dpt_size());
+	struct memblock_region *r;
+	phys_addr_t last_end = 0;
+	int last_nid = NUMA_NO_NODE;
+	long ret;
+
+	if (!rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_ATS))
+		return 0;
+
+	ret = rmi_dpt_l0_create(sro);
+	if (RMI_RETURN_STATUS(ret) != RMI_SUCCESS) {
+		pr_err("RMI: DPT Level 0 create failed: 0x%lx\n", ret);
+		return -ENXIO;
+	}
+
+	rmi_sro_free(sro);
+	for_each_mem_region(r) {
+		phys_addr_t start, end;
+		int nid;
+
+		if (memblock_is_nomap(r))
+			continue;
+
+		start = ALIGN_DOWN(PFN_PHYS(memblock_region_memory_base_pfn(r)),
+				   RMI_DPT_L0_REGION_SIZE);
+		end = ALIGN(PFN_PHYS(memblock_region_memory_end_pfn(r)),
+			    RMI_DPT_L0_REGION_SIZE);
+		if (start < last_end)
+			start = last_end;
+		if (start >= end)
+			continue;
+		last_end = end;
+
+		nid = memblock_get_region_node(r);
+		if (memblock_is_hotpluggable(r) || !numa_valid_node(nid))
+			nid = NUMA_NO_NODE;
+		if (nid != last_nid) {
+			rmi_sro_free(sro);
+			last_nid = nid;
+		}
+
+		while (start < end) {
+			ret = rmi_sro_topup_node(sro, l1_pages, l1_pages, nid);
+			if (ret)
+				return ret;
+
+			ret = rmi_dpt_l1_create(start, sro);
+			if (RMI_RETURN_STATUS(ret) != RMI_SUCCESS) {
+				pr_err("RMI: DPT Level 1 create failed for %pa: 0x%lx\n",
+				       &start, ret);
+				return -ENXIO;
+			}
+			start += RMI_DPT_L0_REGION_SIZE;
+		}
+	}
+
+	return 0;
+}
+
 static int rmi_query_gpt_info(phys_addr_t base, phys_addr_t top,
 			      phys_addr_t *out_top, unsigned long *state)
 {
@@ -2059,6 +2126,43 @@ static void rmi_destroy_metadata(struct rmi_sro_state *sro)
 	}
 }
 
+static void rmi_destroy_dpt(struct rmi_sro_state *sro)
+{
+	struct memblock_region *r;
+	phys_addr_t last_end = 0;
+
+	if (!rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_ATS))
+		return;
+
+	for_each_mem_region(r) {
+		phys_addr_t start, end;
+
+		if (memblock_is_nomap(r))
+			continue;
+
+		start = ALIGN_DOWN(PFN_PHYS(memblock_region_memory_base_pfn(r)),
+				   RMI_DPT_L0_REGION_SIZE);
+		end = ALIGN(PFN_PHYS(memblock_region_memory_end_pfn(r)),
+			    RMI_DPT_L0_REGION_SIZE);
+		if (start < last_end)
+			start = last_end;
+		if (start >= end)
+			continue;
+		last_end = end;
+
+		while (start < end) {
+			if (RMI_RETURN_STATUS(rmi_dpt_l1_destroy(start, sro)) !=
+			    RMI_SUCCESS)
+				pr_warn("RMI: DPT Level 1 destroy failed for %pa\n",
+					&start);
+			start += RMI_DPT_L0_REGION_SIZE;
+		}
+	}
+
+	if (RMI_RETURN_STATUS(rmi_dpt_l0_destroy(sro)) != RMI_SUCCESS)
+		pr_warn("RMI: DPT Level 0 destroy failed\n");
+}
+
 /*
  * On the way into a kexec, fold away the L1 GPTs the RMM can release. This runs
  * in the reboot notifier chain (process context, before machine_shutdown()),
@@ -2075,7 +2179,10 @@ static int rmi_reboot_notify(struct notifier_block *nb, unsigned long action,
 		u64 remaining_bytes;
 		long ret;
 
+		rmi_destroy_dpt(rmi_sro);
+		rmi_sro_free(rmi_sro);
 		rmi_destroy_metadata(rmi_sro);
+		rmi_sro_free(rmi_sro);
 		ret = rmi_rmm_deactivate(rmi_sro);
 		remaining_bytes = rmi_region_owned_bytes(rmi_sro);
 
@@ -2145,6 +2252,10 @@ static int __init arm64_init_rmi(void)
 	if (ret)
 		goto out_deactivate;
 
+	ret = rmi_init_dpt(rmi_sro);
+	if (ret)
+		goto out_deactivate;
+
 	arm64_rmi_is_available = true;
 	pr_info("RMI configured\n");
 
@@ -2163,7 +2274,10 @@ out_deactivate:
 	 * activation donation. Keep the notifier and tracking state only if the
 	 * firmware fails to return all memory, so a later kexec can retry.
 	 */
+	rmi_destroy_dpt(rmi_sro);
+	rmi_sro_free(rmi_sro);
 	rmi_destroy_metadata(rmi_sro);
+	rmi_sro_free(rmi_sro);
 	deactivate_ret = rmi_rmm_deactivate(rmi_sro);
 	remaining_bytes = rmi_region_owned_bytes(rmi_sro);
 	if (deactivate_ret)

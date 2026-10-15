@@ -187,5 +187,6 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 		unsigned long vdev_phys, unsigned long start_ipa,
 		unsigned long end_ipa, unsigned long start_pa);
 int realm_dev_mem_unmap(struct kvm *kvm, unsigned long vdev_phys);
+void realm_destroy_dpt_l1(struct kvm *kvm, phys_addr_t base);
 
 #endif /* __ASM_KVM_RMI_H */

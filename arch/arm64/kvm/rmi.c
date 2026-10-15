@@ -3115,6 +3115,50 @@ err_undelegate_tail:
 	return ret;
 }
 
+/*
+ * With ATS, the SMMU checks device accesses against the DPT, which the RMM
+ * only describes for physical ranges that have a Level 1 table. Boot creates
+ * them for system memory; device ranges get theirs when first mapped. A
+ * range that already has a Level 1 table makes the create fail harmlessly.
+ */
+static void realm_create_dpt_l1_range(struct rmi_sro_state *sro,
+				      phys_addr_t phys, unsigned long size)
+{
+	phys_addr_t base = ALIGN_DOWN(phys, RMI_DPT_L0_REGION_SIZE);
+	phys_addr_t end = ALIGN(phys + size, RMI_DPT_L0_REGION_SIZE);
+
+	if (!rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_ATS))
+		return;
+
+	for (; base < end; base += RMI_DPT_L0_REGION_SIZE)
+		rmi_dpt_l1_create(base, sro);
+	rmi_sro_free(sro);
+}
+
+/*
+ * The RMM only folds a Level 1 DPT whose entries all describe the same
+ * permission state, so this fails harmlessly while any device in the
+ * region still has DPT permissions.
+ */
+void realm_destroy_dpt_l1(struct kvm *kvm, phys_addr_t base)
+{
+	struct rmi_sro_state *sro;
+
+	if (!kvm_realm_is_created(kvm))
+		return;
+	if (!rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_ATS))
+		return;
+
+	sro = kzalloc_obj(*sro, GFP_KERNEL_ACCOUNT);
+	if (!sro)
+		return;
+
+	rmi_dpt_l1_destroy(base, sro);
+	rmi_sro_free(sro);
+	kfree(sro);
+}
+EXPORT_SYMBOL_GPL(realm_destroy_dpt_l1);
+
 int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 		unsigned long vdev_phys, unsigned long start_ipa,
 		unsigned long end_ipa, unsigned long start_pa)
@@ -3131,6 +3175,8 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 	sro = kzalloc_obj(*sro, GFP_KERNEL_ACCOUNT);
 	if (!sro)
 		return -ENOMEM;
+
+	realm_create_dpt_l1_range(sro, start_pa, end_ipa - start_ipa);
 
 	do {
 		mapping = kmalloc_obj(*mapping);

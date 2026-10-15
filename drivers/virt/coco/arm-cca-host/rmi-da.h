@@ -134,12 +134,19 @@ enum dev_comm_type {
 	VDEV_COMMUNICATE = 0x2,
 };
 
+struct cca_vdev_dpt_region {
+	struct list_head node;
+	phys_addr_t base;
+};
+
 struct cca_host_tdi {
 	struct kvm *kvm;
 	struct realm *realm;
 	void *rmm_vdev;
 	/* Protected by the PCI TSM PF0 lock. */
 	enum rmi_vdev_state state;
+	/* DPT L1 regions created for this TDI's mappings, PF0 lock. */
+	struct list_head dpt_regions;
 	/* protected by cca_host_pdev_dsc.object_lock */
 	struct cache_object *interface_report;
 	struct cache_object *measurements;
