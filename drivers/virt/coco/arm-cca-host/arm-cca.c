@@ -281,8 +281,39 @@ static int cca_pdev_create_ncoh_sys_stream(struct pci_dev *pdev)
 	return ret;
 }
 
+/*
+ * Device memory must be tracked at FINE granularity before the RMM can
+ * delegate it, which the boot-time setup only does for system memory.
+ */
+static int cca_pdev_init_device_tracking(struct pci_dev *pdev)
+{
+	struct rmi_addr_range ranges[MAX_STREAM_ADDR_RANGE];
+	int naddr = pci_dev_addr_range(pdev, ranges);
+
+	for (int i = 0; i < naddr; i++) {
+		int ret;
+
+		ret = rmi_init_device_tracking(ranges[i].base,
+					       ranges[i].top - ranges[i].base);
+		if (ret) {
+			pci_err(pdev,
+				"failed to configure RMM tracking for %#llx-%#llx: %d\n",
+				ranges[i].base, ranges[i].top, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
 static int cca_pdev_create_streams(struct pci_dev *pdev, unsigned long stream_id)
 {
+	int ret;
+
+	ret = cca_pdev_init_device_tracking(pdev);
+	if (ret)
+		return ret;
+
 	switch (pci_pcie_type(pdev)) {
 	case PCI_EXP_TYPE_ENDPOINT:
 		return cca_pdev_create_ncoh_stream(pdev, stream_id);

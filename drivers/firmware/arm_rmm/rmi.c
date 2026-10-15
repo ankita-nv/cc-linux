@@ -15,6 +15,7 @@
 #include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
+#include <linux/mutex.h>
 #include <linux/numa.h>
 #include <linux/overflow.h>
 #include <linux/processor.h>
@@ -292,6 +293,8 @@ static bool rmi_sro_donate_tracking_failed;
 
 /* Boot SRO for global RMI allocations. */
 static struct rmi_sro_state *rmi_sro;
+/* Serialises use of rmi_sro after boot. */
+static DEFINE_MUTEX(rmi_sro_lock);
 
 int rmi_trackid_alloc(void)
 {
@@ -338,6 +341,9 @@ void rmi_region_track(struct rmi_sro_state *sro, phys_addr_t phys,
 
 	if (!trackid || !size)
 		return;
+
+	if (fid == SMC_RMI_GPT_L1_CREATE)
+		ipa = sro->regs.a1;
 
 	mark = FIELD_PREP(RMI_MT_TRACKID_MASK, trackid) |
 	       (ipa & RMI_MT_IPA_MASK) |
@@ -1540,8 +1546,11 @@ static int rmi_configure(struct rmi_sro_state *sro)
 #define RMM_GRANULE_TRACKING_SIZE	SZ_512M
 #endif
 
-/* Make sure the area is conventional memory tracked at FINE granularity. */
+#define RMI_TRACK_CATEGORY_ANY		ULONG_MAX
+
+/* Make sure the area has the expected category and is tracked at FINE. */
 static int rmi_init_memory_tracking(phys_addr_t start, phys_addr_t end,
+				    unsigned long expected_category,
 				    struct rmi_sro_state *sro)
 {
 	while (start < end) {
@@ -1559,9 +1568,10 @@ static int rmi_init_memory_tracking(phys_addr_t start, phys_addr_t end,
 			       &start, next);
 			return -ENODEV;
 		}
-		if (category != RMI_MEM_CATEGORY_CONVENTIONAL) {
-			pr_err("RMI: non-conventional tracking region at %pa: category=%lu\n",
-			       &start, category);
+		if (expected_category != RMI_TRACK_CATEGORY_ANY &&
+		    category != expected_category) {
+			pr_err("RMI: unexpected tracking category at %pa: category=%lu expected=%lu\n",
+			       &start, category, expected_category);
 			return -ENODEV;
 		}
 		if (state == RMI_TRACKING_FINE) {
@@ -1569,9 +1579,8 @@ static int rmi_init_memory_tracking(phys_addr_t start, phys_addr_t end,
 			continue;
 		}
 
-		ret = rmi_granule_tracking_set(start,
-				RMI_MEM_CATEGORY_CONVENTIONAL,
-				RMI_TRACKING_FINE, sro);
+		ret = rmi_granule_tracking_set(start, category,
+					       RMI_TRACKING_FINE, sro);
 		if (ret) {
 			pr_err("RMI: tracking set failed for %pa: state=%lu ret=0x%lx\n",
 			       &start, state, ret);
@@ -1589,7 +1598,8 @@ static int rmi_init_memory_tracking(phys_addr_t start, phys_addr_t end,
 			return -ENODEV;
 		}
 		if (next != region_top ||
-		    category != RMI_MEM_CATEGORY_CONVENTIONAL ||
+		    (expected_category != RMI_TRACK_CATEGORY_ANY &&
+		     category != expected_category) ||
 		    state != RMI_TRACKING_FINE) {
 			pr_err("RMI: tracking verification failed for %pa: category=%lu state=%lu next=0x%lx\n",
 			       &start, category, state, next);
@@ -1600,6 +1610,39 @@ static int rmi_init_memory_tracking(phys_addr_t start, phys_addr_t end,
 	}
 
 	return 0;
+}
+
+static void rmi_teardown_memory_tracking(phys_addr_t start, phys_addr_t end,
+					 struct rmi_sro_state *sro)
+{
+	while (start < end) {
+		unsigned long ret, category, state, next;
+
+		ret = rmi_granule_tracking_get(start, end, &category, &state,
+					       &next);
+		if (ret != RMI_SUCCESS) {
+			pr_warn("RMI: tracking teardown query failed for %pa: ret=0x%lx\n",
+				&start, ret);
+			return;
+		}
+		if (next <= start || next > end) {
+			pr_warn("RMI: invalid tracking teardown cursor for %pa: next=0x%lx\n",
+				&start, next);
+			return;
+		}
+		if (state == RMI_TRACKING_NONE ||
+		    state == RMI_TRACKING_RESERVED) {
+			start = next;
+			continue;
+		}
+
+		ret = rmi_granule_tracking_set(start, category,
+					       RMI_TRACKING_NONE, sro);
+		if (ret)
+			pr_warn("RMI: tracking clear failed for %pa: state=%lu ret=0x%lx\n",
+				&start, state, ret);
+		start += RMM_GRANULE_TRACKING_SIZE;
+	}
 }
 
 static unsigned long rmi_l0gpt_size(void)
@@ -2047,7 +2090,9 @@ static int rmi_init_metadata(struct rmi_sro_state *sro)
 
 			if (state == RMI_GPT_PAR_HOST_NOT_CREATED ||
 			    state == RMI_GPT_PAR_HOST_CREATED) {
-				ret = rmi_init_memory_tracking(start, state_top, sro);
+				ret = rmi_init_memory_tracking(start, state_top,
+						RMI_MEM_CATEGORY_CONVENTIONAL,
+						sro);
 				if (ret)
 					return ret;
 			}
@@ -2061,33 +2106,89 @@ static int rmi_init_metadata(struct rmi_sro_state *sro)
 	return 0;
 }
 
+static int rmi_init_device_gpt(struct rmi_sro_state *sro,
+			       phys_addr_t start, phys_addr_t end)
+{
+	unsigned long l0gpt_sz = rmi_l0gpt_size();
+	unsigned long l1_pages = PFN_UP(rmi_l1gpt_size());
+
+	while (start < end) {
+		unsigned long state;
+		int ret;
+
+		ret = rmi_query_gpt_par(start, l0gpt_sz, &state);
+		if (ret)
+			return ret;
+
+		switch (state) {
+		case RMI_GPT_PAR_RESERVED:
+		case RMI_GPT_PAR_PLAT:
+		case RMI_GPT_PAR_HOST_CREATED:
+			start += l0gpt_sz;
+			continue;
+		case RMI_GPT_PAR_HOST_NOT_CREATED:
+			break;
+		default:
+			return -EPROTO;
+		}
+
+		rmi_sro_topup_node(sro, MAX_ORDER_NR_PAGES, 2 * l1_pages,
+				   NUMA_NO_NODE);
+
+		ret = rmi_create_self_describing_gpt(sro);
+		if (ret)
+			return ret;
+
+		ret = rmi_query_gpt_par(start, l0gpt_sz, &state);
+		if (ret)
+			return ret;
+		if (state == RMI_GPT_PAR_HOST_NOT_CREATED) {
+			ret = rmi_create_gpt_l1(start, l0gpt_sz, l1_pages, sro);
+			if (ret)
+				return ret;
+		} else if (state != RMI_GPT_PAR_HOST_CREATED) {
+			return -EPROTO;
+		}
+		start += l0gpt_sz;
+	}
+
+	return 0;
+}
+
+int rmi_init_device_tracking(phys_addr_t phys, unsigned long size)
+{
+	phys_addr_t start = ALIGN_DOWN(phys, RMM_GRANULE_TRACKING_SIZE);
+	phys_addr_t end = ALIGN(phys + size, RMM_GRANULE_TRACKING_SIZE);
+	int ret;
+
+	mutex_lock(&rmi_sro_lock);
+	ret = rmi_init_memory_tracking(start, end, RMI_TRACK_CATEGORY_ANY,
+				       rmi_sro);
+	rmi_sro_free(rmi_sro);
+	mutex_unlock(&rmi_sro_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rmi_init_device_tracking);
+
+int rmi_init_device_gpt_range(phys_addr_t phys, unsigned long size)
+{
+	unsigned long l0gpt_sz = rmi_l0gpt_size();
+	phys_addr_t start = ALIGN_DOWN(phys, l0gpt_sz);
+	phys_addr_t end = ALIGN(phys + size, l0gpt_sz);
+	int ret;
+
+	mutex_lock(&rmi_sro_lock);
+	ret = rmi_init_device_gpt(rmi_sro, start, end);
+	rmi_sro_free(rmi_sro);
+	mutex_unlock(&rmi_sro_lock);
+
+	return ret;
+}
+
 bool is_rmi_available(void)
 {
 	return arm64_rmi_is_available;
-}
-
-static void rmi_destroy_gpt_range(struct rmi_sro_state *sro,
-				  phys_addr_t start, phys_addr_t end)
-{
-	unsigned long l0gpt_sz = rmi_l0gpt_size();
-
-	while (start < end) {
-		phys_addr_t state_top;
-		unsigned long state;
-
-		if (rmi_query_gpt_info(start, end, &state_top, &state))
-			return;
-
-		if (state != RMI_GPT_PAR_HOST_CREATED) {
-			start = state_top;
-			continue;
-		}
-
-		while (start < state_top) {
-			rmi_gpt_l1_destroy(start, sro);
-			start += l0gpt_sz;
-		}
-	}
 }
 
 /*
@@ -2097,31 +2198,47 @@ static void rmi_destroy_gpt_range(struct rmi_sro_state *sro,
  */
 static void rmi_destroy_metadata(struct rmi_sro_state *sro)
 {
+	unsigned long slot = RMI_SMC_SLOT_IDX(SMC_RMI_GPT_L1_CREATE);
 	unsigned long l0gpt_sz = rmi_l0gpt_size();
-	struct memblock_region *r;
 
 	for (unsigned int pass = 0; pass < 2; pass++) {
-		phys_addr_t last_end = 0;
+		for (;;) {
+			MA_STATE(mas, &rmi_mt, 0, 0);
+			phys_addr_t anchor = 0;
+			bool found = false;
+			void *entry;
 
-		for_each_mem_region(r) {
-			phys_addr_t start, end;
+			rcu_read_lock();
+			mas_for_each(&mas, entry, ULONG_MAX) {
+				unsigned long mark = xa_to_value(entry);
+				bool self_desc;
 
-			if (memblock_is_nomap(r))
-				continue;
+				if (FIELD_GET(RMI_MT_TRACKID_MASK, mark) !=
+				    RMI_TRACKID_GLOBAL)
+					continue;
+				if (FIELD_GET(RMI_MT_SLOT_MASK, mark) != slot)
+					continue;
 
-			start = ALIGN_DOWN(
-				PFN_PHYS(memblock_region_memory_base_pfn(r)), l0gpt_sz);
-			end = ALIGN(PFN_PHYS(memblock_region_memory_end_pfn(r)),
-				    l0gpt_sz);
+				anchor = mark & RMI_MT_IPA_MASK;
+				self_desc = (ALIGN_DOWN(mas.index, l0gpt_sz) &
+					     RMI_MT_IPA_MASK) == anchor;
+				if ((pass == 0) == self_desc)
+					continue;
 
-			/* Skip L0 blocks handled by an earlier memory region. */
-			if (start < last_end)
-				start = last_end;
-			if (start >= end)
-				continue;
-			last_end = end;
+				found = true;
+				break;
+			}
+			rcu_read_unlock();
 
-			rmi_destroy_gpt_range(sro, start, end);
+			if (!found)
+				break;
+
+			if (RMI_RETURN_STATUS(rmi_gpt_l1_destroy(anchor, sro)) !=
+			    RMI_SUCCESS) {
+				pr_warn("RMI: GPT L1 destroy failed for %pa\n",
+					&anchor);
+				break;
+			}
 		}
 	}
 }
@@ -2163,6 +2280,19 @@ static void rmi_destroy_dpt(struct rmi_sro_state *sro)
 		pr_warn("RMI: DPT Level 0 destroy failed\n");
 }
 
+static void rmi_destroy_tracking(struct rmi_sro_state *sro)
+{
+	unsigned int s2sz = FIELD_GET(RMI_FEATURE_REGISTER_0_S2SZ,
+				      rmi_feat_reg(0));
+	phys_addr_t pasz;
+
+	if (!s2sz || s2sz >= BITS_PER_LONG)
+		return;
+
+	pasz = 1UL << s2sz;
+	rmi_teardown_memory_tracking(0, pasz, sro);
+}
+
 /*
  * On the way into a kexec, fold away the L1 GPTs the RMM can release. This runs
  * in the reboot notifier chain (process context, before machine_shutdown()),
@@ -2179,12 +2309,16 @@ static int rmi_reboot_notify(struct notifier_block *nb, unsigned long action,
 		u64 remaining_bytes;
 		long ret;
 
+		mutex_lock(&rmi_sro_lock);
 		rmi_destroy_dpt(rmi_sro);
 		rmi_sro_free(rmi_sro);
 		rmi_destroy_metadata(rmi_sro);
 		rmi_sro_free(rmi_sro);
+		rmi_destroy_tracking(rmi_sro);
+		rmi_sro_free(rmi_sro);
 		ret = rmi_rmm_deactivate(rmi_sro);
 		remaining_bytes = rmi_region_owned_bytes(rmi_sro);
+		mutex_unlock(&rmi_sro_lock);
 
 		if (ret)
 			pr_err("RMI: RMM deactivate failed: 0x%lx\n", ret);
@@ -2277,6 +2411,8 @@ out_deactivate:
 	rmi_destroy_dpt(rmi_sro);
 	rmi_sro_free(rmi_sro);
 	rmi_destroy_metadata(rmi_sro);
+	rmi_sro_free(rmi_sro);
+	rmi_destroy_tracking(rmi_sro);
 	rmi_sro_free(rmi_sro);
 	deactivate_ret = rmi_rmm_deactivate(rmi_sro);
 	remaining_bytes = rmi_region_owned_bytes(rmi_sro);

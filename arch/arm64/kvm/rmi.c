@@ -3172,6 +3172,10 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 	struct realm *realm = &kvm->arch.realm;
 	struct kvm_s2_mmu *mmu = &kvm->arch.mmu;
 
+	ret = rmi_init_device_gpt_range(start_pa, end_ipa - start_ipa);
+	if (ret)
+		return ret;
+
 	sro = kzalloc_obj(*sro, GFP_KERNEL_ACCOUNT);
 	if (!sro)
 		return -ENOMEM;

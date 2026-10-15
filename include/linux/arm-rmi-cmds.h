@@ -84,6 +84,9 @@ long rmi_delegate_range(phys_addr_t phys, unsigned long size,
 long rmi_undelegate_range(phys_addr_t phys, unsigned long size,
 			  unsigned long *undelegated_size);
 
+int rmi_init_device_tracking(phys_addr_t phys, unsigned long size);
+int rmi_init_device_gpt_range(phys_addr_t phys, unsigned long size);
+
 int rmi_sro_topup_node(struct rmi_sro_state *sro, unsigned long capacity,
 		       unsigned long min, int nid);
 
