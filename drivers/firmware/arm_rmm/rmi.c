@@ -2227,60 +2227,108 @@ int rmi_init_device_gpt_range(phys_addr_t phys, unsigned long size)
 	return ret;
 }
 
-static int rmi_direct_call(struct arm_smccc_1_2_regs *regs,
+/*
+ * DEN0137 v2.0-bet3 allows VDEV and VSMMU object creation and destruction
+ * to initiate a Stateful RMI Operation, so drive them through the SRO engine.
+ */
+static int rmi_sro_command(struct arm_smccc_1_2_regs regs,
 			   unsigned long *rmi_ret)
 {
-	struct arm_smccc_1_2_regs res;
+	struct rmi_sro_state *sro __free(kfree) = kzalloc_obj(*sro);
+	long ret;
 
-	rmi_smccc_invoke(regs, &res);
-	*rmi_ret = res.a0;
+	if (!sro)
+		return -ENOMEM;
+
+	sro->regs = regs;
+	ret = rmi_sro_execute(sro, GFP_KERNEL, NULL);
+	rmi_sro_free(sro);
+	if (ret < 0)
+		return ret;
+
+	*rmi_ret = ret;
 	return 0;
 }
+
+int rmi_vdev_create(unsigned long rd_phys, unsigned long pdev_phys,
+		    unsigned long vdev_phys, unsigned long params_phys,
+		    unsigned long *rmi_ret)
+{
+	return rmi_sro_command((struct arm_smccc_1_2_regs) {
+			SMC_RMI_VDEV_CREATE, rd_phys, pdev_phys, vdev_phys,
+			params_phys
+		}, rmi_ret);
+}
+EXPORT_SYMBOL_GPL(rmi_vdev_create);
+
+int rmi_vdev_destroy(unsigned long rd_phys, unsigned long pdev_phys,
+		     unsigned long vdev_phys, unsigned long *rmi_ret)
+{
+	return rmi_sro_command((struct arm_smccc_1_2_regs) {
+			SMC_RMI_VDEV_DESTROY, rd_phys, pdev_phys, vdev_phys
+		}, rmi_ret);
+}
+EXPORT_SYMBOL_GPL(rmi_vdev_destroy);
 
 int rmi_vsmmu_create(unsigned long rd_phys, unsigned long vsmmu_phys,
 		     unsigned long params_phys, unsigned long *rmi_ret)
 {
-	struct arm_smccc_1_2_regs regs = {
-		SMC_RMI_VSMMU_CREATE, rd_phys, vsmmu_phys, params_phys
-	};
-
-	return rmi_direct_call(&regs, rmi_ret);
+	return rmi_sro_command((struct arm_smccc_1_2_regs) {
+			SMC_RMI_VSMMU_CREATE, rd_phys, vsmmu_phys, params_phys
+		}, rmi_ret);
 }
 EXPORT_SYMBOL_GPL(rmi_vsmmu_create);
 
 int rmi_vsmmu_destroy(unsigned long rd_phys, unsigned long vsmmu_phys,
 		      unsigned long *rmi_ret)
 {
-	struct arm_smccc_1_2_regs regs = {
-		SMC_RMI_VSMMU_DESTROY, rd_phys, vsmmu_phys
-	};
-
-	return rmi_direct_call(&regs, rmi_ret);
+	return rmi_sro_command((struct arm_smccc_1_2_regs) {
+			SMC_RMI_VSMMU_DESTROY, rd_phys, vsmmu_phys
+		}, rmi_ret);
 }
 EXPORT_SYMBOL_GPL(rmi_vsmmu_destroy);
 
-int rmi_vsmmu_map(unsigned long rd_phys, unsigned long vsmmu_phys,
-		  unsigned long ipa, unsigned long level,
-		  unsigned long *rmi_ret)
+int rmi_rtt_arch_dev_map(unsigned long rd_phys, unsigned long dev_phys,
+			 unsigned long base, unsigned long top,
+			 unsigned long *out_top, unsigned long *rmi_ret)
 {
 	struct arm_smccc_1_2_regs regs = {
-		SMC_RMI_VSMMU_MAP, rd_phys, vsmmu_phys, ipa, level
+		SMC_RMI_RTT_ARCH_DEV_MAP, rd_phys, dev_phys, base, top
 	};
+	long ret;
 
-	return rmi_direct_call(&regs, rmi_ret);
+	ret = rmi_sro_execute_no_xfer(&regs);
+	if (ret < 0)
+		return ret;
+
+	*rmi_ret = ret;
+	if (RMI_RETURN_STATUS(ret) == RMI_SUCCESS)
+		*out_top = regs.a1;
+
+	return 0;
 }
-EXPORT_SYMBOL_GPL(rmi_vsmmu_map);
+EXPORT_SYMBOL_GPL(rmi_rtt_arch_dev_map);
 
-int rmi_vsmmu_unmap(unsigned long rd_phys, unsigned long ipa,
-		    unsigned long vsmmu_phys, unsigned long *rmi_ret)
+int rmi_rtt_arch_dev_unmap(unsigned long rd_phys, unsigned long dev_phys,
+			   unsigned long base, unsigned long top,
+			   unsigned long *out_top, unsigned long *rmi_ret)
 {
 	struct arm_smccc_1_2_regs regs = {
-		SMC_RMI_VSMMU_UNMAP, rd_phys, ipa, vsmmu_phys
+		SMC_RMI_RTT_ARCH_DEV_UNMAP, rd_phys, dev_phys, base, top
 	};
+	long ret;
 
-	return rmi_direct_call(&regs, rmi_ret);
+	ret = rmi_sro_execute_no_xfer(&regs);
+	if (ret < 0)
+		return ret;
+
+	*rmi_ret = ret;
+	if (RMI_RETURN_STATUS(ret) == RMI_SUCCESS)
+		*out_top = regs.a1;
+
+	return 0;
 }
-EXPORT_SYMBOL_GPL(rmi_vsmmu_unmap);
+EXPORT_SYMBOL_GPL(rmi_rtt_arch_dev_unmap);
 
 bool is_rmi_available(void)
 {

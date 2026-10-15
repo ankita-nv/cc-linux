@@ -1111,6 +1111,21 @@ static void init_vdev_params_mmio_range(struct pci_dev *pdev,
 	params->num_addr_range = index;
 }
 
+static int cca_rmi_vdev_destroy(phys_addr_t rd_phys,
+				phys_addr_t rmm_pdev_phys,
+				phys_addr_t rmm_vdev_phys)
+{
+	unsigned long rmi_ret;
+	int ret;
+
+	ret = rmi_vdev_destroy(rd_phys, rmm_pdev_phys, rmm_vdev_phys,
+			       &rmi_ret);
+	if (ret)
+		return ret;
+
+	return rmi_ret ? -EIO : 0;
+}
+
 static int cca_vdev_unlock_for_destroy(struct cca_host_tdi *host_tdi,
 		struct pci_dev *pdev, phys_addr_t rd_phys,
 		phys_addr_t rmm_pdev_phys, phys_addr_t rmm_vdev_phys)
@@ -1154,6 +1169,7 @@ void *cca_vdev_create(struct cca_host_tdi *host_tdi, struct realm *realm,
 	bool should_free = true;
 	bool rmm_vdev_created = false;
 	bool rmm_vdev_destroyed = false;
+	unsigned long rmi_ret;
 	void *rmm_vdev;
 	int ret;
 
@@ -1207,9 +1223,11 @@ void *cca_vdev_create(struct cca_host_tdi *host_tdi, struct realm *realm,
 	init_vdev_params_mmio_range(pdev, params);
 
 	rmm_pdev_phys = virt_to_phys(pdev_dsc->rmm_pdev);
-	if (rmi_vdev_create(rd_phys, rmm_pdev_phys,
-			    rmm_vdev_phys, virt_to_phys(params))) {
-		ret = -ENXIO;
+	ret = rmi_vdev_create(rd_phys, rmm_pdev_phys, rmm_vdev_phys,
+			      virt_to_phys(params), &rmi_ret);
+	if (ret || rmi_ret) {
+		if (!ret)
+			ret = -ENXIO;
 		goto err_vdev_create;
 	}
 	rmm_vdev_created = true;
@@ -1235,7 +1253,7 @@ void *cca_vdev_create(struct cca_host_tdi *host_tdi, struct realm *realm,
 err_vdev_comm:
 	if (!cca_vdev_unlock_for_destroy(host_tdi, pdev, rd_phys,
 					 rmm_pdev_phys, rmm_vdev_phys) &&
-	    !rmi_vdev_destroy(rd_phys, rmm_pdev_phys, rmm_vdev_phys)) {
+	    !cca_rmi_vdev_destroy(rd_phys, rmm_pdev_phys, rmm_vdev_phys)) {
 		rmm_vdev_destroyed = true;
 	} else {
 		pci_err(pdev, "failed to destroy vdev after create failure\n");
@@ -1607,7 +1625,7 @@ void cca_vdev_destroy(struct cca_host_tdi *host_tdi, struct realm *realm,
 	/* A successful unlock proves that no device mappings remain. */
 	cca_vdev_drain_dpt_regions(host_tdi, true);
 
-	if (rmi_vdev_destroy(rd_phys, rmm_pdev_phys, rmm_vdev_phys)) {
+	if (cca_rmi_vdev_destroy(rd_phys, rmm_pdev_phys, rmm_vdev_phys)) {
 		pci_err(pdev, "failed to destroy vdev\n");
 		return;
 	}

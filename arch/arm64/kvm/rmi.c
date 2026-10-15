@@ -3608,16 +3608,20 @@ static int realm_vsmmu_unmap_pages(struct realm_vsmmu *vsmmu, size_t npages)
 {
 	phys_addr_t rd_phys = virt_to_phys(vsmmu->kvm->arch.realm.rd);
 	phys_addr_t vsmmu_phys = virt_to_phys(vsmmu->vsmmu_page);
-	unsigned long rmi_ret;
+	unsigned long rmi_ret = 0;
 	int first_err = 0;
 	size_t i;
 
 	for (i = 0; i < npages; i++) {
 		unsigned long ipa = vsmmu->params->reg_base + i * PAGE_SIZE;
+		unsigned long out_top = ipa;
 		int ret;
 
-		ret = rmi_vsmmu_unmap(rd_phys, ipa, vsmmu_phys, &rmi_ret);
-		if (WARN_ONCE(ret || RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS,
+		ret = rmi_rtt_arch_dev_unmap(rd_phys, vsmmu_phys, ipa,
+					     ipa + PAGE_SIZE, &out_top,
+					     &rmi_ret);
+		if (WARN_ONCE(ret || RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS ||
+			      out_top != ipa + PAGE_SIZE,
 			      "RMI: vSMMU unmap failed: ret=%d rmi=%lx\n", ret,
 			      rmi_ret)) {
 			if (!first_err)
@@ -3726,6 +3730,7 @@ int kvm_realm_register_vsmmu(struct kvm *kvm, u32 vsmmu_id,
 	npages = mmio_size / PAGE_SIZE;
 	for (i = 0; i < npages; i++) {
 		unsigned long ipa = params->reg_base + i * PAGE_SIZE;
+		unsigned long out_top = ipa;
 		struct rtt_entry rtte;
 
 		ret = rmi_rtt_read_entry(rd_phys, ipa, RMM_RTT_MAX_LEVEL,
@@ -3742,9 +3747,11 @@ int kvm_realm_register_vsmmu(struct kvm *kvm, u32 vsmmu_id,
 				goto out_unmap_vsmmu;
 		}
 
-		ret = rmi_vsmmu_map(rd_phys, vsmmu_phys, ipa, RMM_RTT_MAX_LEVEL,
-				    &rmi_ret);
-		if (ret || RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS) {
+		ret = rmi_rtt_arch_dev_map(rd_phys, vsmmu_phys, ipa,
+					   ipa + PAGE_SIZE, &out_top,
+					   &rmi_ret);
+		if (ret || RMI_RETURN_STATUS(rmi_ret) != RMI_SUCCESS ||
+		    out_top != ipa + PAGE_SIZE) {
 			ret = ret ?: -EIO;
 			goto out_unmap_vsmmu;
 		}

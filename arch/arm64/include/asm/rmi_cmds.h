@@ -787,28 +787,6 @@ static inline unsigned long rmi_vdev_abort(unsigned long rd_phys,
 	return res.a0;
 }
 
-static inline unsigned long rmi_vdev_create(unsigned long rd,
-		unsigned long pdev_phys, unsigned long vdev_phys,
-		unsigned long vdev_params_phys)
-{
-	struct arm_smccc_res res;
-
-	arm_smccc_1_1_invoke(SMC_RMI_VDEV_CREATE, rd, pdev_phys,
-			     vdev_phys, vdev_params_phys, &res);
-
-	return res.a0;
-}
-
-static inline unsigned long rmi_vdev_destroy(unsigned long rd,
-		unsigned long pdev_phys, unsigned long vdev_phys)
-{
-	struct arm_smccc_res res;
-
-	arm_smccc_1_1_invoke(SMC_RMI_VDEV_DESTROY, rd, pdev_phys, vdev_phys, &res);
-
-	return res.a0;
-}
-
 static inline unsigned long rmi_pdev_stream_key_refresh(unsigned long pdev1_phys,
 		unsigned long pdev2_phys, unsigned long stream_handle)
 {
