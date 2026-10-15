@@ -344,6 +344,8 @@ struct pci_tsm_context {
 	struct pci_dev *dsm_dev;
 	struct tsm_dev *tsm_dev;
 	struct list_head bound_node;
+	/* TSM state released for a reset, protected by pf0->lock */
+	bool detached;
 	void *data;
 };
 
@@ -516,7 +518,10 @@ static int __pci_tsm_disconnect(struct pci_dev *pdev)
 		if (tsm_pf0->context_users)
 			return -EBUSY;
 	pci_tsm_walk_fns_reverse(pdev, remove_fn, NULL);
-	ops->disconnect(pdev);
+	/* A failed post-reset reconnect already tore the link down. */
+	if (!tsm_pf0->reset_link)
+		ops->disconnect(pdev);
+	tsm_pf0->reset_link = false;
 	return 0;
 }
 
@@ -558,6 +563,67 @@ static bool pci_tsm_reset_is_bound(struct pci_dev *pdev)
 	return false;
 }
 
+/* A PF0 reset affects every bound context, otherwise only @pdev's own. */
+static bool pci_tsm_reset_affects(struct pci_dev *pdev,
+				  struct pci_tsm_context *context)
+{
+	return is_pci_tsm_pf0(pdev) || context->pdev == pdev;
+}
+
+/* Rebuild the detached contexts affected by a reset of @pdev. */
+static void pci_tsm_reset_attach(struct pci_dev *pdev,
+				 struct pci_tsm_pf0 *pf0,
+				 const struct pci_tsm_ops *ops)
+{
+	struct pci_tsm_context *context;
+	int rc;
+
+	lockdep_assert_held(&pf0->lock);
+	list_for_each_entry(context, &pf0->bound_contexts, bound_node) {
+		if (!context->detached || !pci_tsm_reset_affects(pdev, context))
+			continue;
+		rc = ops->context_attach(context);
+		if (rc) {
+			pci_warn(context->pdev,
+				 "tsm-reset: rebind after reset failed (%d)\n",
+				 rc);
+			continue;
+		}
+		context->detached = false;
+	}
+}
+
+/*
+ * Release the TSM state of every bound context affected by a reset of @pdev.
+ * On failure, rebuild the contexts released so far and refuse the reset.
+ */
+static int pci_tsm_reset_detach(struct pci_dev *pdev,
+				struct pci_tsm_pf0 *pf0,
+				const struct pci_tsm_ops *ops)
+{
+	struct pci_tsm_context *context;
+	int rc = 0;
+
+	if (!ops->context_detach || !ops->context_attach)
+		return -EBUSY;
+
+	guard(mutex)(&pf0->lock);
+	list_for_each_entry(context, &pf0->bound_contexts, bound_node) {
+		if (context->detached || !pci_tsm_reset_affects(pdev, context))
+			continue;
+		rc = ops->context_detach(context);
+		if (rc)
+			break;
+		context->detached = true;
+	}
+	if (!rc)
+		return 0;
+
+	pci_info(pdev, "tsm-reset: unbind failed (%d), blocking reset\n", rc);
+	pci_tsm_reset_attach(pdev, pf0, ops);
+	return -EBUSY;
+}
+
 /**
  * pci_tsm_reset_prepare() - drop the TSM session before a device reset
  * @pdev: device about to be reset
@@ -567,8 +633,15 @@ static bool pci_tsm_reset_is_bound(struct pci_dev *pdev)
  * prepare/done pair acts. Every successful call must be paired with
  * pci_tsm_reset_done().
  *
+ * When a TVM has the device bound, the TSM state of the affected bindings is
+ * released instead (@context_detach) and rebuilt after the reset
+ * (@context_attach). The bindings themselves, and the pci_tsm contexts they
+ * reference, persist across the reset; for a PF0 reset only the link is
+ * recycled.
+ *
  * Context: Called from the reset methods with the device locked.
- * Return: 0 to proceed, -EBUSY if a TVM is using the device, else -errno.
+ * Return: 0 to proceed, -EBUSY if the TSM state cannot be released, else
+ * -errno.
  */
 int pci_tsm_reset_prepare(struct pci_dev *pdev)
 {
@@ -596,9 +669,23 @@ int pci_tsm_reset_prepare(struct pci_dev *pdev)
 		return 0;
 
 	if (pci_tsm_reset_is_bound(pdev)) {
-		pci_info(pdev, "tsm-reset: bound to TVM (vdevice present), blocking reset\n");
-		rc = -EBUSY;
-		goto err;
+		struct pci_tsm_pf0 *pf0 = to_pci_tsm_pf0(pdev->tsm);
+		const struct pci_tsm_ops *ops = to_pci_tsm_ops(pdev->tsm);
+
+		pci_dbg(pdev, "tsm-reset: unbinding TVM state before reset\n");
+		rc = pci_tsm_reset_detach(pdev, pf0, ops);
+		if (rc)
+			goto err;
+		if (!is_pci_tsm_pf0(pdev))
+			return 0;
+
+		/* Keep pdev->tsm, which the bound contexts reference. */
+		scoped_guard(mutex, &pf0->lock) {
+			if (!pf0->reset_link)
+				ops->disconnect(pdev);
+			pf0->reset_link = true;
+		}
+		return 0;
 	}
 
 	/* The TSM session lives on PF0; resetting another function keeps it */
@@ -626,6 +713,62 @@ EXPORT_SYMBOL_GPL(pci_tsm_reset_prepare);
 
 #define PCI_TSM_RECONNECT_PACING_MS 500
 
+/*
+ * Rebuild the bindings released by pci_tsm_reset_prepare(): reconnect the
+ * link if it was recycled, then reattach the detached contexts. The contexts
+ * keep pdev->tsm alive, so it remains valid between attempts.
+ */
+static void pci_tsm_reset_rebind(struct pci_dev *pdev)
+{
+	const struct pci_tsm_ops *ops;
+	struct pci_tsm_pf0 *pf0;
+	unsigned long deadline;
+	bool reconnect;
+	int rc;
+
+	scoped_guard(rwsem_write, &pci_tsm_rwsem) {
+		if (!pdev->tsm || !is_link_tsm(pdev->tsm->tsm_dev))
+			return;
+		pf0 = to_pci_tsm_pf0(pdev->tsm);
+		if (!pf0)
+			return;
+		scoped_guard(mutex, &pf0->lock)
+			reconnect = is_pci_tsm_pf0(pdev) && pf0->reset_link;
+	}
+
+	deadline = jiffies + msecs_to_jiffies(reset_timeout_ms);
+	while (reconnect) {
+		scoped_guard(rwsem_write, &pci_tsm_rwsem) {
+			if (!pdev->tsm)
+				return;
+			ops = to_pci_tsm_ops(pdev->tsm);
+			guard(mutex)(&pf0->lock);
+			rc = ops->connect(pdev);
+			if (!rc)
+				pf0->reset_link = false;
+		}
+		if (!rc)
+			break;
+		if (time_after(jiffies, deadline)) {
+			pci_warn(pdev, "tsm-reset: reconnect after reset failed (%d)\n",
+				 rc);
+			return;
+		}
+		msleep(PCI_TSM_RECONNECT_PACING_MS);
+	}
+
+	guard(rwsem_write)(&pci_tsm_rwsem);
+	if (!pdev->tsm || !is_link_tsm(pdev->tsm->tsm_dev))
+		return;
+	pf0 = to_pci_tsm_pf0(pdev->tsm);
+	ops = to_pci_tsm_ops(pdev->tsm);
+	if (!pf0 || !ops->context_attach)
+		return;
+	guard(mutex)(&pf0->lock);
+	if (!pf0->reset_link)
+		pci_tsm_reset_attach(pdev, pf0, ops);
+}
+
 /**
  * pci_tsm_reset_done() - rebuild the TSM session after a device reset
  * @pdev: device that was reset
@@ -645,8 +788,11 @@ void pci_tsm_reset_done(struct pci_dev *pdev)
 		pdev->tsm_reset_dev = NULL;
 	}
 
-	if (!tsm_dev)
-		return;			/* was not connected, nothing to rebuild */
+	if (!tsm_dev) {
+		/* not disconnected; rebuild any bindings released for the reset */
+		pci_tsm_reset_rebind(pdev);
+		return;
+	}
 
 	/* device settles after the reset at its own pace; retry connect until it takes */
 	deadline = jiffies + msecs_to_jiffies(reset_timeout_ms);

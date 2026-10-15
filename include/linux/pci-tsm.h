@@ -37,12 +37,19 @@ struct pci_tsm_ops {
 	 * @disconnect: teardown the secure link
 	 * @vsmmu_event: route a physical IOMMU event to the TVM VSMMU of a
 	 *		 bound context
+	 * @context_detach: before a reset of the bound function (or of its
+	 *		    DSM), release the TSM state of a bound context while
+	 *		    keeping the binding itself
+	 * @context_attach: after the reset, rebuild the TSM state released by
+	 *		    @context_detach, leaving the TDI unlocked
 	 * Context: @probe, @remove, @connect, and @disconnect run under
 	 * pci_tsm_rwsem held for write to sync with TSM unregistration and
 	 * mutual exclusion of @connect and @disconnect. @connect and
 	 * @disconnect additionally run under the DSM lock (struct
 	 * pci_tsm_pf0::lock) as well as @probe and @remove of the subfunctions.
 	 * @vsmmu_event runs under pci_tsm_rwsem held for read and the DSM lock.
+	 * @context_detach and @context_attach run under pci_tsm_rwsem held for
+	 * write and the DSM lock.
 	 * The core holds a runtime PM reference on the DSM for the connected
 	 * lifetime so the device cannot runtime-suspend into a state that
 	 * would invalidate IDE / TDISP security context.
@@ -55,6 +62,8 @@ struct pci_tsm_ops {
 		void (*disconnect)(struct pci_dev *pdev);
 		int (*vsmmu_event)(struct pci_tsm_context *context,
 				   phys_addr_t psmmu);
+		int (*context_detach)(struct pci_tsm_context *context);
+		int (*context_attach)(struct pci_tsm_context *context);
 	);
 
 	/*
@@ -170,6 +179,8 @@ struct pci_tsm {
  *	being initialized and not yet in @bound_contexts; a nonzero count blocks
  *	link disconnect and is independent of TSM and vIOMMU provider lifetimes
  * @bound_contexts: bound per-function contexts, protected by @lock
+ * @reset_link: the link was disconnected for a reset while contexts were
+ *	bound and has not been reconnected yet, protected by @lock
  * @doe_mb: PCIe Data Object Exchange mailbox
  */
 struct pci_tsm_pf0 {
@@ -177,6 +188,7 @@ struct pci_tsm_pf0 {
 	struct mutex lock;
 	unsigned int context_users;
 	struct list_head bound_contexts;
+	bool reset_link;
 	struct pci_doe_mb *doe_mb;
 };
 
