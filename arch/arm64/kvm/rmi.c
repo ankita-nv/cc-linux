@@ -3447,7 +3447,7 @@ int realm_dev_mem_map(struct kvm *kvm, unsigned long pdev_phys,
 		}
 		mapping_added = false;
 
-		ret = rmi_sro_topup(sro, kvm_mmu_cache_min_pages(mmu),
+		ret = rmi_sro_topup(sro, SZ_2M >> PAGE_SHIFT,
 				    kvm_mmu_cache_min_pages(mmu));
 		if (ret) {
 			kfree(mapping);
