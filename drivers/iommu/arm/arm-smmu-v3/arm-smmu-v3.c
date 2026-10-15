@@ -5759,7 +5759,6 @@ static int arm_smmu_rmm_device_probe(struct arm_smmu_device *smmu)
 	struct irq_domain *domain;
 	unsigned long flags, irq_cfg;
 	bool gerr_mapping_created = false;
-	bool evtq_mapping_created = false;
 	int ret;
 
 	struct rmi_psmmu_info *psmmu_info __free(free_page) =
@@ -5796,20 +5795,9 @@ static int arm_smmu_rmm_device_probe(struct arm_smmu_device *smmu)
 
 		ret = arm_smmu_map_realm_irq(smmu, domain,
 					     psmmu_info->eventq_intr_num,
-					     &smmu->realm.evtq_irq,
-					     &evtq_mapping_created);
+					     &smmu->realm.evtq_irq, NULL);
 		if (ret)
 			goto err_release_gerr_mapping;
-
-		if ((flags & RMI_PSMMU_PRI) &&
-		    (smmu->features & ARM_SMMU_FEAT_PRI)) {
-			ret = arm_smmu_map_realm_irq(smmu, domain,
-						     psmmu_info->priq_intr_num,
-						     &smmu->realm.pri_irq,
-						     NULL);
-			if (ret)
-				goto err_release_evtq_mapping;
-		}
 		break;
 	case RMI_PSMMU_IRQCFG_IRQ_MSI:
 		smmu->features |= ARM_SMMU_FEAT_RME_MSI;
@@ -5822,9 +5810,6 @@ static int arm_smmu_rmm_device_probe(struct arm_smmu_device *smmu)
 	smmu->features |= ARM_SMMU_FEAT_RME_IRQ;
 	return 0;
 
-err_release_evtq_mapping:
-	arm_smmu_release_realm_irq_mapping(smmu, &smmu->realm.evtq_irq,
-					   evtq_mapping_created);
 err_release_gerr_mapping:
 	arm_smmu_release_realm_irq_mapping(smmu, &smmu->realm.gerr_irq,
 					   gerr_mapping_created);

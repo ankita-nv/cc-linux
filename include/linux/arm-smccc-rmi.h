@@ -590,7 +590,6 @@ enum rmi_pdev_state {
 #define RMI_PDEV_FLAGS_SPDM		BIT(0)
 #define RMI_PDEV_FLAGS_CATEGORY_MASK	GENMASK(2, 1)
 #define RMI_PDEV_FLAGS_CATEGORY_SHIFT	1
-#define RMI_PDEV_FLAGS_P2P		BIT(3)
 
 #define RMI_PDEV_FLAGS_CATEGORY_ROOT_PORT	0x0
 #define RMI_PDEV_FLAGS_CATEGORY_OFF_CHIP_EP	0x1
@@ -620,6 +619,12 @@ struct rmi_pdev_params {
 		u8 padding3[0x1000];
 	};
 };
+static_assert(offsetof(struct rmi_pdev_params, hb_base) == 0x08);
+static_assert(offsetof(struct rmi_pdev_params, pdev_id) == 0x10);
+static_assert(offsetof(struct rmi_pdev_params, rid_base) == 0x28);
+static_assert(offsetof(struct rmi_pdev_params, rid_top) == 0x30);
+static_assert(offsetof(struct rmi_pdev_params, hash_algo) == 0x38);
+static_assert(sizeof(struct rmi_pdev_params) == SZ_4K);
 
 #define RMI_DEV_COMM_EXIT_CACHE_REQ	BIT(0)
 #define RMI_DEV_COMM_EXIT_CACHE_RSP	BIT(1)
@@ -651,6 +656,9 @@ struct rmi_dev_comm_enter {
 	u64 resp_len;
 	u8 padding1[0xe0];
 };
+static_assert(offsetof(struct rmi_dev_comm_enter, req_addr) == 0x08);
+static_assert(offsetof(struct rmi_dev_comm_enter, resp_len) == 0x18);
+static_assert(sizeof(struct rmi_dev_comm_enter) == 0x100);
 
 struct rmi_dev_comm_exit {
 	u64 flags;
@@ -672,6 +680,10 @@ struct rmi_dev_comm_exit {
 	u64 rsp_timeout;
 	u8 padding2[0xb0];
 };
+static_assert(offsetof(struct rmi_dev_comm_exit, cache_object_id) == 0x28);
+static_assert(offsetof(struct rmi_dev_comm_exit, protocol) == 0x30);
+static_assert(offsetof(struct rmi_dev_comm_exit, rsp_timeout) == 0x48);
+static_assert(sizeof(struct rmi_dev_comm_exit) == 0x100);
 
 struct rmi_dev_comm_data {
 	union { /* 0x0 */
@@ -683,6 +695,8 @@ struct rmi_dev_comm_data {
 		u8 padding1[0x800];
 	};
 };
+static_assert(offsetof(struct rmi_dev_comm_data, exit) == 0x800);
+static_assert(sizeof(struct rmi_dev_comm_data) == SZ_4K);
 
 struct rmi_public_key_params {
 	union {
@@ -701,6 +715,10 @@ struct rmi_public_key_params {
 		u8 padding[0x1000];
 	};
 };
+static_assert(offsetof(struct rmi_public_key_params, metadata_addr) == 0x400);
+static_assert(offsetof(struct rmi_public_key_params, key_len) == 0x800);
+static_assert(offsetof(struct rmi_public_key_params, metadata_len) == 0x808);
+static_assert(sizeof(struct rmi_public_key_params) == SZ_4K);
 
 #define MAX_STREAM_ADDR_RANGE	16
 
@@ -738,6 +756,12 @@ struct rmi_pdev_stream_params {
 		u8 padding2[0xF00];
 	};
 };
+static_assert(offsetof(struct rmi_pdev_stream_params, stream_type) == 0x08);
+static_assert(offsetof(struct rmi_pdev_stream_params, pdev_1) == 0x10);
+static_assert(offsetof(struct rmi_pdev_stream_params, ide_sid) == 0x20);
+static_assert(offsetof(struct rmi_pdev_stream_params, num_addr_range) == 0x28);
+static_assert(offsetof(struct rmi_pdev_stream_params, addr_range) == 0x100);
+static_assert(sizeof(struct rmi_pdev_stream_params) == SZ_4K);
 
 #define RMI_PSMMU_IRQCFG_IRQ_DISABLED	0x0
 #define RMI_PSMMU_IRQCFG_IRQ_WIRED	0x1
@@ -770,6 +794,11 @@ struct rmi_psmmu_info {
 		u8 padding4[0x1000];
 	};
 };
+static_assert(offsetof(struct rmi_psmmu_info, gerror_intr_num) == 0x08);
+static_assert(offsetof(struct rmi_psmmu_info, eventq_intr_num) == 0x10);
+static_assert(offsetof(struct rmi_psmmu_info, priq_intr_num) == 0x18);
+static_assert(offsetof(struct rmi_psmmu_info, cmdq_sync_intr_num) == 0x20);
+static_assert(sizeof(struct rmi_psmmu_info) == SZ_4K);
 
 struct rmi_psmmu_params {
 	union {
@@ -785,6 +814,10 @@ struct rmi_psmmu_params {
 		u8 padding0[0x1000];
 	};
 };
+static_assert(offsetof(struct rmi_psmmu_params, gerr_addr) == 0x08);
+static_assert(offsetof(struct rmi_psmmu_params, eventq_addr) == 0x18);
+static_assert(offsetof(struct rmi_psmmu_params, priq_data) == 0x30);
+static_assert(sizeof(struct rmi_psmmu_params) == SZ_4K);
 
 enum rmi_vdev_state {
 	RMI_VDEV_NEW,
@@ -815,6 +848,13 @@ struct rmi_vdev_params {
 		u8 padding2[0x1000 - 0x200];
 	};
 };
+static_assert(offsetof(struct rmi_vdev_params, vdev_id) == 0x08);
+static_assert(offsetof(struct rmi_vdev_params, tdi_id) == 0x10);
+static_assert(offsetof(struct rmi_vdev_params, vsmmu_addr) == 0x20);
+static_assert(offsetof(struct rmi_vdev_params, vsid) == 0x28);
+static_assert(offsetof(struct rmi_vdev_params, num_addr_range) == 0x30);
+static_assert(offsetof(struct rmi_vdev_params, addr_range) == 0x200);
+static_assert(sizeof(struct rmi_vdev_params) == SZ_4K);
 
 #define RMI_VDEV_MEASURE_HASH	0x0
 #define RMI_VDEV_MEASURE_RAW	0x1
@@ -829,5 +869,7 @@ struct rmi_vdev_measurement_params {
 	};
 	u8 padding2[0xe00];
 };
+static_assert(offsetof(struct rmi_vdev_measurement_params, nonce) == 0x100);
+static_assert(sizeof(struct rmi_vdev_measurement_params) == SZ_4K);
 
 #endif /* __LINUX_ARM_SMCCC_RMI_H_ */

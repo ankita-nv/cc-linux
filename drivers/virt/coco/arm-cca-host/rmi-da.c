@@ -18,37 +18,27 @@
 
 #include "rmi-da.h"
 
-static int pci_ide_segment(struct pci_dev *pdev)
+/*
+ * RmiPdevParams.hb_base is the PCI segment's bus-0 ECAM base. The config
+ * window associated with a subordinate bus may begin at a non-zero bus, so
+ * account for that offset explicitly.
+ */
+static u64 cca_pdev_ecam_base(struct pci_dev *pdev)
 {
-	if (pdev->fm_enabled)
-		return pci_domain_nr(pdev->bus);
-	return 0;
-}
+	struct pci_bus *root = pdev->bus;
+	struct pci_config_window *cfg;
 
-static unsigned int pci_get_max_rid(struct pci_dev *pdev)
-{
-	int fn;
-	int max_rid;
-	int slot = PCI_SLOT(pdev->devfn);
+	while (root->parent)
+		root = root->parent;
 
-	for (fn = 0; fn < 8; fn++) {
-		struct pci_dev *fn_dev;
-
-		fn_dev = pci_get_slot(pdev->bus, PCI_DEVFN(slot, fn));
-		if (!fn_dev)
-			continue;
-
-		max_rid = pci_dev_id(fn_dev);
-		pci_dev_put(fn_dev);
-	}
-	return max_rid;
+	cfg = root->sysdata;
+	return cfg->res.start - ((u64)cfg->busr.start << cfg->bus_shift);
 }
 
 static int init_pdev_params(struct pci_dev *pdev, struct rmi_pdev_params *params)
 {
 	int rid;
 	unsigned long category;
-	struct pci_config_window *cfg = pdev->bus->sysdata;
 
 	/* check we are ECAM compliant */
 	if (!pdev->bus->ops->map_bus)
@@ -85,17 +75,20 @@ static int init_pdev_params(struct pci_dev *pdev, struct rmi_pdev_params *params
 	}
 
 	params->flags |= (category << RMI_PDEV_FLAGS_CATEGORY_SHIFT);
-	/* assign the ep device with RMM */
 	rid = pci_dev_id(pdev);
+	params->hb_base = cca_pdev_ecam_base(pdev);
 	params->pdev_id = rid;
-	params->hb_base = cfg->res.start;
-	params->routing_id = pci_ide_segment(pdev);
+	params->routing_id = pci_domain_nr(pdev->bus);
 	/* slot number for certificate chain default to zero */
 	params->id_index = 0;
 	params->hash_algo = RMI_HASH_SHA_256;
-	/* no multi function device here. */
-	params->rid_base = rid;
-	params->rid_top = pci_get_max_rid(pdev) + 1;
+	if (category == RMI_PDEV_FLAGS_CATEGORY_ROOT_PORT) {
+		params->rid_base = 0;
+		params->rid_top = 0;
+	} else {
+		params->rid_base = rid;
+		params->rid_top = rid + 1;
+	}
 	return 0;
 }
 
@@ -385,7 +378,9 @@ static int do_dev_communicate(enum dev_comm_type type,
 		if (type == PDEV_COMMUNICATE)
 			rmi_pdev_abort(virt_to_phys(pdev_dsc->rmm_pdev));
 		else
-			rmi_vdev_abort(virt_to_phys(host_tdi->rmm_vdev));
+			rmi_vdev_abort(virt_to_phys(host_tdi->realm->rd),
+				       virt_to_phys(pdev_dsc->rmm_pdev),
+				       virt_to_phys(host_tdi->rmm_vdev));
 
 		state = error_state;
 	} else {

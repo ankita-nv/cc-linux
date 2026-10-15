@@ -1003,8 +1003,10 @@ static int realm_create_rd(struct kvm *kvm)
 		goto out_undelegate_tables;
 
 	/* For now default enable DA */
-	if (rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_DA))
+	if (rmm_has_reg2_feature(RMI_FEATURE_REGISTER_2_DA)) {
 		params->flags0 |= RMI_REALM_PARAM_FLAG_DA;
+		params->max_num_vdevs = rmm_realm_max_vdevs();
+	}
 	params_phys = virt_to_phys(params);
 
 	rmi_ret = rmi_realm_create(rd_phys, params_phys, realm->sro);

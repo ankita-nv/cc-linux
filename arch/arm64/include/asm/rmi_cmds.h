@@ -10,6 +10,33 @@
 #include <linux/arm-smccc-rmi.h>
 #include <linux/processor.h>
 
+/* DEN0137 B4.6.25: PDEV_MAX_VDEVS is 2^order - 1. */
+static inline unsigned long rmm_pdev_max_vdevs(void)
+{
+	unsigned long order;
+
+	order = u64_get_bits(rmi_feat_reg(2),
+			     RMI_FEATURE_REGISTER_2_PDEV_MAX_VDEVS_ORDER);
+
+	return (1UL << order) - 1;
+}
+
+/*
+ * DEN0137 B4.6.25: REALM_MAX_VDEVS is 2^order. Order zero is reserved,
+ * rather than encoding one VDEV.
+ */
+static inline unsigned long rmm_realm_max_vdevs(void)
+{
+	unsigned long order;
+
+	order = u64_get_bits(rmi_feat_reg(2),
+			     RMI_FEATURE_REGISTER_2_REALM_MAX_VDEVS_ORDER);
+	if (!order)
+		return 0;
+
+	return 1UL << order;
+}
+
 struct rtt_entry {
 	unsigned long walk_level;
 	unsigned long desc;
@@ -664,11 +691,14 @@ static inline unsigned long rmi_vdev_get_state(unsigned long vdev_phys,
 	return res.a0;
 }
 
-static inline unsigned long rmi_vdev_abort(unsigned long vdev_phys)
+static inline unsigned long rmi_vdev_abort(unsigned long rd_phys,
+					   unsigned long pdev_phys,
+					   unsigned long vdev_phys)
 {
 	struct arm_smccc_res res;
 
-	arm_smccc_1_1_invoke(SMC_RMI_VDEV_ABORT, vdev_phys, &res);
+	arm_smccc_1_1_invoke(SMC_RMI_VDEV_ABORT, rd_phys, pdev_phys,
+			     vdev_phys, &res);
 
 	return res.a0;
 }
