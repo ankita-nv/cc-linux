@@ -1500,7 +1500,7 @@ int cca_vdev_device_unlock(struct cca_host_tdi *host_tdi,
 
 	if (host_tdi->state == RMI_VDEV_UNLOCKED ||
 	    host_tdi->state == RMI_VDEV_NEW)
-		return -EINVAL;
+		return -ENXIO;
 
 	rd_phys = virt_to_phys(host_tdi->realm->rd);
 	rmm_vdev_phys = virt_to_phys(host_tdi->rmm_vdev);
@@ -1745,7 +1745,7 @@ int cca_vdev_device_start(struct cca_host_tdi *host_tdi,
 	cca_vdev_assert_locked(pdev);
 
 	if (host_tdi->state != RMI_VDEV_LOCKED)
-		return -EINVAL;
+		return -ENXIO;
 
 	rmm_vdev_phys = virt_to_phys(host_tdi->rmm_vdev);
 	realm = &host_tdi->kvm->arch.realm;
@@ -1772,7 +1772,7 @@ int cca_vdev_device_lock(struct cca_host_tdi *host_tdi,
 	cca_vdev_assert_locked(pdev);
 
 	if (host_tdi->state != RMI_VDEV_UNLOCKED)
-		return -EINVAL;
+		return -ENXIO;
 
 	rmm_vdev_phys = virt_to_phys(host_tdi->rmm_vdev);
 	rd_phys = virt_to_phys(host_tdi->realm->rd);
