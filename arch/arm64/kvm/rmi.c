@@ -3952,14 +3952,19 @@ static int kvm_complete_vsmmu_command(struct kvm_vcpu *vcpu)
 		}
 
 		if (cmd.flags & RMI_VSMMU_CMD_FLAGS_IRQ) {
-			ret = kvm_realm_inject_vsmmu_msi(vsmmu, cmd.msi_addr,
+			int err;
+
+			/*
+			 * The Realm programs the MSI address. Drop an MSI that
+			 * cannot be delivered, as a stray SMMU write would be,
+			 * and keep draining the remaining commands.
+			 */
+			err = kvm_realm_inject_vsmmu_msi(vsmmu, cmd.msi_addr,
 							 cmd.msi_data);
-			if (ret < 0) {
-				vcpu_err(vcpu, "VSMMU MSI injection failed: %d\n",
-					 ret);
-				break;
-			}
-			ret = 0;
+			if (err < 0)
+				pr_warn_ratelimited(
+					"RMI: VSMMU MSI dropped addr=%#llx err=%d\n",
+					cmd.msi_addr, err);
 		}
 		cond_resched();
 	} while (cmd.flags & RMI_VSMMU_CMD_FLAGS_PENDING);
