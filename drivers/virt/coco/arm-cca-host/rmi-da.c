@@ -15,6 +15,7 @@
 #include <linux/kvm_host.h>
 #include <asm/rmi_cmds.h>
 #include <asm/kvm_rmi.h>
+#include <cxl/cxl.h>
 
 #include "rmi-da.h"
 
@@ -1106,6 +1107,21 @@ static void init_vdev_params_mmio_range(struct pci_dev *pdev,
 
 		index = insert_addr_range_sorted(params->addr_range, index,
 						 res->start, res->end + 1);
+	}
+
+	if (index < MAX_VDEV_ADDR_RANGE) {
+		struct range range;
+
+		/*
+		 * Append the HPA of the device's committed CXL region, queried
+		 * live rather than from a cached resource so it cannot go stale
+		 * against the HDM decoder. Absent region (no CXL memdev,
+		 * nothing committed, or CXL_REGION=n) means the device has no
+		 * coherent range to map.
+		 */
+		if (!cxl_find_region_for_pdev(pdev, &range))
+			index = insert_addr_range_sorted(params->addr_range, index,
+							 range.start, range.end + 1);
 	}
 
 	params->num_addr_range = index;

@@ -13,6 +13,7 @@
 #include <linux/tsm.h>
 #include <linux/cleanup.h>
 #include <linux/pci-doe.h>
+#include <cxl/cxl.h>
 
 #include "rmi-da.h"
 
@@ -220,14 +221,24 @@ static int pci_dev_addr_range(struct pci_dev *pdev,
 {
 	int naddr = 0;
 
-	/*
-	 * A coherent stream describes memory that is not covered by the PCI
-	 * BARs. No range is published for it yet, so hand back an empty list
-	 * and let the caller skip the stream.
-	 */
 	if (stream_type == RMI_PDEV_STREAM_COH ||
-	    stream_type == RMI_PDEV_STREAM_COH_SYS)
-		return 0;
+	    stream_type == RMI_PDEV_STREAM_COH_SYS) {
+		struct range range;
+
+		/*
+		 * The coherent range is the HPA of the device's committed CXL
+		 * region, queried live rather than from a cached resource so it
+		 * cannot go stale against the HDM decoder. Absent region (no
+		 * CXL memdev, nothing committed, or CXL_REGION=n) means the
+		 * device has no coherent range to program.
+		 */
+		if (cxl_find_region_for_pdev(pdev, &range))
+			return 0;
+
+		pdev_addr[naddr].base = range.start;
+		pdev_addr[naddr].top = range.end + 1;
+		return naddr + 1;
+	}
 
 	for (int i = 0; i <= PCI_STD_RESOURCE_END && naddr < MAX_STREAM_ADDR_RANGE; i++) {
 		struct resource *res = &pdev->resource[i];
@@ -748,6 +759,7 @@ static struct arm_smccc_driver cca_link_tsm_driver = {
 };
 module_arm_smccc_driver(cca_link_tsm_driver);
 MODULE_IMPORT_NS("PCI_IDE");
+MODULE_IMPORT_NS("CXL");
 MODULE_AUTHOR("Aneesh Kumar <aneesh.kumar@kernel.org>");
 MODULE_DESCRIPTION("ARM CCA Host TSM driver");
 MODULE_LICENSE("GPL");

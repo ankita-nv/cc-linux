@@ -4093,6 +4093,68 @@ static int first_mapped_decoder(struct device *dev, const void *data)
 	return 0;
 }
 
+static int match_cxl_memdev(struct device *dev, const void *data)
+{
+	return is_cxl_memdev(dev);
+}
+
+static struct cxl_memdev *cxl_memdev_from_pdev(struct pci_dev *pdev)
+{
+	struct device *dev = device_find_child(&pdev->dev, NULL,
+					       match_cxl_memdev);
+	if (!dev)
+		return NULL;
+	return to_cxl_memdev(dev);
+}
+
+/**
+ * cxl_find_region_for_pdev - find the committed CXL region HPA for a PCI device
+ * @pdev: PCI device to query
+ * @range: output range filled with region HPA on success
+ *
+ * Walks the child device list of @pdev to find an associated CXL memdev,
+ * then retrieves its committed decoder's region range.
+ *
+ * Returns 0 on success, -ENOENT if @pdev has no CXL memdev child or no
+ * committed region, negative error otherwise.
+ */
+int cxl_find_region_for_pdev(struct pci_dev *pdev, struct range *range)
+{
+	struct cxl_endpoint_decoder *cxled;
+	struct cxl_port *endpoint;
+	struct cxl_region *cxlr;
+	struct cxl_memdev *cxlmd;
+
+	cxlmd = cxl_memdev_from_pdev(pdev);
+	if (!cxlmd)
+		return -ENOENT;
+	struct device *memdev __free(put_device) = &cxlmd->dev;
+
+	endpoint = cxlmd->endpoint;
+	if (IS_ERR_OR_NULL(endpoint))
+		return -ENOENT;
+
+	guard(rwsem_read)(&cxl_rwsem.region);
+	guard(rwsem_read)(&cxl_rwsem.dpa);
+
+	struct device *dev __free(put_device) =
+		device_find_child(&endpoint->dev, NULL, first_mapped_decoder);
+	if (!dev)
+		return -ENOENT;
+
+	cxled = to_cxl_endpoint_decoder(dev);
+	cxlr = cxled->cxld.region;
+	if (cxlr->params.state < CXL_CONFIG_COMMIT || !cxlr->params.res)
+		return -ENOENT;
+
+	*range = (struct range) {
+		.start = cxlr->params.res->start,
+		.end = cxlr->params.res->end,
+	};
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_find_region_for_pdev, "CXL");
+
 /*
  * Runs in cxl_mem_probe context after successful endpoint probe, assumes the
  * simple case of single mapped decoder per memdev.

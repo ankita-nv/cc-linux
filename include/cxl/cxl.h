@@ -360,4 +360,14 @@ struct cxl_memdev *devm_cxl_probe_mem(struct cxl_dev_state *cxlds,
 				      struct range *range);
 
 int cxl_set_capacity(struct cxl_dev_state *cxlds, u64 capacity);
+
+#ifdef CONFIG_CXL_REGION
+int cxl_find_region_for_pdev(struct pci_dev *pdev, struct range *range);
+#else
+static inline int cxl_find_region_for_pdev(struct pci_dev *pdev,
+					   struct range *range)
+{
+	return -ENODEV;
+}
+#endif
 #endif /* __CXL_CXL_H__ */
