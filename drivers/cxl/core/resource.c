@@ -15,6 +15,7 @@
 #include <linux/memregion.h>
 #include <linux/overflow.h>
 #include <linux/pci.h>
+#include <linux/pci-tsm.h>
 #include <linux/slab.h>
 
 #include <cxl/pci.h>
@@ -1369,8 +1370,17 @@ int cxl_reset_function(struct pci_dev *pdev, bool probe)
 	if (probe)
 		return 0;
 
+	/*
+	 * -ENOTTY falls through to the next reset method, which handles the
+	 * TSM state itself (pcie_flr()), so check it before touching the TSM.
+	 */
 	if (!cxl_reset_hdm_available(pdev))
 		return -ENOTTY;
+
+	/* CXL Reset wipes IDE/SPDM state; release the TSM state first */
+	rc = pci_tsm_reset_prepare(pdev);
+	if (rc)
+		return rc;
 
 	cxl_hdm_range_context_init(&range_ctx);
 
@@ -1396,5 +1406,8 @@ int cxl_reset_function(struct pci_dev *pdev, bool probe)
 	}
 
 	cxl_pci_target_reset_done(pdev, &target_prepared);
+
+	/* device is back from the reset: rebuild the TSM state transparently */
+	pci_tsm_reset_done(pdev);
 	return rc;
 }
