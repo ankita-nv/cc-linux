@@ -72,6 +72,8 @@ struct vfio_cxl_ops {
 	void	(*release)(struct vfio_pci_core_device *vdev);
 	int	(*open_device)(struct vfio_pci_core_device *vdev);
 	void	(*close_device)(struct vfio_pci_core_device *vdev);
+	/* Optional, sleepable; called before notifying userspace of an error. */
+	void	(*error_detected)(struct vfio_pci_core_device *vdev);
 	void	(*reset_prepare)(struct vfio_pci_core_device *vdev);
 	void	(*reset_done)(struct vfio_pci_core_device *vdev);
 	/* Run the CXL reset (always clears CXL.mem) in place of FLR */

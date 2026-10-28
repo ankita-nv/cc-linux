@@ -25,7 +25,6 @@
  * @cxlmd: memory device joined to the CXL topology at bind
  * @hpa_range: host physical range of the HDM region
  * @hdm_pfn_space: HDM-region pfn range registered with memory_failure()
- * @hdm_regs: mapped HDM decoder registers, read live by the decoder region
  * @hdm_len: length of the HDM decoder register block
  * @hdm_valid: true when host CPU access to the HDM range is safe; under memory_lock
  * @mem_region_index: vfio region index of the mmap-able HDM memory region
@@ -35,7 +34,6 @@ struct vfio_cxl_state {
 	struct cxl_memdev *cxlmd;
 	struct range hpa_range;
 	struct pfn_address_space hdm_pfn_space;
-	void __iomem *hdm_regs;
 	u32 hdm_len;
 	bool hdm_valid;
 	unsigned int mem_region_index;
@@ -226,39 +224,43 @@ static ssize_t vfio_cxl_comp_rw(struct vfio_pci_core_device *vdev,
 	struct vfio_cxl_state *cxl = vdev->cxl;
 	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
 	void *tmp;
+	int ret;
 
 	if (pos >= cxl->hdm_len)
 		return -EINVAL;
 
-	/* The decoder registers take only aligned dword accesses. */
+	/* Keep the decoder region's aligned dword access contract. */
 	if (pos % sizeof(u32) || count % sizeof(u32))
 		return -EINVAL;
 
 	count = min_t(size_t, count, cxl->hdm_len - pos);
 
 	/*
-	 * The host committed and locked the physical decoder before the guest
-	 * saw the device, so the guest never drives it: absorb writes without
-	 * forwarding them to hardware. The guest programs a GPA that the VMM
-	 * virtualizes; reads return the live registers, which already report the
-	 * decoder committed. BASE_LOW and BASE_HIGH carry the host HPA, visible
-	 * only to the trusted VMM that virtualizes it away from the guest.
+	 * Firmware owns the physical decoder. Absorb writes; the VMM
+	 * virtualizes GPA programming and hides the cached host HPA.
 	 */
 	if (iswrite) {
 		*ppos += count;
 		return count;
 	}
 
-	tmp = kmalloc(count, GFP_KERNEL);
+	tmp = kmalloc(cxl->hdm_len, GFP_KERNEL);
 	if (!tmp)
 		return -ENOMEM;
 
-	memcpy_fromio(tmp, cxl->hdm_regs + pos, count);
-	if (copy_to_user(buf, tmp, count)) {
-		kfree(tmp);
-		return -EFAULT;
+	scoped_guard(rwsem_read, &vdev->memory_lock) {
+		/*
+		 * The CXL cache lock serializes the image and its validity with
+		 * all CXL resets, including resets initiated outside VFIO.
+		 * Physical HDM MMIO can abort once the TSM owns the device.
+		 */
+		ret = pci_cxl_hdm_copy_state(vdev->pdev, tmp, cxl->hdm_len);
 	}
+	if (!ret && copy_to_user(buf, tmp + pos, count))
+		ret = -EFAULT;
 	kfree(tmp);
+	if (ret)
+		return ret;
 
 	*ppos += count;
 	return count;
@@ -416,19 +418,7 @@ static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 		goto err;
 	}
 
-	/*
-	 * Map the HDM decoder registers so the decoder region can read them
-	 * live. The block location comes from the enumeration cache in
-	 * pdev->hdm; vfio-pci owns the BAR, so map without claiming the block.
-	 */
-	cxl->hdm_regs = devm_ioremap(&pdev->dev,
-				     pci_resource_start(pdev, pdev->hdm->hdm_bar) +
-				     pdev->hdm->hdm_offset, pdev->hdm->hdm_size);
-	if (!cxl->hdm_regs) {
-		ret = -ENOMEM;
-		goto err;
-	}
-
+	/* All decoder-region reads use the pre-TSM CXL programming cache. */
 	cxl->hdm_len = pdev->hdm->hdm_size;
 
 	/*
@@ -586,10 +576,6 @@ static void vfio_cxl_close_device(struct vfio_pci_core_device *vdev)
 	unregister_pfn_address_space(&cxl->hdm_pfn_space);
 }
 
-static void vfio_cxl_reset_prepare(struct vfio_pci_core_device *vdev)
-{
-}
-
 /*
  * A secondary bus reset only reaches a CXL endpoint when the upstream port
  * has SBR unmasked (CXL r3.1 sec 8.1.5.2); otherwise the Bridge Control SBR
@@ -613,6 +599,19 @@ static bool vfio_cxl_sbr_unmasked(struct pci_dev *pdev)
 		return false;
 
 	return ctl & PCI_DVSEC_CXL_PORT_CTL_UNMASK_SBR;
+}
+
+static void vfio_cxl_error_detected(struct vfio_pci_core_device *vdev)
+{
+	/* AER recovery can reset the bus without calling reset_prepare. */
+	pci_cxl_hdm_invalidate_state(vdev->pdev);
+}
+
+static void vfio_cxl_reset_prepare(struct vfio_pci_core_device *vdev)
+{
+	/* CXL function resets invalidate centrally; raw SBR has no restore. */
+	if (vfio_cxl_sbr_unmasked(vdev->pdev))
+		pci_cxl_hdm_invalidate_state(vdev->pdev);
 }
 
 static void vfio_cxl_reset_done(struct vfio_pci_core_device *vdev)
@@ -676,6 +675,7 @@ static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.release	= vfio_cxl_release_device,
 	.open_device	= vfio_cxl_open_device,
 	.close_device	= vfio_cxl_close_device,
+	.error_detected	= vfio_cxl_error_detected,
 	.reset_prepare	= vfio_cxl_reset_prepare,
 	.reset_done	= vfio_cxl_reset_done,
 	.reset		= vfio_cxl_reset,

@@ -145,6 +145,8 @@ struct cxl_hdm_decoder_state;
  * @hdm_bar: BAR containing the HDM decoder registers
  * @hdm_offset: HDM decoder register offset relative to @hdm_bar
  * @hdm_size: HDM decoder register resource size
+ * @image_valid: cached decoder image is restored; protected by cxl_rwsem.dpa
+ * @cap: static HDM decoder capability captured at PCI enumeration
  * @global_ctrl: cached HDM decoder global control register
  * @dvsec_ctrl: cached CXL Device DVSEC control register
  * @dvsec_ctrl_valid: @dvsec_ctrl contains valid state
@@ -156,6 +158,8 @@ struct cxl_hdm_info {
 	int hdm_bar;
 	resource_size_t hdm_offset;
 	resource_size_t hdm_size;
+	bool image_valid;
+	u32 cap;
 	u32 global_ctrl;
 	u16 dvsec_ctrl;
 	bool dvsec_ctrl_valid;
@@ -164,6 +168,8 @@ struct cxl_hdm_info {
 };
 
 #ifdef CONFIG_CXL_RESET
+int pci_cxl_hdm_copy_state(struct pci_dev *pdev, void *buf, size_t len);
+void pci_cxl_hdm_invalidate_state(struct pci_dev *pdev);
 void pci_cxl_hdm_init(struct pci_dev *pdev);
 void pci_cxl_hdm_release(struct pci_dev *pdev);
 int cxl_restore_state_after_pci_reset(struct pci_dev *pdev);
@@ -171,6 +177,16 @@ int cxl_reset_function(struct pci_dev *pdev, bool probe);
 bool cxl_reset_capable(struct pci_dev *pdev);
 int cxl_reset_dvsec_sequence(struct pci_dev *pdev);
 #else
+static inline void pci_cxl_hdm_invalidate_state(struct pci_dev *pdev)
+{
+}
+
+static inline int pci_cxl_hdm_copy_state(struct pci_dev *pdev, void *buf,
+					 size_t len)
+{
+	return -ENODEV;
+}
+
 static inline void pci_cxl_hdm_init(struct pci_dev *pdev)
 {
 }

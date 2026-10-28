@@ -17,6 +17,7 @@
 #include <linux/pci.h>
 #include <linux/pci-tsm.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 
 #include <cxl/pci.h>
 
@@ -29,7 +30,7 @@ struct cxl_rwsem cxl_rwsem = {
 };
 EXPORT_SYMBOL_FOR_MODULES(cxl_rwsem, "cxl_core");
 
-static void cxld_set_interleave(struct cxl_decoder_settings *settings, u32 *ctrl)
+static void cxld_set_interleave(const struct cxl_decoder_settings *settings, u32 *ctrl)
 {
 	u16 eig;
 	u8 eiw;
@@ -52,7 +53,7 @@ static void cxld_set_interleave(struct cxl_decoder_settings *settings, u32 *ctrl
 	*ctrl |= CXL_HDM_DECODER0_CTRL_COMMIT;
 }
 
-static void cxld_set_type(struct cxl_decoder_settings *settings, u32 *ctrl)
+static void cxld_set_type(const struct cxl_decoder_settings *settings, u32 *ctrl)
 {
 	u32p_replace_bits(ctrl,
 			  !!(settings->target_type == CXL_DECODER_HOSTONLYMEM),
@@ -200,6 +201,96 @@ struct cxl_hdm_decoder_state {
 	u32 target_low;
 	u32 target_high;
 };
+
+/**
+ * pci_cxl_hdm_copy_state - copy a firmware-fixed decoder's cached register image
+ * @pdev: CXL PCI device
+ * @buf: destination for little-endian HDM decoder registers
+ * @len: destination size, matching the cached HDM register block size
+ *
+ * No hardware access is performed. The cache lock serializes the image with
+ * reset invalidation and successful restore. Only the single-decoder,
+ * non-interleaved VFIO contract is supported.
+ */
+int pci_cxl_hdm_copy_state(struct pci_dev *pdev, void *buf, size_t len)
+{
+	const struct cxl_decoder_settings *settings;
+	struct cxl_hdm_info *info;
+	u64 base, size, target;
+	u32 ctrl;
+
+	guard(rwsem_read)(&cxl_rwsem.dpa);
+	info = pdev->hdm;
+	if (!info)
+		return -ENODEV;
+	if (!info->image_valid)
+		return -EIO;
+	if (info->decoder_count != 1)
+		return -EOPNOTSUPP;
+	if (len != info->hdm_size ||
+	    len < CXL_HDM_DECODER0_CTRL_OFFSET(0) + 0x10 ||
+	    !info->decoder_state)
+		return -EINVAL;
+
+	settings = &info->settings[0];
+	if (!(settings->flags & CXL_DECODER_F_ENABLE))
+		return -ENXIO;
+	if (settings->interleave_ways != 1)
+		return -EOPNOTSUPP;
+
+	base = settings->hpa_range.start;
+	size = range_len(&settings->hpa_range);
+	target = settings->target_or_skip;
+	ctrl = info->decoder_state[0].ctrl;
+	ctrl &= ~(CXL_HDM_DECODER0_CTRL_COMMIT_ERROR |
+		  CXL_HDM_DECODER0_CTRL_LOCK);
+	cxld_set_interleave(settings, &ctrl);
+	cxld_set_type(settings, &ctrl);
+	/* ENABLE describes a committed decoder, never guest programming. */
+	ctrl |= CXL_HDM_DECODER0_CTRL_COMMITTED;
+	if (settings->flags & CXL_DECODER_F_LOCK)
+		ctrl |= CXL_HDM_DECODER0_CTRL_LOCK;
+
+	memset(buf, 0, len);
+	put_unaligned_le32(info->cap, buf + CXL_HDM_DECODER_CAP_OFFSET);
+	put_unaligned_le32(info->global_ctrl, buf + CXL_HDM_DECODER_CTRL_OFFSET);
+	put_unaligned_le32(lower_32_bits(base),
+			   buf + CXL_HDM_DECODER0_BASE_LOW_OFFSET(0));
+	put_unaligned_le32(upper_32_bits(base),
+			   buf + CXL_HDM_DECODER0_BASE_HIGH_OFFSET(0));
+	put_unaligned_le32(lower_32_bits(size),
+			   buf + CXL_HDM_DECODER0_SIZE_LOW_OFFSET(0));
+	put_unaligned_le32(upper_32_bits(size),
+			   buf + CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(0));
+	put_unaligned_le32(ctrl, buf + CXL_HDM_DECODER0_CTRL_OFFSET(0));
+	put_unaligned_le32(lower_32_bits(target), buf + CXL_HDM_DECODER0_TL_LOW(0));
+	put_unaligned_le32(upper_32_bits(target), buf + CXL_HDM_DECODER0_TL_HIGH(0));
+
+	return 0;
+}
+EXPORT_SYMBOL_FOR_MODULES(pci_cxl_hdm_copy_state, "vfio-cxl");
+
+static void cxl_hdm_set_image_valid(struct pci_dev *pdev, bool valid)
+{
+	guard(rwsem_write)(&cxl_rwsem.dpa);
+	/*
+	 * AER freezes the channel before error_detected and may reset the bus
+	 * afterward without reset_prepare. A concurrent explicit reset must
+	 * not republish an image that this later bus reset would invalidate.
+	 * Reset callers hold the device lock, serializing channel transitions.
+	 */
+	if (valid && pci_channel_offline(pdev))
+		return;
+	if (pdev->hdm)
+		pdev->hdm->image_valid = valid;
+}
+
+/* Raw SBR has no CXL restore path to publish a valid image afterward. */
+void pci_cxl_hdm_invalidate_state(struct pci_dev *pdev)
+{
+	cxl_hdm_set_image_valid(pdev, false);
+}
+EXPORT_SYMBOL_FOR_MODULES(pci_cxl_hdm_invalidate_state, "vfio-cxl");
 
 static void cxl_pci_hdm_info_free(struct cxl_hdm_info *info)
 {
@@ -453,8 +544,8 @@ static int __cxl_pci_hdm_read_info(struct pci_dev *pdev,
 	if (IS_ERR(hdm))
 		return PTR_ERR(no_free_ptr(hdm));
 
-	decoder_count = cxl_hdm_decoder_count(readl(hdm +
-						    CXL_HDM_DECODER_CAP_OFFSET));
+	info->cap = readl(hdm + CXL_HDM_DECODER_CAP_OFFSET);
+	decoder_count = cxl_hdm_decoder_count(info->cap);
 	if (decoder_count < 0)
 		return decoder_count;
 
@@ -564,6 +655,7 @@ static int __pci_cxl_hdm_init(struct pci_dev *pdev)
 	if (rc)
 		return rc;
 
+	info->image_valid = true;
 	pdev->hdm = no_free_ptr(info);
 
 	return 0;
@@ -903,6 +995,8 @@ int cxl_restore_state_after_pci_reset(struct pci_dev *pdev)
 	device_lock_assert(&pdev->dev);
 	guard(rwsem_write)(&cxl_rwsem.region);
 
+	cxl_hdm_set_image_valid(pdev, false);
+
 	cxl_restore_pci_state_for_hdm_restore(pdev, &command);
 	rc = cxl_restore_state(pdev);
 	if (rc) {
@@ -910,7 +1004,10 @@ int cxl_restore_state_after_pci_reset(struct pci_dev *pdev)
 		return rc;
 	}
 
-	return cxl_reset_save_restored_state(pdev, command);
+	rc = cxl_reset_save_restored_state(pdev, command);
+	if (!rc)
+		cxl_hdm_set_image_valid(pdev, true);
+	return rc;
 }
 
 static void cxl_hdm_range_context_init(struct cxl_hdm_range_context *ctx)
@@ -1329,6 +1426,9 @@ static int cxl_reset_execute(struct pci_dev *pdev, bool *target_prepared,
 {
 	int rc, rc2;
 
+	/* Invalidate before any hardware transition, regardless of reset caller. */
+	cxl_hdm_set_image_valid(pdev, false);
+
 	rc = cxl_reset_disable_cache(pdev, dvsec, cap);
 	if (rc)
 		return rc;
@@ -1402,6 +1502,8 @@ int cxl_reset_function(struct pci_dev *pdev, bool probe)
 		} else if (reset_initiated) {
 			cxl_reset_save_disabled_state(pdev);
 		}
+		if (!rc)
+			cxl_hdm_set_image_valid(pdev, true);
 		cxl_hdm_range_context_destroy(&range_ctx);
 	}
 

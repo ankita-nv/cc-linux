@@ -2823,6 +2823,10 @@ pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
 	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
 	struct vfio_pci_eventfd *eventfd;
 
+	/* The provider may sleep while invalidating its cached device state. */
+	if (vdev->cxl_ops && vdev->cxl_ops->error_detected)
+		vdev->cxl_ops->error_detected(vdev);
+
 	rcu_read_lock();
 	eventfd = rcu_dereference(vdev->err_trigger);
 	if (eventfd)
