@@ -309,6 +309,14 @@ void pci_cxl_hdm_release(struct pci_dev *pdev)
 	struct cxl_hdm_info *info = pdev->hdm;
 
 	pdev->hdm = NULL;
+
+	for (int i = 0; i < PCI_CXL_MAX_COHERENT_RANGES; i++) {
+		struct resource *res = &pdev->coh_resource[i];
+
+		if (res->parent)
+			remove_resource(res);
+	}
+
 	cxl_pci_hdm_info_free(info);
 }
 
@@ -618,6 +626,47 @@ static int cxl_pci_hdm_read_info(struct pci_dev *pdev,
 	return rc;
 }
 
+/*
+ * Snapshot committed decoders into pdev->coh_resource[] which is called
+ * once per pdev before any driver can bind, so a populated entry is
+ * always firmware-committed and not driver-committed.
+ *
+ * Insert each entry into iomem_resource for /proc/iomem visibility and
+ * conflict detection.
+ */
+static void cxl_populate_coh_resource(struct pci_dev *pdev,
+				      struct cxl_hdm_info *info)
+{
+	int count = min(info->decoder_count, PCI_CXL_MAX_COHERENT_RANGES);
+
+	for (int i = 0; i < count; i++) {
+		struct cxl_decoder_settings *settings = &info->settings[i];
+		struct resource *res = &pdev->coh_resource[i];
+		struct resource *conflict;
+
+		if (!(settings->flags & CXL_DECODER_F_ENABLE) ||
+		    !range_len(&settings->hpa_range))
+			continue;
+
+		*res = DEFINE_RES_NAMED_DESC(settings->hpa_range.start,
+					     range_len(&settings->hpa_range),
+					     "CXL coherent memory",
+					     IORESOURCE_MEM, IORES_DESC_NONE);
+
+		conflict = insert_resource_conflict(&iomem_resource, res);
+		if (conflict) {
+			pci_warn(pdev,
+				 "CXL coherent range: decoder%d %pR conflicts with %s %pR, leaving unpopulated\n",
+				 i, res, conflict->name, conflict);
+			memset(res, 0, sizeof(*res));
+			continue;
+		}
+
+		pci_info(pdev, "CXL coherent range: decoder%d precommitted, populated %pR\n",
+			 i, res);
+	}
+}
+
 static int __pci_cxl_hdm_init(struct pci_dev *pdev)
 {
 	struct cxl_register_map map = { 0 };
@@ -656,6 +705,7 @@ static int __pci_cxl_hdm_init(struct pci_dev *pdev)
 		return rc;
 
 	info->image_valid = true;
+	cxl_populate_coh_resource(pdev, info);
 	pdev->hdm = no_free_ptr(info);
 
 	return 0;

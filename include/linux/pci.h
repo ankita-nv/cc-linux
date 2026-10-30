@@ -147,6 +147,13 @@ enum {
 	DEVICE_COUNT_RESOURCE = PCI_NUM_RESOURCES,
 };
 
+/*
+ * Max CXL HDM decoders tracked per endpoint in pci_dev->coh_resource[].
+ * CXL 3.1 spec section 8.2.4.20.1 - CXL HDM Decoder Capability Register,
+ * mention a max of 10 decoders for a CXL device.
+ */
+#define PCI_CXL_MAX_COHERENT_RANGES 10
+
 /**
  * enum pci_interrupt_pin - PCI INTx interrupt values
  * @PCI_INTERRUPT_UNKNOWN: Unknown or unassigned interrupt
@@ -571,6 +578,13 @@ struct pci_dev {
 #endif
 #ifdef CONFIG_CXL_RESET
 	struct cxl_hdm_info *hdm;	/* CXL HDM decoder reset state */
+	/*
+	 * Precommitted CXL HDM decoder coherent ranges, snapshotted before
+	 * any driver binds. One entry per decoder index. Only written by
+	 * pci_cxl_hdm_init()/_release(), outside any bound driver's read
+	 * window.
+	 */
+	struct resource coh_resource[PCI_CXL_MAX_COHERENT_RANGES];
 #endif
 #ifdef CONFIG_PCI_NPEM
 	struct npem	*npem;		/* Native PCIe Enclosure Management */
