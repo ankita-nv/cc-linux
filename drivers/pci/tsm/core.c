@@ -889,6 +889,41 @@ static ssize_t dsm_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(dsm);
 
+#ifdef CONFIG_CXL_RESET
+/*
+ * pci_tsm_coh_resource_contains() - check a coherent range against the
+ * PCI-core coh_resource[] snapshot
+ * @pdev: device owner of @res
+ * @res: candidate coherent MMIO range to validate
+ *
+ * The coherent (CXL.mem) range isn't BAR-backed. So pci_resource_n()
+ * containment doesn't apply. Check against pdev->coh_resource[] instead.
+ *
+ * Return: true if @res falls within a populated coh_resource[] entry.
+ */
+static bool pci_tsm_coh_resource_contains(struct pci_dev *pdev,
+					  const struct resource *res)
+{
+	int i;
+
+	for (i = 0; i < PCI_CXL_MAX_COHERENT_RANGES; i++) {
+		struct resource *coh_res = &pdev->coh_resource[i];
+
+		if ((coh_res->flags & IORESOURCE_MEM) &&
+		    resource_contains(coh_res, res))
+			return true;
+	}
+
+	return false;
+}
+#else
+static bool pci_tsm_coh_resource_contains(struct pci_dev *pdev,
+					  const struct resource *res)
+{
+	return false;
+}
+#endif /* CONFIG_CXL_RESET */
+
 static void mmio_teardown(struct pci_tsm_mmio *mmio, int nr)
 {
 	while (nr--)
@@ -909,7 +944,9 @@ int pci_tsm_mmio_setup(struct pci_dev *pdev, struct pci_tsm_mmio *mmio)
 		return -EBUSY;
 
 	for (i = 0; i < mmio->nr; i++) {
-		struct resource *res = pci_tsm_mmio_resource(mmio, i);
+		struct pci_tsm_mmio_entry *entry = pci_tsm_mmio_entry(mmio, i);
+		struct resource *res = &entry->res;
+		bool coherent = entry->flags & PCI_TSM_MMIO_F_COHERENT;
 		int j;
 
 		if (resource_size(res) == 0 || !res->end)
@@ -921,13 +958,22 @@ int pci_tsm_mmio_setup(struct pci_dev *pdev, struct pci_tsm_mmio *mmio)
 					     IORESOURCE_MEM,
 					     IORES_DESC_ENCRYPTED);
 
-		for (j = 0; j < PCI_NUM_RESOURCES; j++)
-			if (resource_contains(pci_resource_n(pdev, j), res))
+		/*
+		 * The coherent (CXL.mem) range isn't BAR-backed, so check it
+		 * against pdev->coh_resource[] instead of pci_resource_n().
+		 */
+		if (coherent) {
+			if (!pci_tsm_coh_resource_contains(pdev, res))
 				break;
+		} else {
+			for (j = 0; j < PCI_NUM_RESOURCES; j++)
+				if (resource_contains(pci_resource_n(pdev, j), res))
+					break;
 
-		/* Request is outside of device MMIO */
-		if (j >= PCI_NUM_RESOURCES)
-			break;
+			/* Request is outside of device MMIO */
+			if (j >= PCI_NUM_RESOURCES)
+				break;
+		}
 
 		if (insert_resource(&iomem_resource, res) != 0)
 			break;
@@ -978,20 +1024,43 @@ struct pci_tsm_devif_report {
 	struct pci_tsm_devif_mmio mmio[];
 };
 
-static int pci_tsm_next_mem_bar(struct pci_dev *pdev, int start)
+#ifdef CONFIG_CXL_RESET
+/*
+ * pci_tsm_coherent_range() - resolve the device's coherent CXL window
+ * @pdev: device owner of the reported ranges
+ * @out_base: host physical (guest IPA) base of the coherent window
+ * @out_size: size of the coherent window
+ *
+ * The coherent range carries no BAR number, so its address comes from
+ * pdev->coh_resource[], a pre-driver-bind snapshot of committed CXL HDM
+ * decoders.
+ *
+ * Return: 0 with *@out_base / *@out_size set from the first populated entry,
+ * or -ENODEV if no entry is populated.
+ */
+static int pci_tsm_coherent_range(struct pci_dev *pdev, u64 *out_base,
+				  u64 *out_size)
 {
-	for (int bar = start; bar < PCI_STD_NUM_BARS; bar++) {
-		if (!(pci_resource_flags(pdev, bar) & IORESOURCE_MEM))
+	for (int i = 0; i < PCI_CXL_MAX_COHERENT_RANGES; i++) {
+		struct resource *res = &pdev->coh_resource[i];
+
+		if (!(res->flags & IORESOURCE_MEM))
 			continue;
 
-		if (!pci_resource_len(pdev, bar))
-			continue;
-
-		return bar;
+		*out_base = res->start;
+		*out_size = resource_size(res);
+		return 0;
 	}
 
 	return -ENODEV;
 }
+#else
+static int pci_tsm_coherent_range(struct pci_dev *pdev, u64 *out_base,
+				  u64 *out_size)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_CXL_RESET */
 
 /**
  * pci_tsm_mmio_alloc() - allocate encrypted MMIO range descriptor
@@ -1038,7 +1107,7 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev)
 		return NULL;
 
 	for (i = 0; i < mmio_range_count; i++) {
-		u64 range_off;
+		u64 range_base, range_len, range_off;
 		struct range range;
 		const struct pci_tsm_devif_mmio *mmio_data = &report->mmio[i];
 		struct pci_tsm_mmio_entry *entry =
@@ -1072,30 +1141,58 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev)
 				return NULL;
 			}
 
-			bar = pci_tsm_next_mem_bar(pdev, last_bar + 1);
-			if (bar < 0) {
-				pci_dbg(pdev, "No BAR found for coherent reporting range\n");
+			/*
+			 * Fail closed if pdev->coh_resource[] has no populated
+			 * entry: nothing else in the report identifies the
+			 * window's address.
+			 */
+			if (pci_tsm_coherent_range(pdev, &range_base,
+						   &range_len)) {
+				pci_info(pdev,
+					 "No populated coh_resource[] entry for coherent range\n");
 				return NULL;
 			}
-		}
 
-		if (bar >= PCI_STD_NUM_BARS ||
-		    !(pci_resource_flags(pdev, bar) & IORESOURCE_MEM)) {
-			pci_dbg(pdev, "Invalid reporting bar ID %d\n", bar);
-			return NULL;
-		}
+			pci_info(pdev, "coherent range: base %#llx size %#llx\n",
+				 range_base, range_len);
 
-		if (last_bar > bar) {
-			pci_dbg(pdev, "Reporting bar ID not in ascending order\n");
-			return NULL;
-		}
+			/*
+			 * The coherent range is last and not part of the BAR
+			 * sequence.
+			 *
+			 * Guest-side fetch point of the CXL memory: the range
+			 * recorded here (PCI_TSM_MMIO_F_COHERENT) is what
+			 * cca_device_accept() later validates with
+			 * RSI_DEV_MEM_COHERENT. If this lookup fails, accept
+			 * fails closed and the device memory is never made
+			 * available to the guest, so a driver that relied on it
+			 * has to fall back to system memory, whose streaming
+			 * DMA in a realm goes through the decrypted swiotlb
+			 * pool (bounce is limited to IO_TLB_SEGSIZE slots per
+			 * mapping).
+			 */
+		} else {
+			if (bar >= PCI_STD_NUM_BARS ||
+			    !(pci_resource_flags(pdev, bar) & IORESOURCE_MEM)) {
+				pci_info(pdev, "Invalid reporting bar ID %d\n", bar);
+				return NULL;
+			}
 
-		if (last_bar < bar) {
-			/* transition to a new bar */
-			last_bar = bar;
-		} else if (tsm_offset < last_reporting_end) {
-			pci_dbg(pdev, "Reporting ranges within BAR not in ascending order\n");
-			return NULL;
+			if (last_bar > bar) {
+				pci_info(pdev, "Reporting bar ID not in ascending order\n");
+				return NULL;
+			}
+
+			if (last_bar < bar) {
+				/* transition to a new bar */
+				last_bar = bar;
+			} else if (tsm_offset < last_reporting_end) {
+				pci_info(pdev, "Reporting ranges within BAR not in ascending order\n");
+				return NULL;
+			}
+
+			range_base = pci_resource_start(pdev, bar);
+			range_len = pci_resource_len(pdev, bar);
 		}
 
 		last_reporting_end = tsm_offset + size;
@@ -1104,14 +1201,22 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev)
 			return NULL;
 		}
 
-		range_off = tsm_offset & (pci_resource_len(pdev, bar) - 1);
+		/*
+		 * Use tsm_offset directly for the coherent range instead of
+		 * masking: an HDM decoder's size - unlike a BAR's - need not be
+		 * a power of two, so masking could wrap an out-of-range offset
+		 * back in-bounds. The bounds check below still catches it.
+		 */
+		range_off = coherent ? tsm_offset :
+				       tsm_offset & (range_len - 1);
 
-		if (pci_resource_len(pdev, bar) < range_off + size) {
-			pci_dbg(pdev, "Reporting range larger than BAR size\n");
+		if (range_len < range_off + size) {
+			pci_info(pdev, "Reporting range larger than %s size\n",
+				coherent ? "coherent range" : "BAR");
 			return NULL;
 		}
 
-		range.start = pci_resource_start(pdev, bar) + range_off;
+		range.start = range_base + range_off;
 		range.end = range.start + size - 1;
 
 		if (FIELD_GET(PCI_TSM_DEVIF_REPORT_MMIO_ATTR_IS_NON_TEE,
