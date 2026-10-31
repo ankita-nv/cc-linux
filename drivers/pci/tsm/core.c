@@ -1093,6 +1093,8 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev)
 	u32 mmio_range_count;
 	int last_bar = -1;
 	bool seen_coherent = false;
+	u64 coh_first_off[PCI_CXL_MAX_COHERENT_RANGES] = {};
+	bool coh_seen[PCI_CXL_MAX_COHERENT_RANGES] = {};
 	int i;
 
 	guard(rwsem_read)(&evidence->lock);
@@ -1215,13 +1217,29 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev)
 		}
 
 		/*
-		 * Use tsm_offset directly for the coherent range instead of
-		 * masking: an HDM decoder's size - unlike a BAR's - need not be
-		 * a power of two, so masking could wrap an out-of-range offset
-		 * back in-bounds. The bounds check below still catches it.
+		 * Report offsets are positions in the interface's address
+		 * space, not offsets into the window. A BAR is power-of-two
+		 * sized and aligned, so the offset is recovered by masking. An
+		 * HDM decoder's size need not be a power of two, so measure a
+		 * coherent range from the first entry reported for the same
+		 * window. The bounds check below still catches anything that
+		 * does not fit.
 		 */
-		range_off = coherent ? tsm_offset :
-				       tsm_offset & (range_len - 1);
+		if (coherent) {
+			if (!coh_seen[coh_idx]) {
+				coh_seen[coh_idx] = true;
+				coh_first_off[coh_idx] = tsm_offset;
+			}
+
+			if (tsm_offset < coh_first_off[coh_idx]) {
+				pci_info(pdev, "Coherent reporting ranges not in ascending order\n");
+				return NULL;
+			}
+
+			range_off = tsm_offset - coh_first_off[coh_idx];
+		} else {
+			range_off = tsm_offset & (range_len - 1);
+		}
 
 		if (range_len < range_off + size) {
 			pci_info(pdev, "Reporting range larger than %s size\n",
