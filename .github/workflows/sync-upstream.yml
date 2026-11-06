@@ -42,7 +42,8 @@ jobs:
           # uploads history in many small chunks instead of one huge pack.
           git ls-remote --tags --refs dest | sed 's#.*refs/tags/##' | sort > have.txt
           git for-each-ref --sort=creatordate --format='%(refname:strip=2)' refs/tags \
-            | grep -vxFf have.txt > want.txt || true
+            | grep -E '^v7\.|^v([89]|[1-9][0-9])\.' | grep -v '^v7\.0-rc' \
+            | grep -vxFf have.txt > want.txt || true   # only v7.0 and later
           echo "$(wc -l < want.txt) tags to push"
           split -l 10 want.txt batch.
           for f in batch.*; do
