@@ -11,9 +11,10 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 340
     steps:
       # Cache the bare repo so each run only fetches new objects.
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         with:
           path: mirror.git
           key: mirror-${{ github.run_id }}
@@ -25,10 +26,33 @@ jobs:
           set -euo pipefail
           [ -d mirror.git ] || git init --bare mirror.git
           cd mirror.git
+          git config http.postBuffer 524288000
           git remote remove upstream 2>/dev/null || true
           git remote remove dest 2>/dev/null || true
           git remote add upstream https://github.com/torvalds/linux.git
           git remote add dest "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git fetch --no-tags upstream '+refs/heads/master:refs/heads/master' '+refs/tags/*:refs/tags/*'
-          git push dest refs/heads/master:refs/heads/master
-          git push dest 'refs/tags/*:refs/tags/*'
+
+          push() {  # retry wrapper
+            for i in 1 2 3 4; do git push dest "$@" && return 0; echo "push failed (try $i)"; sleep 20; done
+            return 1
+          }
+
+          # Tags missing on the destination, oldest first. On the first run this
+          # uploads history in many small chunks instead of one huge pack.
+          git ls-remote --tags --refs dest | sed 's#.*refs/tags/##' | sort > have.txt
+          git for-each-ref --sort=creatordate --format='%(refname:strip=2)' refs/tags \
+            | grep -vxFf have.txt > want.txt || true
+          echo "$(wc -l < want.txt) tags to push"
+          split -l 10 want.txt batch.
+          for f in batch.*; do
+            [ -e "$f" ] || break
+            push $(sed 's#.*#refs/tags/&:refs/tags/&#' "$f")
+          done
+          push refs/heads/master:refs/heads/master
+      - name: Save cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: mirror.git
+          key: mirror-${{ github.run_id }}
